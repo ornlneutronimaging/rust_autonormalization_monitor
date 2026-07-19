@@ -1,0 +1,11 @@
+[package]
+name = "autonormalization_monitor"
+version = "0.1.0"
+edition = "2024"
+description = "Monitor and (admin-only) toggle the VENUS auto normalization state"
+
+[dependencies]
+chrono = "0.4"
+eframe = "0.31"
+image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"
