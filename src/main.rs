@@ -302,8 +302,11 @@ impl eframe::App for MonitorApp {
                             );
                         });
                     }
-                    ui.add_space(theme::SPACE_LG);
-                    self.details(ui, &cfg);
+                    // The raw configuration content is admin-only.
+                    if self.admin_unlocked {
+                        ui.add_space(theme::SPACE_LG);
+                        self.details(ui, &cfg);
+                    }
                 }
                 Err(e) => {
                     ui.vertical_centered(|ui| {
