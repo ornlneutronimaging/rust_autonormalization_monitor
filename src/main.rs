@@ -34,6 +34,16 @@ fn password_matches(candidate: &str) -> bool {
     format!("{digest:x}") == ADMIN_PASSWORD_SHA256
 }
 
+/// Top-level tabs: Admin (status + admin-gated toggle) and Monitor (live view
+/// of the normalization state, to be implemented).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Admin,
+    Monitor,
+}
+
+const TABS: &[(Tab, &str)] = &[(Tab::Admin, "Admin"), (Tab::Monitor, "Monitor")];
+
 /// A static logo image loaded into a texture, plus its aspect ratio for sizing.
 struct Logo {
     texture: egui::TextureHandle,
@@ -57,6 +67,7 @@ impl Logo {
 struct MonitorApp {
     logo: Option<Logo>,
     logo_loaded: bool,
+    tab: Tab,
     /// Latest read of the configuration file (Err = message shown in the UI).
     cfg: Result<config::AutoNormConfig, String>,
     last_refresh: Instant,
@@ -73,6 +84,7 @@ impl MonitorApp {
         Self {
             logo: None,
             logo_loaded: false,
+            tab: Tab::Admin,
             cfg: config::read(Path::new(CONFIG_PATH)),
             last_refresh: Instant::now(),
             admin_unlocked: false,
@@ -233,6 +245,50 @@ impl MonitorApp {
         });
     }
 
+    /// Admin tab: ON/OFF status button, admin unlock, and (once unlocked) the
+    /// raw configuration content.
+    fn admin_tab(&mut self, ui: &mut egui::Ui) {
+        match self.cfg.clone() {
+            Ok(cfg) => {
+                self.status_button(ui, cfg.activate);
+                if let Some(err) = &self.write_error {
+                    ui.add_space(theme::SPACE_SM);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Failed to update flag: {err}"))
+                                .color(theme::DANGER),
+                        );
+                    });
+                }
+                // The raw configuration content is admin-only.
+                if self.admin_unlocked {
+                    ui.add_space(theme::SPACE_LG);
+                    self.details(ui, &cfg);
+                }
+            }
+            Err(e) => {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Cannot read configuration: {e}"))
+                            .color(theme::DANGER),
+                    );
+                });
+            }
+        }
+        ui.add_space(theme::SPACE_LG);
+        self.admin_section(ui);
+    }
+
+    /// Monitor tab: live view of the normalization state (to be implemented).
+    fn monitor_tab(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("Monitoring view — coming soon")
+                    .color(theme::TEXT_EMPHASIS),
+            );
+        });
+    }
+
     /// Admin unlock (password prompt) / lock control.
     fn admin_section(&mut self, ui: &mut egui::Ui) {
         ui.label(theme::section_heading("Admin"));
@@ -288,37 +344,35 @@ impl eframe::App for MonitorApp {
 
         self.header(ctx);
 
+        // Tab bar directly under the header (same pattern as the template's
+        // selector bar).
+        egui::TopBottomPanel::top("tab_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SURFACE_WEAK)
+                    .inner_margin(egui::Margin {
+                        left: 16,
+                        right: 16,
+                        top: 8,
+                        bottom: 8,
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (tab, label) in TABS {
+                        if ui.selectable_label(self.tab == *tab, *label).clicked() {
+                            self.tab = *tab;
+                        }
+                    }
+                });
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(theme::SPACE_LG);
-            match self.cfg.clone() {
-                Ok(cfg) => {
-                    self.status_button(ui, cfg.activate);
-                    if let Some(err) = &self.write_error {
-                        ui.add_space(theme::SPACE_SM);
-                        ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("Failed to update flag: {err}"))
-                                    .color(theme::DANGER),
-                            );
-                        });
-                    }
-                    // The raw configuration content is admin-only.
-                    if self.admin_unlocked {
-                        ui.add_space(theme::SPACE_LG);
-                        self.details(ui, &cfg);
-                    }
-                }
-                Err(e) => {
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("Cannot read configuration: {e}"))
-                                .color(theme::DANGER),
-                        );
-                    });
-                }
+            match self.tab {
+                Tab::Admin => self.admin_tab(ui),
+                Tab::Monitor => self.monitor_tab(ui),
             }
-            ui.add_space(theme::SPACE_LG);
-            self.admin_section(ui);
         });
     }
 }
