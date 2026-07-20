@@ -71,35 +71,51 @@ pub fn read(path: &Path) -> Result<AutoNormConfig, String> {
     Ok(cfg)
 }
 
-/// Set the `activate` flag in the file, updating the `last_modified` /
+impl AutoNormConfig {
+    /// Value of `key` as displayed (quotes stripped), if present.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Set `key` to `value` in the file, updating the `last_modified` /
 /// `last_modified_by` bookkeeping lines if present. All other lines are
-/// preserved unchanged.
-pub fn set_activate(path: &Path, activate: bool) -> Result<(), String> {
+/// preserved unchanged. Errors if `key` is not already in the file (this
+/// tool only edits existing fields, it never adds new ones).
+pub fn set_value(path: &Path, key: &str, value: &str) -> Result<(), String> {
     let content = fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
 
-    let mut saw_activate = false;
+    let mut saw_key = false;
     let mut lines: Vec<String> = Vec::new();
     for line in content.lines() {
         match split_key_value(line) {
-            Some(("activate", _)) => {
-                lines.push(format!("activate: {activate}"));
-                saw_activate = true;
+            Some((k, _)) if k == key => {
+                lines.push(format!("{key}: {value}"));
+                saw_key = true;
             }
             Some(("last_modified", _)) => lines.push(format!("last_modified: '{now}'")),
             Some(("last_modified_by", _)) => lines.push(format!("last_modified_by: {user}")),
             _ => lines.push(line.to_owned()),
         }
     }
-    if !saw_activate {
-        return Err(format!("no 'activate' flag found in {}", path.display()));
+    if !saw_key {
+        return Err(format!("no '{key}' field found in {}", path.display()));
     }
 
     let mut new_content = lines.join("\n");
     new_content.push('\n');
     fs::write(path, new_content).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Set the `activate` flag (written as lowercase `true`/`false`).
+pub fn set_activate(path: &Path, activate: bool) -> Result<(), String> {
+    set_value(path, "activate", if activate { "true" } else { "false" })
 }
 
 #[cfg(test)]
@@ -159,6 +175,21 @@ last_modified_by: j35
         // Bookkeeping lines were rewritten (timestamp changed, still quoted).
         assert!(content.contains("last_modified: '2026-"));
         assert!(!content.contains("last_modified: '2026-07-18 08:43:47'"));
+    }
+
+    #[test]
+    fn set_value_updates_ipts() {
+        let dir = std::env::temp_dir().join("anm_test_ipts");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_sample(&dir);
+        set_value(&path, "ipts", "IPTS-99999").unwrap();
+        let cfg = read(&path).unwrap();
+        assert_eq!(cfg.get("ipts"), Some("IPTS-99999"));
+        // Other fields untouched, flag unchanged.
+        assert!(!cfg.activate);
+        // Unknown keys are rejected, nothing is appended.
+        assert!(set_value(&path, "not_a_key", "x").is_err());
+        assert!(read(&path).unwrap().get("not_a_key").is_none());
     }
 
     #[test]

@@ -15,10 +15,15 @@ mod theme;
 
 use eframe::egui;
 use sha2::{Digest, Sha256};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 const CONFIG_PATH: &str = "/SNS/VENUS/shared/autoreduction/autoreduction.cfg";
+/// Root scanned for the IPTS-* experiment folders offered in the admin
+/// "Autoreduction IPTS" selector.
+const IPTS_ROOT: &str = "/SNS/VENUS";
 const LOGO_PATH: &str = "/SNS/VENUS/shared/software/logos/logo_with_green_neutron_rays.png";
 const APP_TITLE: &str = "VENUS Auto Normalization Monitor";
 /// SHA-256 of the admin password — the password itself never appears in the
@@ -27,6 +32,36 @@ const ADMIN_PASSWORD_SHA256: &str =
     "b8b22aedc372aa891df895be9a7626e6d9ddc6d39ba85d202ca68de8c52ad782";
 /// How often the configuration file is re-read.
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
+
+/// POSIX `access(2)` check: can the current user read + enter this directory?
+fn can_access(path: &Path) -> bool {
+    let Ok(cstr) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(cstr.as_ptr(), libc::R_OK | libc::X_OK) == 0 }
+}
+
+/// List the IPTS-* folders under `root` the current user can access, sorted
+/// by IPTS number (same pattern as the marimo portal template).
+fn list_accessible_ipts(root: &Path) -> Result<Vec<String>, String> {
+    let dir = std::fs::read_dir(root)
+        .map_err(|e| format!("cannot read {}: {e}", root.display()))?;
+    let mut ipts: Vec<(u64, String)> = Vec::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Some(suffix) = name_str.strip_prefix("IPTS-") else {
+            continue;
+        };
+        if !can_access(&entry.path()) {
+            continue;
+        }
+        let num: u64 = suffix.parse().unwrap_or(u64::MAX);
+        ipts.push((num, name_str.into_owned()));
+    }
+    ipts.sort_by_key(|(n, _)| *n);
+    Ok(ipts.into_iter().map(|(_, name)| name).collect())
+}
 
 fn password_matches(candidate: &str) -> bool {
     let digest = Sha256::digest(candidate.as_bytes());
@@ -77,6 +112,8 @@ struct MonitorApp {
     password_error: bool,
     /// Error from the last write attempt, shown until the next successful one.
     write_error: Option<String>,
+    /// IPTS folders the current user can access (scanned on admin unlock).
+    ipts_list: Result<Vec<String>, String>,
 }
 
 impl MonitorApp {
@@ -91,6 +128,7 @@ impl MonitorApp {
             password_input: String::new(),
             password_error: false,
             write_error: None,
+            ipts_list: Ok(Vec::new()),
         }
     }
 
@@ -103,6 +141,8 @@ impl MonitorApp {
         if password_matches(self.password_input.trim()) {
             self.admin_unlocked = true;
             self.password_error = false;
+            // Fresh scan on every unlock so newly granted IPTS show up.
+            self.ipts_list = list_accessible_ipts(Path::new(IPTS_ROOT));
         } else {
             self.password_error = true;
         }
@@ -224,6 +264,66 @@ impl MonitorApp {
         });
     }
 
+    /// Admin-only: choose which IPTS the autoreduction should use, among the
+    /// IPTS-* folders the current user can access. Selecting one writes the
+    /// `ipts` field of the configuration file.
+    fn ipts_section(&mut self, ui: &mut egui::Ui, current: &str) {
+        ui.label(theme::section_heading("Autoreduction IPTS"));
+        ui.add_space(theme::SPACE_XS);
+        theme::container_frame().show(ui, |ui| {
+            match &self.ipts_list {
+                Ok(list) if list.is_empty() => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "No accessible IPTS found under {IPTS_ROOT}"
+                        ))
+                        .color(theme::WARNING),
+                    );
+                }
+                Ok(list) => {
+                    let mut selected: Option<String> = None;
+                    ui.horizontal(|ui| {
+                        ui.label("IPTS to use:");
+                        egui::ComboBox::from_id_salt("ipts_combo")
+                            .selected_text(if current.is_empty() {
+                                "— select —"
+                            } else {
+                                current
+                            })
+                            .show_ui(ui, |ui| {
+                                for name in list {
+                                    if ui
+                                        .selectable_label(name == current, name)
+                                        .clicked()
+                                        && name != current
+                                    {
+                                        selected = Some(name.clone());
+                                    }
+                                }
+                            });
+                        ui.label(
+                            egui::RichText::new(format!("({} accessible)", list.len()))
+                                .color(theme::TEXT_EMPHASIS),
+                        );
+                    });
+                    if let Some(name) = selected {
+                        match config::set_value(Path::new(CONFIG_PATH), "ipts", &name) {
+                            Ok(()) => self.write_error = None,
+                            Err(e) => self.write_error = Some(e),
+                        }
+                        self.refresh();
+                    }
+                }
+                Err(e) => {
+                    ui.label(
+                        egui::RichText::new(format!("Cannot list IPTS: {e}"))
+                            .color(theme::DANGER),
+                    );
+                }
+            }
+        });
+    }
+
     /// Read-only view of every `key: value` pair of the configuration file.
     fn details(&self, ui: &mut egui::Ui, cfg: &config::AutoNormConfig) {
         ui.label(theme::section_heading("Configuration"));
@@ -260,8 +360,11 @@ impl MonitorApp {
                         );
                     });
                 }
-                // The raw configuration content is admin-only.
+                // The raw configuration content and the IPTS selector are
+                // admin-only.
                 if self.admin_unlocked {
+                    ui.add_space(theme::SPACE_LG);
+                    self.ipts_section(ui, cfg.get("ipts").unwrap_or(""));
                     ui.add_space(theme::SPACE_LG);
                     self.details(ui, &cfg);
                 }

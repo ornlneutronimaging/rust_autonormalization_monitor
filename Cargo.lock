@@ -422,6 +422,7 @@ dependencies = [
  "chrono",
  "eframe",
  "image",
+ "libc",
  "sha2",
 ]
 
