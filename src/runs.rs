@@ -99,6 +99,28 @@ pub fn folders_from_log(log_path: &Path) -> LogFolders {
     folders
 }
 
+/// Detector offset (µs) for a data folder, read from its `config.json`
+/// (falling back to the `summary.json` the autoreduction writes):
+/// `{"detector_offset": {"value": 0.0, "units": "us"}}`. Plain numbers
+/// (`"detector_offset": 12.5`) are accepted too. `None` when no file names
+/// an offset.
+pub fn detector_offset_us(folder: &Path) -> Option<f64> {
+    for name in ["config.json", "summary.json"] {
+        let Ok(content) = fs::read_to_string(folder.join(name)) else {
+            continue;
+        };
+        let Ok(json) = content.parse::<serde_json::Value>() else {
+            continue;
+        };
+        let offset = &json["detector_offset"];
+        let value = offset["value"].as_f64().or_else(|| offset.as_f64());
+        if let Some(value) = value {
+            return Some(value);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +166,25 @@ mod tests {
         assert!(folders.normalized.is_none());
         // No matching lines / unreadable log → empty folders.
         assert!(folders_from_log(&dir.join("missing.log")).corrected.is_none());
+    }
+
+    #[test]
+    fn reads_detector_offset() {
+        let dir = std::env::temp_dir().join("anm_test_offset");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // No json at all.
+        assert_eq!(detector_offset_us(&dir), None);
+        // summary.json with the autoreduction's structure.
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"detector_offset": {"value": 7.5, "units": "us"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detector_offset_us(&dir), Some(7.5));
+        // config.json takes precedence, plain-number form accepted.
+        fs::write(dir.join("config.json"), r#"{"detector_offset": 12.0}"#).unwrap();
+        assert_eq!(detector_offset_us(&dir), Some(12.0));
     }
 
     #[test]

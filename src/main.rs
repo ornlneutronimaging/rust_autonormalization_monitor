@@ -35,11 +35,11 @@ const ADMIN_PASSWORD_SHA256: &str =
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 /// Number of most recently reduced runs shown in the Monitor table.
 const MONITOR_RUN_COUNT: usize = 20;
-/// Application launched to visualize a run's detector-efficiency-corrected
-/// data; called with the data folder as its only argument. Placeholder until
-/// the visualizer application is designed.
+/// Application launched to visualize a run's corrected / normalized data:
+/// the rust_tiff_viewer, called with the data folder and, when the folder's
+/// config.json / summary.json names one, the detector offset (µs, --offset).
 const DATA_VISUALIZER_CMD: &str =
-    "/SNS/VENUS/shared/software/git/rust_autonormalization_visualizer/launch_visualizer.sh";
+    "/SNS/VENUS/shared/software/git/rust_tiff_viewer/launch_rust_tiff_viewer.sh";
 
 /// Which of a run's files is open in the viewer below the Monitor table.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -469,12 +469,16 @@ impl MonitorApp {
         });
     }
 
-    /// Launch the external visualizer application on a data folder (detached).
+    /// Launch the rust_tiff_viewer on a data folder (detached), passing the
+    /// detector offset found in the folder's config.json / summary.json.
     fn launch_visualizer(&mut self, folder: &Path) {
         let result = if folder.is_dir() {
-            std::process::Command::new(DATA_VISUALIZER_CMD)
-                .arg(folder)
-                .spawn()
+            let mut cmd = std::process::Command::new(DATA_VISUALIZER_CMD);
+            cmd.arg(folder);
+            if let Some(offset_us) = runs::detector_offset_us(folder) {
+                cmd.arg("--offset").arg(offset_us.to_string());
+            }
+            cmd.spawn()
                 .map(|_| ())
                 .map_err(|e| format!("cannot launch {DATA_VISUALIZER_CMD}: {e}"))
         } else {
