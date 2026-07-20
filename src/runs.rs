@@ -64,27 +64,39 @@ pub fn last_runs(log_dir: &Path, count: usize) -> Result<Vec<RunEntry>, String> 
     Ok(runs)
 }
 
-/// Folder the reduction wrote the detector-efficiency-corrected data to,
-/// parsed from the run's log file: the line `Writing data to <path>`.
-/// The last such line wins if the log ever contains several.
-pub fn data_folder_from_log(log_path: &Path) -> Result<PathBuf, String> {
-    let content = fs::read_to_string(log_path)
-        .map_err(|e| format!("cannot read {}: {e}", log_path.display()))?;
-    content
-        .lines()
-        .filter_map(|line| {
-            // Tolerate the historical "Writting" spelling.
-            line.strip_prefix("Writing data to ")
-                .or_else(|| line.strip_prefix("Writting data to "))
-        })
-        .last()
-        .map(|path| PathBuf::from(path.trim()))
-        .ok_or_else(|| {
-            format!(
-                "no 'Writing data to' line found in {}",
-                log_path.display()
-            )
-        })
+/// Data folders a reduction reported in its log file.
+#[derive(Clone, Debug, Default)]
+pub struct LogFolders {
+    /// Detector-efficiency-corrected data: `Writing data to <path>`.
+    pub corrected: Option<PathBuf>,
+    /// Normalized data (written by the normalization tool):
+    /// `Writing normalized data to <path>`.
+    pub normalized: Option<PathBuf>,
+}
+
+/// Parse the data-folder lines out of a run's log file. For each kind the
+/// last matching line wins if the log ever contains several. A missing or
+/// unreadable log yields empty folders.
+pub fn folders_from_log(log_path: &Path) -> LogFolders {
+    let Ok(content) = fs::read_to_string(log_path) else {
+        return LogFolders::default();
+    };
+    let mut folders = LogFolders::default();
+    for line in content.lines() {
+        // Tolerate the historical "Writting" spelling.
+        if let Some(path) = line
+            .strip_prefix("Writing normalized data to ")
+            .or_else(|| line.strip_prefix("Writting normalized data to "))
+        {
+            folders.normalized = Some(PathBuf::from(path.trim()));
+        } else if let Some(path) = line
+            .strip_prefix("Writing data to ")
+            .or_else(|| line.strip_prefix("Writting data to "))
+        {
+            folders.corrected = Some(PathBuf::from(path.trim()));
+        }
+    }
+    folders
 }
 
 #[cfg(test)]
@@ -101,23 +113,37 @@ mod tests {
     }
 
     #[test]
-    fn extracts_data_folder_from_log() {
+    fn extracts_data_folders_from_log() {
         let dir = std::env::temp_dir().join("anm_test_datafolder");
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("VENUS_1.nxs.h5.log");
         fs::write(
             &log,
-            "Parsing input\nWriting data to /SNS/VENUS/IPTS-1/shared/autoreduce/images/run_1\nrun_number ='1'\n",
+            "Parsing input\n\
+             Writing data to /SNS/VENUS/IPTS-1/shared/autoreduce/images/run_1\n\
+             Writing normalized data to /SNS/VENUS/IPTS-1/shared/autoreduce/normalized/run_1\n\
+             run_number ='1'\n",
         )
         .unwrap();
+        let folders = folders_from_log(&log);
         assert_eq!(
-            data_folder_from_log(&log).unwrap(),
-            PathBuf::from("/SNS/VENUS/IPTS-1/shared/autoreduce/images/run_1")
+            folders.corrected,
+            Some(PathBuf::from("/SNS/VENUS/IPTS-1/shared/autoreduce/images/run_1"))
         );
-        // No matching line → error.
-        let empty = dir.join("VENUS_2.nxs.h5.log");
-        fs::write(&empty, "Parsing input\n").unwrap();
-        assert!(data_folder_from_log(&empty).is_err());
+        assert_eq!(
+            folders.normalized,
+            Some(PathBuf::from(
+                "/SNS/VENUS/IPTS-1/shared/autoreduce/normalized/run_1"
+            ))
+        );
+        // Not-normalized run: only the corrected folder is present.
+        let plain = dir.join("VENUS_2.nxs.h5.log");
+        fs::write(&plain, "Writing data to /tmp/x\n").unwrap();
+        let folders = folders_from_log(&plain);
+        assert_eq!(folders.corrected, Some(PathBuf::from("/tmp/x")));
+        assert!(folders.normalized.is_none());
+        // No matching lines / unreadable log → empty folders.
+        assert!(folders_from_log(&dir.join("missing.log")).corrected.is_none());
     }
 
     #[test]

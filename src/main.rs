@@ -149,6 +149,9 @@ struct MonitorApp {
     viewer_content: String,
     /// Error from the last attempt to launch the data visualizer.
     launch_error: Option<String>,
+    /// Corrected/normalized data folders parsed from each run's log
+    /// (rebuilt on every refresh).
+    run_folders: std::collections::HashMap<u64, runs::LogFolders>,
 }
 
 impl MonitorApp {
@@ -169,6 +172,7 @@ impl MonitorApp {
             viewer: None,
             viewer_content: String::new(),
             launch_error: None,
+            run_folders: std::collections::HashMap::new(),
         };
         app.refresh();
         app
@@ -191,6 +195,15 @@ impl MonitorApp {
             Some(dir) => runs::last_runs(&dir, MONITOR_RUN_COUNT),
             None => Err("no IPTS defined in the configuration file".to_owned()),
         };
+        self.run_folders.clear();
+        if let Ok(run_list) = &self.runs {
+            for run in run_list {
+                if let Some(log_path) = &run.log_path {
+                    self.run_folders
+                        .insert(run.run_number, runs::folders_from_log(log_path));
+                }
+            }
+        }
         self.reload_viewer();
         self.last_refresh = Instant::now();
     }
@@ -456,19 +469,17 @@ impl MonitorApp {
         });
     }
 
-    /// Find the run's detector-efficiency-corrected data folder in its log
-    /// and launch the external visualizer application on it (detached).
-    fn launch_visualizer(&mut self, log_path: &Path) {
-        let result = runs::data_folder_from_log(log_path).and_then(|folder| {
-            if !folder.is_dir() {
-                return Err(format!("data folder not found: {}", folder.display()));
-            }
+    /// Launch the external visualizer application on a data folder (detached).
+    fn launch_visualizer(&mut self, folder: &Path) {
+        let result = if folder.is_dir() {
             std::process::Command::new(DATA_VISUALIZER_CMD)
-                .arg(&folder)
+                .arg(folder)
                 .spawn()
                 .map(|_| ())
                 .map_err(|e| format!("cannot launch {DATA_VISUALIZER_CMD}: {e}"))
-        });
+        } else {
+            Err(format!("data folder not found: {}", folder.display()))
+        };
         self.launch_error = result.err();
     }
 
@@ -552,7 +563,7 @@ impl MonitorApp {
                 .max_height(ui.available_height() * 0.45)
                 .show(ui, |ui| {
                     egui::Grid::new("runs_grid")
-                        .num_columns(6)
+                        .num_columns(7)
                         .striped(true)
                         .spacing([theme::SPACE_LG * 2.0, theme::SPACE_XS])
                         .show(ui, |ui| {
@@ -561,7 +572,8 @@ impl MonitorApp {
                             ui.label(theme::section_heading("Status"));
                             ui.label(theme::section_heading("Log"));
                             ui.label(theme::section_heading("Error log"));
-                            ui.label(theme::section_heading("Data"));
+                            ui.label(theme::section_heading("Corrected"));
+                            ui.label(theme::section_heading("Normalized"));
                             ui.end_row();
                             for run in &run_list {
                                 let failed = run.err_path.is_some();
@@ -601,29 +613,43 @@ impl MonitorApp {
                                         );
                                     }
                                 }
-                                // Detector-efficiency-corrected data: launch
-                                // the external visualizer on the folder named
-                                // in the run's log.
-                                match &run.log_path {
-                                    Some(log_path) => {
-                                        let clicked = ui
-                                            .button("▶ visualize")
-                                            .on_hover_text(
-                                                "Open the detector efficiency corrected data \
-                                                 in the visualizer",
-                                            )
-                                            .clicked();
-                                        if clicked {
-                                            self.launch_error = None;
-                                            let log_path = log_path.clone();
-                                            self.launch_visualizer(&log_path);
+                                // Corrected / Normalized data: launch the
+                                // external visualizer on the folder named in
+                                // the run's log. A dash means the log does
+                                // not name that folder (e.g. the run was
+                                // never normalized).
+                                let folders =
+                                    self.run_folders.get(&run.run_number).cloned();
+                                for (folder, what) in [
+                                    (
+                                        folders.as_ref().and_then(|f| f.corrected.clone()),
+                                        "detector efficiency corrected",
+                                    ),
+                                    (
+                                        folders.as_ref().and_then(|f| f.normalized.clone()),
+                                        "normalized",
+                                    ),
+                                ] {
+                                    match folder {
+                                        Some(folder) => {
+                                            let clicked = ui
+                                                .button("▶ visualize")
+                                                .on_hover_text(format!(
+                                                    "Open the {what} data in the visualizer\n{}",
+                                                    folder.display()
+                                                ))
+                                                .clicked();
+                                            if clicked {
+                                                self.launch_error = None;
+                                                self.launch_visualizer(&folder);
+                                            }
                                         }
-                                    }
-                                    None => {
-                                        ui.label(
-                                            egui::RichText::new("—")
-                                                .color(theme::TEXT_EMPHASIS),
-                                        );
+                                        None => {
+                                            ui.label(
+                                                egui::RichText::new("—")
+                                                    .color(theme::TEXT_EMPHASIS),
+                                            );
+                                        }
                                     }
                                 }
                                 ui.end_row();
