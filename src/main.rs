@@ -11,6 +11,7 @@
 //! changes made by other tools (e.g. the marimo normalization notebook).
 
 mod config;
+mod runs;
 mod theme;
 
 use eframe::egui;
@@ -32,6 +33,24 @@ const ADMIN_PASSWORD_SHA256: &str =
     "b8b22aedc372aa891df895be9a7626e6d9ddc6d39ba85d202ca68de8c52ad782";
 /// How often the configuration file is re-read.
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
+/// Number of most recently reduced runs shown in the Monitor table.
+const MONITOR_RUN_COUNT: usize = 20;
+
+/// Which of a run's files is open in the viewer below the Monitor table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogKind {
+    Log,
+    Err,
+}
+
+impl LogKind {
+    fn label(self) -> &'static str {
+        match self {
+            LogKind::Log => "log",
+            LogKind::Err => "error log",
+        }
+    }
+}
 
 /// POSIX `access(2)` check: can the current user read + enter this directory?
 fn can_access(path: &Path) -> bool {
@@ -116,15 +135,22 @@ struct MonitorApp {
     ipts_list: Result<Vec<String>, String>,
     /// Text typed by the admin to narrow the IPTS list (matched on the number).
     ipts_filter: String,
+    /// Last-reduced runs shown in the Monitor tab (refreshed with the config).
+    runs: Result<Vec<runs::RunEntry>, String>,
+    /// File open in the viewer below the Monitor table: (run number, kind).
+    viewer: Option<(u64, LogKind)>,
+    /// Content of the viewed file (re-read on every refresh so a run that is
+    /// still reducing streams into the viewer).
+    viewer_content: String,
 }
 
 impl MonitorApp {
     fn new() -> Self {
-        Self {
+        let mut app = Self {
             logo: None,
             logo_loaded: false,
             tab: Tab::Admin,
-            cfg: config::read(Path::new(CONFIG_PATH)),
+            cfg: Ok(config::AutoNormConfig::default()),
             last_refresh: Instant::now(),
             admin_unlocked: false,
             password_input: String::new(),
@@ -132,12 +158,60 @@ impl MonitorApp {
             write_error: None,
             ipts_list: Ok(Vec::new()),
             ipts_filter: String::new(),
-        }
+            runs: Ok(Vec::new()),
+            viewer: None,
+            viewer_content: String::new(),
+        };
+        app.refresh();
+        app
+    }
+
+    /// `/SNS/VENUS/<ipts>/shared/autoreduce/reduction_log` for the IPTS
+    /// currently named in the configuration file.
+    fn reduction_log_dir(&self) -> Option<std::path::PathBuf> {
+        let ipts = self.cfg.as_ref().ok()?.get("ipts")?;
+        Some(
+            Path::new(IPTS_ROOT)
+                .join(ipts)
+                .join("shared/autoreduce/reduction_log"),
+        )
     }
 
     fn refresh(&mut self) {
         self.cfg = config::read(Path::new(CONFIG_PATH));
+        self.runs = match self.reduction_log_dir() {
+            Some(dir) => runs::last_runs(&dir, MONITOR_RUN_COUNT),
+            None => Err("no IPTS defined in the configuration file".to_owned()),
+        };
+        self.reload_viewer();
         self.last_refresh = Instant::now();
+    }
+
+    /// (Re)read the file selected in the Monitor viewer. Clears the selection
+    /// if its run dropped out of the table.
+    fn reload_viewer(&mut self) {
+        let Some((run_number, kind)) = self.viewer else {
+            return;
+        };
+        let path = self
+            .runs
+            .as_ref()
+            .ok()
+            .and_then(|runs| runs.iter().find(|r| r.run_number == run_number))
+            .and_then(|r| match kind {
+                LogKind::Log => r.log_path.clone(),
+                LogKind::Err => r.err_path.clone(),
+            });
+        match path {
+            Some(path) => {
+                self.viewer_content = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| format!("cannot read {}: {e}", path.display()));
+            }
+            None => {
+                self.viewer = None;
+                self.viewer_content.clear();
+            }
+        }
     }
 
     fn try_unlock(&mut self) {
@@ -411,14 +485,118 @@ impl MonitorApp {
         self.admin_section(ui);
     }
 
-    /// Monitor tab: live view of the normalization state (to be implemented).
+    /// Monitor tab: master table of the last reduced runs, with switches to
+    /// open each run's reduction log / error log in a viewer below the table.
     fn monitor_tab(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
+        let ipts = self
+            .cfg
+            .as_ref()
+            .ok()
+            .and_then(|cfg| cfg.get("ipts"))
+            .unwrap_or("?")
+            .to_owned();
+        ui.label(theme::section_heading(&format!(
+            "Last {MONITOR_RUN_COUNT} reduced runs — {ipts}"
+        )));
+        ui.add_space(theme::SPACE_XS);
+
+        let run_list = match self.runs.clone() {
+            Ok(list) => list,
+            Err(e) => {
+                ui.label(
+                    egui::RichText::new(format!("Cannot list reduced runs: {e}"))
+                        .color(theme::DANGER),
+                );
+                return;
+            }
+        };
+        if run_list.is_empty() {
             ui.label(
-                egui::RichText::new("Monitoring view — coming soon")
+                egui::RichText::new("No reduced runs found in the reduction_log folder")
                     .color(theme::TEXT_EMPHASIS),
             );
+            return;
+        }
+
+        // Master table: run number | log switch | error-log switch. A switch
+        // opens that file in the viewer below; only one file is open at a
+        // time, and clicking the active switch closes the viewer.
+        let mut toggled: Option<(u64, LogKind)> = None;
+        theme::container_frame().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("runs_table")
+                .max_height(ui.available_height() * 0.45)
+                .show(ui, |ui| {
+                    egui::Grid::new("runs_grid")
+                        .num_columns(3)
+                        .striped(true)
+                        .spacing([theme::SPACE_LG * 2.0, theme::SPACE_XS])
+                        .show(ui, |ui| {
+                            ui.label(theme::section_heading("Run"));
+                            ui.label(theme::section_heading("Log"));
+                            ui.label(theme::section_heading("Error log"));
+                            ui.end_row();
+                            for run in &run_list {
+                                ui.label(
+                                    egui::RichText::new(run.run_number.to_string()).strong(),
+                                );
+                                for (kind, path) in [
+                                    (LogKind::Log, &run.log_path),
+                                    (LogKind::Err, &run.err_path),
+                                ] {
+                                    if path.is_some() {
+                                        let active =
+                                            self.viewer == Some((run.run_number, kind));
+                                        if ui.selectable_label(active, "view").clicked() {
+                                            toggled = Some((run.run_number, kind));
+                                        }
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("—")
+                                                .color(theme::TEXT_EMPHASIS),
+                                        );
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
         });
+        if let Some(selection) = toggled {
+            // Same switch again → off; otherwise switch the viewer over.
+            self.viewer = if self.viewer == Some(selection) {
+                None
+            } else {
+                Some(selection)
+            };
+            self.viewer_content.clear();
+            self.reload_viewer();
+        }
+
+        // Viewer: content of the selected file, below the table.
+        if let Some((run_number, kind)) = self.viewer {
+            ui.add_space(theme::SPACE_MD);
+            ui.label(theme::section_heading(&format!(
+                "Run {run_number} — {} (VENUS_{run_number}.nxs.h5.{})",
+                kind.label(),
+                match kind {
+                    LogKind::Log => "log",
+                    LogKind::Err => "err",
+                }
+            )));
+            ui.add_space(theme::SPACE_XS);
+            theme::container_frame().show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("log_viewer")
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.viewer_content.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+            });
+        }
     }
 
     /// Admin unlock (password prompt) / lock control.
