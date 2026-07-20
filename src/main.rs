@@ -114,6 +114,8 @@ struct MonitorApp {
     write_error: Option<String>,
     /// IPTS folders the current user can access (scanned on admin unlock).
     ipts_list: Result<Vec<String>, String>,
+    /// Text typed by the admin to narrow the IPTS list (matched on the number).
+    ipts_filter: String,
 }
 
 impl MonitorApp {
@@ -129,6 +131,7 @@ impl MonitorApp {
             password_error: false,
             write_error: None,
             ipts_list: Ok(Vec::new()),
+            ipts_filter: String::new(),
         }
     }
 
@@ -281,6 +284,16 @@ impl MonitorApp {
                     );
                 }
                 Ok(list) => {
+                    // Type-to-filter: keep the entries whose IPTS number
+                    // contains the typed text (e.g. "369" → IPTS-36967).
+                    let filter = self
+                        .ipts_filter
+                        .trim()
+                        .trim_start_matches("IPTS-")
+                        .trim_start_matches("ipts-")
+                        .to_owned();
+                    let filtered: Vec<&String> =
+                        list.iter().filter(|name| name.contains(&filter)).collect();
                     let mut selected: Option<String> = None;
                     ui.horizontal(|ui| {
                         ui.label("IPTS to use:");
@@ -291,21 +304,37 @@ impl MonitorApp {
                                 current
                             })
                             .show_ui(ui, |ui| {
-                                for name in list {
+                                for name in &filtered {
                                     if ui
-                                        .selectable_label(name == current, name)
+                                        .selectable_label(*name == current, *name)
                                         .clicked()
-                                        && name != current
+                                        && *name != current
                                     {
-                                        selected = Some(name.clone());
+                                        selected = Some((*name).clone());
                                     }
                                 }
                             });
+                        ui.label("Filter:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ipts_filter)
+                                .hint_text("type IPTS number…")
+                                .desired_width(130.0),
+                        );
                         ui.label(
-                            egui::RichText::new(format!("({} accessible)", list.len()))
-                                .color(theme::TEXT_EMPHASIS),
+                            egui::RichText::new(if filter.is_empty() {
+                                format!("({} accessible)", list.len())
+                            } else {
+                                format!("({} of {} match)", filtered.len(), list.len())
+                            })
+                            .color(theme::TEXT_EMPHASIS),
                         );
                     });
+                    if !filter.is_empty() && filtered.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No accessible IPTS matches the filter")
+                                .color(theme::WARNING),
+                        );
+                    }
                     if let Some(name) = selected {
                         match config::set_value(Path::new(CONFIG_PATH), "ipts", &name) {
                             Ok(()) => self.write_error = None,
