@@ -528,35 +528,28 @@ impl MonitorApp {
         }
         ui.add_space(theme::SPACE_LG);
         self.admin_section(ui);
-        ui.add_space(theme::SPACE_LG);
-        self.refresh_section(ui);
     }
 
     /// Auto-refresh controls: enable/disable the periodic re-read of the
     /// config file and runs table, and pick its period.
-    fn refresh_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(theme::section_heading("Auto-refresh"));
-        ui.add_space(theme::SPACE_XS);
-        theme::container_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.auto_refresh, "Auto-refresh");
-                ui.add_enabled(
-                    self.auto_refresh,
-                    egui::DragValue::new(&mut self.refresh_secs)
-                        .range(1..=3600)
-                        .suffix(" s")
-                        .speed(1),
-                )
-                .on_hover_text("Refresh period in seconds");
-                if ui
-                    .button("⟳ Refresh now")
-                    .on_hover_text("Re-read the config file and the runs table")
-                    .clicked()
-                {
-                    self.refresh();
-                }
-            });
-        });
+    fn refresh_controls(&mut self, ui: &mut egui::Ui) {
+        // Laid out right-to-left, so add the widgets in reverse order.
+        if ui
+            .button("⟳ Refresh now")
+            .on_hover_text("Re-read the config file and the runs table")
+            .clicked()
+        {
+            self.refresh();
+        }
+        ui.add_enabled(
+            self.auto_refresh,
+            egui::DragValue::new(&mut self.refresh_secs)
+                .range(1..=3600)
+                .suffix(" s")
+                .speed(1),
+        )
+        .on_hover_text("Refresh period in seconds");
+        ui.checkbox(&mut self.auto_refresh, "Auto-refresh");
     }
 
     /// Monitor tab: master table of the last reduced runs, with switches to
@@ -569,9 +562,15 @@ impl MonitorApp {
             .and_then(|cfg| cfg.get("ipts"))
             .unwrap_or("?")
             .to_owned();
-        ui.label(theme::section_heading(&format!(
-            "Last {MONITOR_RUN_COUNT} reduced runs — {ipts}"
-        )));
+        // Heading on the left, auto-refresh controls on the right.
+        ui.horizontal(|ui| {
+            ui.label(theme::section_heading(&format!(
+                "Last {MONITOR_RUN_COUNT} reduced runs — {ipts}"
+            )));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.refresh_controls(ui);
+            });
+        });
         ui.add_space(theme::SPACE_XS);
 
         let run_list = match self.runs.clone() {
