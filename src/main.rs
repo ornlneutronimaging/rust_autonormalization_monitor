@@ -528,11 +528,12 @@ impl MonitorApp {
                 .max_height(ui.available_height() * 0.45)
                 .show(ui, |ui| {
                     egui::Grid::new("runs_grid")
-                        .num_columns(3)
+                        .num_columns(4)
                         .striped(true)
                         .spacing([theme::SPACE_LG * 2.0, theme::SPACE_XS])
                         .show(ui, |ui| {
                             ui.label(theme::section_heading("Run"));
+                            ui.label(theme::section_heading("Date/time"));
                             ui.label(theme::section_heading("Log"));
                             ui.label(theme::section_heading("Error log"));
                             ui.end_row();
@@ -540,6 +541,8 @@ impl MonitorApp {
                                 ui.label(
                                     egui::RichText::new(run.run_number.to_string()).strong(),
                                 );
+                                let when: chrono::DateTime<chrono::Local> = run.mtime.into();
+                                ui.label(when.format("%Y-%m-%d %H:%M:%S").to_string());
                                 for (kind, path) in [
                                     (LogKind::Log, &run.log_path),
                                     (LogKind::Err, &run.err_path),
