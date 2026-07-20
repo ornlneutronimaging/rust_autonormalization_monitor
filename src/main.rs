@@ -31,8 +31,8 @@ const APP_TITLE: &str = "VENUS Auto Normalization Monitor";
 /// source or the compiled binary, only this digest.
 const ADMIN_PASSWORD_SHA256: &str =
     "b8b22aedc372aa891df895be9a7626e6d9ddc6d39ba85d202ca68de8c52ad782";
-/// How often the configuration file is re-read.
-const REFRESH_EVERY: Duration = Duration::from_secs(2);
+/// Default auto-refresh period (config file + runs table), in seconds.
+const DEFAULT_REFRESH_SECS: u32 = 5;
 /// Number of most recently reduced runs shown in the Monitor table.
 const MONITOR_RUN_COUNT: usize = 20;
 /// Application launched to visualize a run's corrected / normalized data:
@@ -152,6 +152,10 @@ struct MonitorApp {
     /// Corrected/normalized data folders parsed from each run's log
     /// (rebuilt on every refresh).
     run_folders: std::collections::HashMap<u64, runs::LogFolders>,
+    /// Auto-refresh of the config file and runs table.
+    auto_refresh: bool,
+    /// Auto-refresh period in seconds.
+    refresh_secs: u32,
 }
 
 impl MonitorApp {
@@ -173,6 +177,8 @@ impl MonitorApp {
             viewer_content: String::new(),
             launch_error: None,
             run_folders: std::collections::HashMap::new(),
+            auto_refresh: true,
+            refresh_secs: DEFAULT_REFRESH_SECS,
         };
         app.refresh();
         app
@@ -522,6 +528,35 @@ impl MonitorApp {
         }
         ui.add_space(theme::SPACE_LG);
         self.admin_section(ui);
+        ui.add_space(theme::SPACE_LG);
+        self.refresh_section(ui);
+    }
+
+    /// Auto-refresh controls: enable/disable the periodic re-read of the
+    /// config file and runs table, and pick its period.
+    fn refresh_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(theme::section_heading("Auto-refresh"));
+        ui.add_space(theme::SPACE_XS);
+        theme::container_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.auto_refresh, "Auto-refresh");
+                ui.add_enabled(
+                    self.auto_refresh,
+                    egui::DragValue::new(&mut self.refresh_secs)
+                        .range(1..=3600)
+                        .suffix(" s")
+                        .speed(1),
+                )
+                .on_hover_text("Refresh period in seconds");
+                if ui
+                    .button("⟳ Refresh now")
+                    .on_hover_text("Re-read the config file and the runs table")
+                    .clicked()
+                {
+                    self.refresh();
+                }
+            });
+        });
     }
 
     /// Monitor tab: master table of the last reduced runs, with switches to
@@ -753,10 +788,13 @@ impl eframe::App for MonitorApp {
 
         // Poll the file so changes made elsewhere show up without user action;
         // request_repaint keeps frames coming while the window is idle.
-        if self.last_refresh.elapsed() >= REFRESH_EVERY {
-            self.refresh();
+        if self.auto_refresh {
+            let period = Duration::from_secs(self.refresh_secs.max(1) as u64);
+            if self.last_refresh.elapsed() >= period {
+                self.refresh();
+            }
+            ctx.request_repaint_after(period);
         }
-        ctx.request_repaint_after(REFRESH_EVERY);
 
         self.header(ctx);
 
