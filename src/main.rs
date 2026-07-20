@@ -35,6 +35,11 @@ const ADMIN_PASSWORD_SHA256: &str =
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 /// Number of most recently reduced runs shown in the Monitor table.
 const MONITOR_RUN_COUNT: usize = 20;
+/// Application launched to visualize a run's detector-efficiency-corrected
+/// data; called with the data folder as its only argument. Placeholder until
+/// the visualizer application is designed.
+const DATA_VISUALIZER_CMD: &str =
+    "/SNS/VENUS/shared/software/git/rust_autonormalization_visualizer/launch_visualizer.sh";
 
 /// Which of a run's files is open in the viewer below the Monitor table.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -142,6 +147,8 @@ struct MonitorApp {
     /// Content of the viewed file (re-read on every refresh so a run that is
     /// still reducing streams into the viewer).
     viewer_content: String,
+    /// Error from the last attempt to launch the data visualizer.
+    launch_error: Option<String>,
 }
 
 impl MonitorApp {
@@ -161,6 +168,7 @@ impl MonitorApp {
             runs: Ok(Vec::new()),
             viewer: None,
             viewer_content: String::new(),
+            launch_error: None,
         };
         app.refresh();
         app
@@ -448,6 +456,22 @@ impl MonitorApp {
         });
     }
 
+    /// Find the run's detector-efficiency-corrected data folder in its log
+    /// and launch the external visualizer application on it (detached).
+    fn launch_visualizer(&mut self, log_path: &Path) {
+        let result = runs::data_folder_from_log(log_path).and_then(|folder| {
+            if !folder.is_dir() {
+                return Err(format!("data folder not found: {}", folder.display()));
+            }
+            std::process::Command::new(DATA_VISUALIZER_CMD)
+                .arg(&folder)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("cannot launch {DATA_VISUALIZER_CMD}: {e}"))
+        });
+        self.launch_error = result.err();
+    }
+
     /// Admin tab: ON/OFF status button, admin unlock, and (once unlocked) the
     /// raw configuration content.
     fn admin_tab(&mut self, ui: &mut egui::Ui) {
@@ -528,7 +552,7 @@ impl MonitorApp {
                 .max_height(ui.available_height() * 0.45)
                 .show(ui, |ui| {
                     egui::Grid::new("runs_grid")
-                        .num_columns(5)
+                        .num_columns(6)
                         .striped(true)
                         .spacing([theme::SPACE_LG * 2.0, theme::SPACE_XS])
                         .show(ui, |ui| {
@@ -537,6 +561,7 @@ impl MonitorApp {
                             ui.label(theme::section_heading("Status"));
                             ui.label(theme::section_heading("Log"));
                             ui.label(theme::section_heading("Error log"));
+                            ui.label(theme::section_heading("Data"));
                             ui.end_row();
                             for run in &run_list {
                                 let failed = run.err_path.is_some();
@@ -576,11 +601,43 @@ impl MonitorApp {
                                         );
                                     }
                                 }
+                                // Detector-efficiency-corrected data: launch
+                                // the external visualizer on the folder named
+                                // in the run's log.
+                                match &run.log_path {
+                                    Some(log_path) => {
+                                        let clicked = ui
+                                            .button("▶ visualize")
+                                            .on_hover_text(
+                                                "Open the detector efficiency corrected data \
+                                                 in the visualizer",
+                                            )
+                                            .clicked();
+                                        if clicked {
+                                            self.launch_error = None;
+                                            let log_path = log_path.clone();
+                                            self.launch_visualizer(&log_path);
+                                        }
+                                    }
+                                    None => {
+                                        ui.label(
+                                            egui::RichText::new("—")
+                                                .color(theme::TEXT_EMPHASIS),
+                                        );
+                                    }
+                                }
                                 ui.end_row();
                             }
                         });
                 });
         });
+        if let Some(err) = &self.launch_error {
+            ui.add_space(theme::SPACE_XS);
+            ui.label(
+                egui::RichText::new(format!("Cannot visualize data: {err}"))
+                    .color(theme::DANGER),
+            );
+        }
         if let Some(selection) = toggled {
             // Same switch again → off; otherwise switch the viewer over.
             self.viewer = if self.viewer == Some(selection) {
