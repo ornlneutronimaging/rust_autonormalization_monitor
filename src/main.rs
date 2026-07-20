@@ -539,13 +539,17 @@ impl MonitorApp {
                             ui.label(theme::section_heading("Error log"));
                             ui.end_row();
                             for run in &run_list {
-                                ui.label(
-                                    egui::RichText::new(run.run_number.to_string()).strong(),
-                                );
+                                let failed = run.err_path.is_some();
+                                let mut run_text =
+                                    egui::RichText::new(run.run_number.to_string()).strong();
+                                if failed {
+                                    run_text = run_text.color(theme::DANGER);
+                                }
+                                ui.label(run_text);
                                 let when: chrono::DateTime<chrono::Local> = run.mtime.into();
                                 ui.label(when.format("%Y-%m-%d %H:%M:%S").to_string());
                                 // An error log means the reduction failed.
-                                let status = if run.err_path.is_some() {
+                                let status = if failed {
                                     egui::RichText::new("✖ failed")
                                         .color(theme::DANGER)
                                         .strong()
