@@ -363,7 +363,7 @@ impl MonitorApp {
                 } else {
                     "Read-only — unlock admin mode below to change the state"
                 })
-                .color(theme::TEXT_EMPHASIS),
+                .color(theme::text_emphasis(ui.visuals())),
             );
         });
     }
@@ -374,7 +374,7 @@ impl MonitorApp {
     fn ipts_section(&mut self, ui: &mut egui::Ui, current: &str) {
         ui.label(theme::section_heading("Autoreduction IPTS"));
         ui.add_space(theme::SPACE_XS);
-        theme::container_frame().show(ui, |ui| {
+        theme::container_frame(ui.visuals()).show(ui, |ui| {
             match &self.ipts_list {
                 Ok(list) if list.is_empty() => {
                     ui.label(
@@ -427,7 +427,7 @@ impl MonitorApp {
                             } else {
                                 format!("({} of {} match)", filtered.len(), list.len())
                             })
-                            .color(theme::TEXT_EMPHASIS),
+                            .color(theme::text_emphasis(ui.visuals())),
                         );
                     });
                     if !filter.is_empty() && filtered.is_empty() {
@@ -458,16 +458,16 @@ impl MonitorApp {
     fn details(&self, ui: &mut egui::Ui, cfg: &config::AutoNormConfig) {
         ui.label(theme::section_heading("Configuration"));
         ui.add_space(theme::SPACE_XS);
-        theme::container_frame().show(ui, |ui| {
+        theme::container_frame(ui.visuals()).show(ui, |ui| {
             egui::Grid::new("cfg_grid")
                 .num_columns(2)
                 .spacing([theme::SPACE_LG, theme::SPACE_XS])
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new("file").color(theme::TEXT_EMPHASIS));
+                    ui.label(egui::RichText::new("file").color(theme::text_emphasis(ui.visuals())));
                     ui.label(CONFIG_PATH);
                     ui.end_row();
                     for (key, value) in &cfg.entries {
-                        ui.label(egui::RichText::new(key).color(theme::TEXT_EMPHASIS));
+                        ui.label(egui::RichText::new(key).color(theme::text_emphasis(ui.visuals())));
                         ui.label(value);
                         ui.end_row();
                     }
@@ -586,7 +586,7 @@ impl MonitorApp {
         if run_list.is_empty() {
             ui.label(
                 egui::RichText::new("No reduced runs found in the reduction_log folder")
-                    .color(theme::TEXT_EMPHASIS),
+                    .color(theme::text_emphasis(ui.visuals())),
             );
             return;
         }
@@ -595,7 +595,7 @@ impl MonitorApp {
         // opens that file in the viewer below; only one file is open at a
         // time, and clicking the active switch closes the viewer.
         let mut toggled: Option<(u64, LogKind)> = None;
-        theme::container_frame().show(ui, |ui| {
+        theme::container_frame(ui.visuals()).show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("runs_table")
                 .max_height(ui.available_height() * 0.45)
@@ -647,7 +647,7 @@ impl MonitorApp {
                                     } else {
                                         ui.label(
                                             egui::RichText::new("—")
-                                                .color(theme::TEXT_EMPHASIS),
+                                                .color(theme::text_emphasis(ui.visuals())),
                                         );
                                     }
                                 }
@@ -685,7 +685,7 @@ impl MonitorApp {
                                         None => {
                                             ui.label(
                                                 egui::RichText::new("—")
-                                                    .color(theme::TEXT_EMPHASIS),
+                                                    .color(theme::text_emphasis(ui.visuals())),
                                             );
                                         }
                                     }
@@ -725,7 +725,7 @@ impl MonitorApp {
                 }
             )));
             ui.add_space(theme::SPACE_XS);
-            theme::container_frame().show(ui, |ui| {
+            theme::container_frame(ui.visuals()).show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("log_viewer")
                     .show(ui, |ui| {
@@ -743,12 +743,12 @@ impl MonitorApp {
     fn admin_section(&mut self, ui: &mut egui::Ui) {
         ui.label(theme::section_heading("Admin"));
         ui.add_space(theme::SPACE_XS);
-        theme::container_frame().show(ui, |ui| {
+        theme::container_frame(ui.visuals()).show(ui, |ui| {
             if self.admin_unlocked {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Admin mode unlocked")
-                            .color(theme::PRIMARY_STRONG)
+                            .color(theme::primary_text(ui.visuals()))
                             .strong(),
                     );
                     if ui.button("Lock").clicked() {
@@ -802,7 +802,7 @@ impl eframe::App for MonitorApp {
         egui::TopBottomPanel::top("tab_bar")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE_WEAK)
+                    .fill(theme::surface_weak(&ctx.style().visuals))
                     .inner_margin(egui::Margin {
                         left: 16,
                         right: 16,
@@ -817,6 +817,8 @@ impl eframe::App for MonitorApp {
                             self.tab = *tab;
                         }
                     }
+                    ui.separator();
+                    theme::toggle_button(ui);
                 });
             });
 
@@ -841,6 +843,9 @@ fn main() -> eframe::Result<()> {
         APP_TITLE,
         native_options,
         Box::new(|cc| {
+            // Saved light/dark preference, shared by all the VENUS rust
+            // tools (dark when none is saved); the tab bar has a toggle.
+            cc.egui_ctx.set_theme(theme::load());
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(MonitorApp::new()))
         }),
