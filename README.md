@@ -33,9 +33,12 @@ Single view, top to bottom:
      `<IPTS>/shared/autoreduce/normalized/rolling/anchor_<run>/last_<N>min`
      (staged in `.partial`, promoted on success). In **live mode** (no run
      list) the three normalizations fire automatically each time a new
-     NeXus shows up (auto normalization ON + config selected); with a run
-     list the windows look at those runs only and are launched by hand
-     (**▶ Normalize windows now**). **👁 view** opens one window's folder in
+     NeXus shows up (auto normalization ON + config selected). With a run
+     list and auto normalization OFF the windows look at those runs only,
+     launched by hand (**▶ Normalize windows now**); with auto
+     normalization ON (hybrid mode) every run landing after the newest
+     listed one joins the list automatically and the normalizations fire
+     on each new NeXus. **👁 view** opens one window's folder in
      the rust_tiff_viewer; **👁 Compare all 3** (enabled once every window is
      normalized) opens a SINGLE viewer session with the three stacks side by
      side (`--compare`: shared colorscale, regions mirrored, one profile

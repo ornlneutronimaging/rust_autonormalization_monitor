@@ -385,11 +385,12 @@ impl MonitorApp {
         }
         norm::assign_windows(&mut self.windows, &end_times);
 
-        // Live mode: a new anchor run (a NeXus that just showed up) fires
-        // the window normalizations. The first anchor seen only arms the
+        // Live and hybrid modes: a new anchor run (a NeXus that just
+        // showed up — in hybrid mode, just joined the list) fires the
+        // window normalizations. The first anchor seen only arms the
         // trigger — the app should not fire for a run that landed before
         // it was even watching.
-        if live && self.is_active() {
+        if self.is_active() {
             let anchor_run = self.windows.iter().flat_map(|w| w.runs.iter()).max().copied();
             if let Some(anchor_run) = anchor_run {
                 match self.last_live_anchor {
@@ -404,7 +405,7 @@ impl MonitorApp {
                 }
             }
         } else {
-            // Re-armed when live mode resumes.
+            // Re-armed when auto normalization resumes.
             self.last_live_anchor = None;
         }
     }
@@ -471,8 +472,34 @@ impl MonitorApp {
         if self.ipts.is_some() {
             self.rescan_configs();
         }
+        self.extend_run_list();
         self.check_runs();
         self.last_refresh = Instant::now();
+    }
+
+    /// Hybrid mode: when the user gave a run list AND auto normalization is
+    /// ON, every run that lands after the newest listed one joins the list
+    /// (and the text field) automatically, so the windows and the table
+    /// follow the acquisition.
+    fn extend_run_list(&mut self) {
+        if self.runs.is_empty() || !self.is_active() {
+            return;
+        }
+        let Some(ipts_path) = self.ipts_path() else {
+            return;
+        };
+        let newest_listed = *self.runs.last().expect("list not empty");
+        // `runs` is kept sorted, so appending only-newer runs keeps it sorted.
+        for run in files::list_nexus_runs(&ipts_path) {
+            if run > newest_listed {
+                self.runs.push(run);
+                if !self.run_list_text.trim().is_empty() {
+                    self.run_list_text.push_str(&format!(", {run}"));
+                } else {
+                    self.run_list_text = run.to_string();
+                }
+            }
+        }
     }
 
     /// Is auto-normalization currently active (per the shared config file)?
@@ -938,8 +965,13 @@ impl MonitorApp {
                     "Live: the windows follow the latest run of the IPTS, and the \
                      normalizations fire when a new NeXus shows up (auto \
                      normalization ON + configuration selected)."
+                } else if self.is_active() {
+                    "Hybrid: the windows look at the listed runs, new runs join \
+                     the list as they land, and the normalizations fire on each \
+                     new NeXus."
                 } else {
-                    "The windows look at the listed runs only — launch by hand."
+                    "The windows look at the listed runs only — launch by hand \
+                     (turn auto normalization ON to have new runs join the list)."
                 })
                 .color(theme::text_emphasis(ui.visuals())),
             );
