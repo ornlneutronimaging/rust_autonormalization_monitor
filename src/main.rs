@@ -53,6 +53,13 @@ const TIFF_VIEWER_CMD: &str =
 /// Default rolling time windows, in minutes of acquisition time.
 const DEFAULT_WINDOWS_MIN: [u32; 3] = [5, 15, 30];
 
+/// The two views of the "Runs in use" section.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunsView {
+    Table,
+    Timeline,
+}
+
 /// POSIX `access(2)` check: can the current user read + enter this directory?
 fn can_access(path: &Path) -> bool {
     let Ok(cstr) = CString::new(path.as_os_str().as_bytes()) else {
@@ -168,8 +175,18 @@ struct MonitorApp {
 
     /// Rolling combine-normalization windows (default last 5/15/30 min).
     windows: Vec<norm::Window>,
-    /// NeXus end times already read (they never change once written).
-    end_time_cache: HashMap<u64, chrono::DateTime<chrono::FixedOffset>>,
+    /// NeXus (start, end) acquisition times already read (they never
+    /// change once written).
+    time_cache: HashMap<
+        u64,
+        (
+            chrono::DateTime<chrono::FixedOffset>,
+            chrono::DateTime<chrono::FixedOffset>,
+        ),
+    >,
+    /// Which view of section 5 is open: the table or the acquisition
+    /// timeline plot.
+    runs_view: RunsView,
     /// Latest (anchor) run the live mode already reacted to: a job volley
     /// fires only when a newer NeXus shows up.
     last_live_anchor: Option<u64>,
@@ -214,7 +231,8 @@ impl MonitorApp {
                 .iter()
                 .map(|&m| norm::Window::new(m))
                 .collect(),
-            end_time_cache: HashMap::new(),
+            time_cache: HashMap::new(),
+            runs_view: RunsView::Table,
             last_live_anchor: None,
             norm_tx,
             norm_rx,
@@ -255,7 +273,7 @@ impl MonitorApp {
         self.preview_error = None;
         self.viewer_error = None;
         self.selected_config = None;
-        self.end_time_cache.clear();
+        self.time_cache.clear();
         self.rejected.clear();
         self.last_live_anchor = None;
         for w in &mut self.windows {
@@ -377,16 +395,16 @@ impl MonitorApp {
         // in live mode, the scan stops at the first run older than the
         // widest window (no point opening thousands of old NeXus files).
         for &run in candidates.iter().rev() {
-            let time = match self.end_time_cache.get(&run) {
-                Some(t) => *t,
+            let time = match self.time_cache.get(&run) {
+                Some((_, end)) => *end,
                 None => {
-                    let Some(t) = h5::nexus_end_time(&files::nexus_path(&ipts_path, run))
+                    let Some(times) = h5::nexus_times(&files::nexus_path(&ipts_path, run))
                     else {
                         // Missing or still being written — retry next refresh.
                         continue;
                     };
-                    self.end_time_cache.insert(run, t);
-                    t
+                    self.time_cache.insert(run, times);
+                    times.1
                 }
             };
             // The anchor is the newest NON-rejected run, so rejecting the
@@ -1252,6 +1270,170 @@ impl MonitorApp {
         }
     }
 
+    /// Timeline view of section 5: one horizontal bar per run (acquisition
+    /// start → end, from the NeXus times) and, on top, the coverage of the
+    /// three rolling windows — all on a shared time axis in minutes
+    /// relative to the anchor (the newest non-rejected run).
+    fn runs_timeline(&mut self, ui: &mut egui::Ui) {
+        use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text, VLine};
+        theme::section_frame(ui, |ui| {
+            // (run, start, end, rejected) in table order (ascending runs).
+            let bars_data: Vec<_> = self
+                .run_files
+                .iter()
+                .filter_map(|rf| {
+                    self.time_cache.get(&rf.run).map(|(start, end)| {
+                        (rf.run, *start, *end, self.rejected.contains(&rf.run))
+                    })
+                })
+                .collect();
+            if bars_data.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No acquisition times yet — they are read from the NeXus files",
+                    )
+                    .color(theme::text_emphasis(ui.visuals())),
+                );
+                return;
+            }
+            // Same anchor as the windows: newest end among non-rejected runs.
+            let anchor = bars_data
+                .iter()
+                .filter(|(_, _, _, rejected)| !rejected)
+                .map(|(_, _, end, _)| *end)
+                .max()
+                .unwrap_or_else(|| {
+                    bars_data.iter().map(|(_, _, end, _)| *end).max().expect("not empty")
+                });
+            let to_min = |t: &chrono::DateTime<chrono::FixedOffset>| {
+                t.signed_duration_since(anchor).num_milliseconds() as f64 / 60_000.0
+            };
+
+            let n = bars_data.len();
+            let dark = ui.visuals().dark_mode;
+            let text_color = if dark { theme::TEXT_STRONG } else { theme::TEXT_STRONG_LIGHT };
+            let mut run_bars = Vec::new();
+            let mut texts = Vec::new();
+            // Leftmost extent, for the run-number label offset.
+            let span_min = bars_data
+                .iter()
+                .map(|(_, start, _, _)| to_min(start))
+                .fold(0.0_f64, f64::min)
+                .min(-f64::from(self.windows.iter().map(|w| w.minutes).max().unwrap_or(0)));
+            for (i, (run, start, end, rejected)) in bars_data.iter().enumerate() {
+                let (s, e) = (to_min(start), to_min(end));
+                // A visible sliver even for very short acquisitions.
+                let value = (e - s).max(-span_min * 0.004);
+                run_bars.push(
+                    Bar::new(i as f64, value)
+                        .base_offset(s)
+                        .width(0.6)
+                        .fill(if *rejected {
+                            egui::Color32::from_gray(if dark { 110 } else { 150 })
+                        } else {
+                            theme::PRIMARY
+                        })
+                        .name(format!(
+                            "run {run}{}\n{} → {}  ({:.1} min)",
+                            if *rejected { " (rejected)" } else { "" },
+                            start.format("%H:%M:%S"),
+                            end.format("%H:%M:%S"),
+                            e - s
+                        )),
+                );
+                let mut label = egui::RichText::new(run.to_string()).size(11.0);
+                if *rejected {
+                    label = label.strikethrough();
+                }
+                texts.push(
+                    Text::new(PlotPoint::new(s + span_min * 0.01, i as f64), label)
+                        .anchor(egui::Align2::RIGHT_CENTER)
+                        .color(text_color),
+                );
+            }
+            // Window coverage bands above the runs.
+            let band_colors = [
+                theme::INFO,
+                theme::WARNING,
+                egui::Color32::from_rgb(160, 110, 220),
+            ];
+            let mut band_bars = Vec::new();
+            for (j, w) in self.windows.iter().enumerate() {
+                let y = n as f64 + 0.9 + j as f64;
+                let minutes = f64::from(w.minutes);
+                let color = band_colors[j % band_colors.len()];
+                band_bars.push(
+                    Bar::new(y, minutes)
+                        .base_offset(-minutes)
+                        .width(0.7)
+                        .fill(color.gamma_multiply(0.35))
+                        .name(format!(
+                            "last {} min — {} run(s) in the window",
+                            w.minutes,
+                            w.runs.len()
+                        )),
+                );
+                texts.push(
+                    Text::new(
+                        PlotPoint::new(-minutes - span_min * 0.01, y),
+                        egui::RichText::new(format!("last {} min", w.minutes)).size(11.0),
+                    )
+                    .anchor(egui::Align2::LEFT_CENTER)
+                    .color(color),
+                );
+            }
+
+            let height = ((n + 5) as f32 * 24.0).clamp(200.0, 440.0);
+            let anchor_for_cursor = anchor;
+            Plot::new("acq_timeline")
+                .height(height)
+                .allow_scroll(false)
+                .y_axis_formatter(|_, _| String::new())
+                .include_x(span_min * 1.12)
+                .include_x(-span_min * 0.03)
+                .include_y(-0.7)
+                .include_y(n as f64 + 3.9)
+                .label_formatter(move |name, point| {
+                    if name.is_empty() {
+                        let at = anchor_for_cursor
+                            + chrono::Duration::milliseconds((point.x * 60_000.0) as i64);
+                        format!("{:.1} min  ({})", point.x, at.format("%H:%M:%S"))
+                    } else {
+                        name.to_owned()
+                    }
+                })
+                .show(ui, |plot_ui| {
+                    plot_ui.vline(
+                        VLine::new(0.0)
+                            .color(egui::Color32::from_gray(if dark { 150 } else { 110 }))
+                            .style(egui_plot::LineStyle::dashed_loose())
+                            .name(format!("latest run ({})", anchor.format("%H:%M:%S"))),
+                    );
+                    plot_ui.bar_chart(
+                        BarChart::new(band_bars)
+                            .horizontal()
+                            .element_formatter(Box::new(|bar, _| bar.name.clone())),
+                    );
+                    plot_ui.bar_chart(
+                        BarChart::new(run_bars)
+                            .horizontal()
+                            .element_formatter(Box::new(|bar, _| bar.name.clone())),
+                    );
+                    for text in texts {
+                        plot_ui.text(text);
+                    }
+                });
+            ui.label(
+                egui::RichText::new(
+                    "Time axis: minutes relative to the latest (non-rejected) run — \
+                     hover a bar for the run's start/end and duration",
+                )
+                .color(theme::text_emphasis(ui.visuals()))
+                .small(),
+            );
+        });
+    }
+
     /// Section 5 — the runs in use (the list, or the widest window in live
     /// mode): file status per run, a preview of the corrected data in the
     /// TIFF viewer, and a reject/restore toggle — rejected runs stay
@@ -1277,8 +1459,24 @@ impl MonitorApp {
         } else {
             format!("5. Runs in use ({})", self.run_files.len())
         };
-        ui.label(theme::section_heading(&heading));
+        // Heading + view switch (table / acquisition timeline).
+        ui.horizontal(|ui| {
+            ui.label(theme::section_heading(&heading));
+            ui.add_space(theme::SPACE_MD);
+            for (view, label) in [
+                (RunsView::Table, "☰ Table"),
+                (RunsView::Timeline, "📈 Timeline"),
+            ] {
+                if ui.selectable_label(self.runs_view == view, label).clicked() {
+                    self.runs_view = view;
+                }
+            }
+        });
         ui.add_space(theme::SPACE_XS);
+        if self.runs_view == RunsView::Timeline {
+            self.runs_timeline(ui);
+            return;
+        }
         let mut toggle_run: Option<u64> = None;
         let mut preview_folder: Option<PathBuf> = None;
         theme::section_frame(ui, |ui| {

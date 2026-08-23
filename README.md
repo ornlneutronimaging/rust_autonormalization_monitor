@@ -52,8 +52,12 @@ Single view, top to bottom:
    folder in the rust_tiff_viewer, and a **✖ reject / ↩ restore** toggle:
    a rejected run stays listed (crossed out) but leaves the windows and
    their normalizations — rejecting the newest run slides the window
-   anchor back to the previous one. For each run, one column per file
-   kind with a
+   anchor back to the previous one. A **📈 Timeline** tab next to the
+   table shows when each run was acquired (start → end bar per run, run
+   number and duration on hover, rejected runs grayed/struck) with the
+   5/15/30 min window coverage bands on top, on a shared axis in minutes
+   relative to the latest run. For each run, one column per file kind
+   with a
    ✔ (found) / ✘ (not there yet) icon; hovering an icon shows the full
    path. Locations inside the IPTS folder:
    - **NeXus**: `nexus/VENUS_<run>.nxs.h5`

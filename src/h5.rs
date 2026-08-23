@@ -49,13 +49,18 @@ fn dataset_string(file: &h5::File, path: &str) -> Option<String> {
     dataset_strings(file, path)?.into_iter().next()
 }
 
-/// End of acquisition of a run, from `/entry/end_time` of its NeXus file
-/// (RFC-3339 string, e.g. `2026-06-13T13:49:50.064875667-04:00`). `None`
-/// when the file is missing, still being written, or has no parsable time.
-pub fn nexus_end_time(path: &Path) -> Option<DateTime<FixedOffset>> {
+/// Acquisition interval of a run, from `/entry/start_time` and
+/// `/entry/end_time` of its NeXus file (RFC-3339 strings, e.g.
+/// `2026-06-13T13:49:50.064875667-04:00`). `None` when the file is
+/// missing, still being written, or has no parsable times.
+pub fn nexus_times(path: &Path) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
     let file = h5::File::open(path).ok()?;
-    let text = dataset_string(&file, "entry/end_time")?;
-    DateTime::parse_from_rfc3339(text.trim()).ok()
+    let start = dataset_string(&file, "entry/start_time")?;
+    let end = dataset_string(&file, "entry/end_time")?;
+    Some((
+        DateTime::parse_from_rfc3339(start.trim()).ok()?,
+        DateTime::parse_from_rfc3339(end.trim()).ok()?,
+    ))
 }
 
 /// What the auto-normalization launcher needs out of a normalization
@@ -92,15 +97,16 @@ mod tests {
     // filesystem is not mounted.
 
     #[test]
-    fn reads_the_end_time_of_a_real_nexus() {
+    fn reads_the_times_of_a_real_nexus() {
         let path = Path::new("/SNS/VENUS/IPTS-36967/nexus/VENUS_23642.nxs.h5");
         if !path.is_file() {
             return;
         }
-        let t = nexus_end_time(path).expect("end_time should be readable");
-        assert_eq!(t.format("%Y-%m-%d").to_string(), "2026-06-13");
+        let (start, end) = nexus_times(path).expect("times should be readable");
+        assert_eq!(end.format("%Y-%m-%d").to_string(), "2026-06-13");
+        assert!(start <= end);
         // Missing file → None, no panic.
-        assert!(nexus_end_time(Path::new("/nonexistent.nxs.h5")).is_none());
+        assert!(nexus_times(Path::new("/nonexistent.nxs.h5")).is_none());
     }
 
     #[test]
