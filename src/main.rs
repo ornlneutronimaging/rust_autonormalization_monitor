@@ -1,61 +1,57 @@
-//! VENUS Auto Normalization Monitor — shows whether the auto-normalization
-//! pipeline is active (the `activate` flag in the shared
-//! `autoreduction.cfg`) as a big ON/OFF button at the top of the window.
+//! VENUS Auto Normalization — single-view application.
 //!
-//! The state is read-only for regular users: the flag can only be changed
-//! after unlocking admin mode with the admin password (stored as a SHA-256
-//! hash, never in clear text). Once unlocked, clicking the ON/OFF button
-//! flips the flag and writes it back to the configuration file.
-//!
-//! The file is re-read every couple of seconds so the display always reflects
-//! changes made by other tools (e.g. the marimo normalization notebook).
+//! Workflow, top to bottom:
+//! 1. Select the IPTS (dropdown of accessible IPTS-* folders, or manual
+//!    entry). Everything below is disabled until an IPTS is chosen.
+//! 2. Select the normalization configuration file
+//!    (`<IPTS>/shared/autoreduce/configs/*.h5`, created with the marimo
+//!    "Normalization TOF at VENUS" notebook — a button launches that
+//!    notebook directly in the selected IPTS).
+//! 3. Either turn auto-normalization ON (every upcoming run gets
+//!    normalized — writes the shared `autoreduction.cfg`), or type a list
+//!    of runs to normalize.
+//! 4. When a run list is given, a table shows for each run whether its
+//!    NeXus / raw / corrected / normalized files exist yet (hover an icon
+//!    for the full path).
 
 mod config;
-mod runs;
+mod files;
+mod h5;
+mod norm;
+mod notebook;
 mod theme;
 
 use eframe::egui;
-use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const CONFIG_PATH: &str = "/SNS/VENUS/shared/autoreduction/autoreduction.cfg";
-/// Root scanned for the IPTS-* experiment folders offered in the admin
-/// "Autoreduction IPTS" selector.
+/// Shared configuration read/written by the normalization notebook and the
+/// autoreduction. The notebook writes the first path (creating it on first
+/// registration); the second is the legacy location still found on disk.
+const CONFIG_PATHS: &[&str] = &[
+    "/SNS/VENUS/shared/autoreduction/autoreduction.cfg",
+    "/SNS/VENUS/shared/autoreduce/autoreduction.cfg",
+];
+/// Root scanned for the IPTS-* experiment folders.
 const IPTS_ROOT: &str = "/SNS/VENUS";
 const LOGO_PATH: &str = "/SNS/VENUS/shared/software/logos/logo_with_green_neutron_rays.png";
-const APP_TITLE: &str = "VENUS Auto Normalization Monitor";
-/// SHA-256 of the admin password — the password itself never appears in the
-/// source or the compiled binary, only this digest.
-const ADMIN_PASSWORD_SHA256: &str =
-    "b8b22aedc372aa891df895be9a7626e6d9ddc6d39ba85d202ca68de8c52ad782";
+const APP_TITLE: &str = "VENUS Auto Normalization";
 /// Default auto-refresh period (config file + runs table), in seconds.
 const DEFAULT_REFRESH_SECS: u32 = 5;
-/// Number of most recently reduced runs shown in the Monitor table.
-const MONITOR_RUN_COUNT: usize = 20;
-/// Application launched to visualize a run's corrected / normalized data:
-/// the rust_tiff_viewer, called with the data folder and, when the folder's
-/// config.json / summary.json names one, the detector offset (µs, --offset).
-const DATA_VISUALIZER_CMD: &str =
+/// Application launched to preview a normalization configuration file
+/// (HDF5): the rust_nexus_viewer, called with the file as argument.
+const NEXUS_VIEWER_CMD: &str =
+    "/SNS/VENUS/shared/software/git/rust_nexus_viewer/launch_nexus_viewer.sh";
+/// Application launched to look at a window's normalized images: the
+/// rust_tiff_viewer, called with the data folder.
+const TIFF_VIEWER_CMD: &str =
     "/SNS/VENUS/shared/software/git/rust_tiff_viewer/launch_rust_tiff_viewer.sh";
-
-/// Which of a run's files is open in the viewer below the Monitor table.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LogKind {
-    Log,
-    Err,
-}
-
-impl LogKind {
-    fn label(self) -> &'static str {
-        match self {
-            LogKind::Log => "log",
-            LogKind::Err => "error log",
-        }
-    }
-}
+/// Default rolling time windows, in minutes of acquisition time.
+const DEFAULT_WINDOWS_MIN: [u32; 3] = [5, 15, 30];
 
 /// POSIX `access(2)` check: can the current user read + enter this directory?
 fn can_access(path: &Path) -> bool {
@@ -87,21 +83,15 @@ fn list_accessible_ipts(root: &Path) -> Result<Vec<String>, String> {
     Ok(ipts.into_iter().map(|(_, name)| name).collect())
 }
 
-fn password_matches(candidate: &str) -> bool {
-    let digest = Sha256::digest(candidate.as_bytes());
-    // Constant-length hex compare against the stored digest.
-    format!("{digest:x}") == ADMIN_PASSWORD_SHA256
+/// The `autoreduction.cfg` to read/write: the first existing path, or the
+/// notebook's (primary) path when none exists yet.
+fn resolve_config_path() -> PathBuf {
+    CONFIG_PATHS
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from(CONFIG_PATHS[0]))
 }
-
-/// Top-level tabs: Admin (status + admin-gated toggle) and Monitor (live view
-/// of the normalization state, to be implemented).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Admin,
-    Monitor,
-}
-
-const TABS: &[(Tab, &str)] = &[(Tab::Admin, "Admin"), (Tab::Monitor, "Monitor")];
 
 /// A static logo image loaded into a texture, plus its aspect ratio for sizing.
 struct Logo {
@@ -123,140 +113,396 @@ impl Logo {
     }
 }
 
+/// One selectable normalization configuration file.
+#[derive(Clone)]
+struct ConfigFile {
+    path: PathBuf,
+    name: String,
+    mtime: std::time::SystemTime,
+}
+
 struct MonitorApp {
     logo: Option<Logo>,
     logo_loaded: bool,
-    tab: Tab,
-    /// Latest read of the configuration file (Err = message shown in the UI).
+    /// Resolved path of the shared autoreduction.cfg (re-resolved on refresh).
+    cfg_path: PathBuf,
+    /// Latest read of the shared configuration file (Err = not readable /
+    /// not created yet — shown as OFF).
     cfg: Result<config::AutoNormConfig, String>,
-    last_refresh: Instant,
-    /// Admin mode: unlocked by password, allows toggling the flag.
-    admin_unlocked: bool,
-    password_input: String,
-    password_error: bool,
     /// Error from the last write attempt, shown until the next successful one.
     write_error: Option<String>,
-    /// IPTS folders the current user can access (scanned on admin unlock).
+
+    /// IPTS folders the current user can access (scanned at startup).
     ipts_list: Result<Vec<String>, String>,
-    /// Text typed by the admin to narrow the IPTS list (matched on the number).
     ipts_filter: String,
-    /// Last-reduced runs shown in the Monitor tab (refreshed with the config).
-    runs: Result<Vec<runs::RunEntry>, String>,
-    /// File open in the viewer below the Monitor table: (run number, kind).
-    viewer: Option<(u64, LogKind)>,
-    /// Content of the viewed file (re-read on every refresh so a run that is
-    /// still reducing streams into the viewer).
-    viewer_content: String,
-    /// Error from the last attempt to launch the data visualizer.
-    launch_error: Option<String>,
-    /// Corrected/normalized data folders parsed from each run's log
-    /// (rebuilt on every refresh).
-    run_folders: std::collections::HashMap<u64, runs::LogFolders>,
-    /// Auto-refresh of the config file and runs table.
+    manual_ipts: String,
+    manual_ipts_error: Option<String>,
+    /// The selected experiment, e.g. "IPTS-36967". Gates the whole UI.
+    ipts: Option<String>,
+
+    /// Normalization configuration files found in the selected IPTS.
+    configs: Vec<ConfigFile>,
+    configs_error: Option<String>,
+    selected_config: Option<PathBuf>,
+    /// Status/errors from the last notebook launch.
+    launch_status: Option<(String, egui::Color32)>,
+    /// Error from the last attempt to preview a configuration file.
+    preview_error: Option<String>,
+
+    /// Raw text of the run-list field and its parse error, if any.
+    run_list_text: String,
+    run_list_error: Option<String>,
+    /// Parsed run numbers currently shown in the table.
+    runs: Vec<u64>,
+    /// File presence for each run in `runs` (rebuilt on refresh).
+    run_files: Vec<files::RunFiles>,
+    /// When auto-normalization is ON: the upcoming run (latest NeXus in the
+    /// IPTS + 1) that will be normalized next, shown on top of the table.
+    next_run: Option<files::RunFiles>,
+
+    /// Rolling combine-normalization windows (default last 5/15/30 min).
+    windows: Vec<norm::Window>,
+    /// NeXus end times already read (they never change once written).
+    end_time_cache: HashMap<u64, chrono::DateTime<chrono::FixedOffset>>,
+    /// Latest (anchor) run the live mode already reacted to: a job volley
+    /// fires only when a newer NeXus shows up.
+    last_live_anchor: Option<u64>,
+    /// Channel the window jobs report their progress and outcome on.
+    norm_tx: mpsc::Sender<norm::JobMessage>,
+    norm_rx: mpsc::Receiver<norm::JobMessage>,
+    /// Error from the last attempt to open a normalized folder in the viewer.
+    viewer_error: Option<String>,
+
+    last_refresh: Instant,
     auto_refresh: bool,
-    /// Auto-refresh period in seconds.
     refresh_secs: u32,
 }
 
 impl MonitorApp {
     fn new() -> Self {
+        let (norm_tx, norm_rx) = mpsc::channel();
         let mut app = Self {
             logo: None,
             logo_loaded: false,
-            tab: Tab::Admin,
-            cfg: Ok(config::AutoNormConfig::default()),
-            last_refresh: Instant::now(),
-            admin_unlocked: false,
-            password_input: String::new(),
-            password_error: false,
+            cfg_path: resolve_config_path(),
+            cfg: Err("not read yet".to_owned()),
             write_error: None,
-            ipts_list: Ok(Vec::new()),
+            ipts_list: list_accessible_ipts(Path::new(IPTS_ROOT)),
             ipts_filter: String::new(),
-            runs: Ok(Vec::new()),
-            viewer: None,
-            viewer_content: String::new(),
-            launch_error: None,
-            run_folders: std::collections::HashMap::new(),
+            manual_ipts: String::new(),
+            manual_ipts_error: None,
+            ipts: None,
+            configs: Vec::new(),
+            configs_error: None,
+            selected_config: None,
+            launch_status: None,
+            preview_error: None,
+            run_list_text: String::new(),
+            run_list_error: None,
+            runs: Vec::new(),
+            run_files: Vec::new(),
+            next_run: None,
+            windows: DEFAULT_WINDOWS_MIN
+                .iter()
+                .map(|&m| norm::Window::new(m))
+                .collect(),
+            end_time_cache: HashMap::new(),
+            last_live_anchor: None,
+            norm_tx,
+            norm_rx,
+            viewer_error: None,
+            last_refresh: Instant::now(),
             auto_refresh: true,
             refresh_secs: DEFAULT_REFRESH_SECS,
         };
         app.refresh();
-        app
-    }
-
-    /// `/SNS/VENUS/<ipts>/shared/autoreduce/reduction_log` for the IPTS
-    /// currently named in the configuration file.
-    fn reduction_log_dir(&self) -> Option<std::path::PathBuf> {
-        let ipts = self.cfg.as_ref().ok()?.get("ipts")?;
-        Some(
-            Path::new(IPTS_ROOT)
-                .join(ipts)
-                .join("shared/autoreduce/reduction_log"),
-        )
-    }
-
-    fn refresh(&mut self) {
-        self.cfg = config::read(Path::new(CONFIG_PATH));
-        self.runs = match self.reduction_log_dir() {
-            Some(dir) => runs::last_runs(&dir, MONITOR_RUN_COUNT),
-            None => Err("no IPTS defined in the configuration file".to_owned()),
-        };
-        self.run_folders.clear();
-        if let Ok(run_list) = &self.runs {
-            for run in run_list {
-                if let Some(log_path) = &run.log_path {
-                    self.run_folders
-                        .insert(run.run_number, runs::folders_from_log(log_path));
+        // Convenience: pre-select the IPTS (and configuration file) the
+        // shared configuration currently points at.
+        if let Ok(cfg) = &app.cfg {
+            if let Some(ipts) = cfg.get("ipts") {
+                let ipts = ipts.to_owned();
+                let registered = cfg
+                    .get("user_autoreduction_config_file")
+                    .map(PathBuf::from);
+                app.select_ipts(ipts);
+                if let Some(file) = registered {
+                    if app.configs.iter().any(|c| c.path == file) {
+                        app.selected_config = Some(file);
+                    }
                 }
             }
         }
-        self.reload_viewer();
+        app
+    }
+
+    fn ipts_path(&self) -> Option<PathBuf> {
+        self.ipts.as_ref().map(|i| Path::new(IPTS_ROOT).join(i))
+    }
+
+    /// Make `ipts` the selected experiment and rescan what depends on it.
+    fn select_ipts(&mut self, ipts: String) {
+        self.ipts = Some(ipts);
+        self.manual_ipts_error = None;
+        self.launch_status = None;
+        self.preview_error = None;
+        self.viewer_error = None;
+        self.selected_config = None;
+        self.end_time_cache.clear();
+        self.last_live_anchor = None;
+        for w in &mut self.windows {
+            w.runs.clear();
+            w.state = norm::JobState::Idle;
+        }
+        self.rescan_configs();
+        self.check_runs();
+    }
+
+    /// Validate the manually typed IPTS ("36967" or "IPTS-36967") and select
+    /// it if the folder exists and is accessible.
+    fn apply_manual_ipts(&mut self) {
+        let typed = self.manual_ipts.trim();
+        let number = typed
+            .trim_start_matches("IPTS-")
+            .trim_start_matches("ipts-");
+        if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+            self.manual_ipts_error =
+                Some(format!("'{typed}' is not an IPTS number (e.g. 36967)"));
+            return;
+        }
+        let name = format!("IPTS-{number}");
+        let path = Path::new(IPTS_ROOT).join(&name);
+        if !path.is_dir() {
+            self.manual_ipts_error = Some(format!("{} does not exist", path.display()));
+        } else if !can_access(&path) {
+            self.manual_ipts_error =
+                Some(format!("no permission to access {}", path.display()));
+        } else {
+            self.select_ipts(name);
+        }
+    }
+
+    /// List `<IPTS>/shared/autoreduce/configs/*.h5`, newest first.
+    fn rescan_configs(&mut self) {
+        self.configs.clear();
+        self.configs_error = None;
+        let Some(ipts_path) = self.ipts_path() else {
+            return;
+        };
+        let dir = ipts_path.join("shared/autoreduce/configs");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.configs_error = Some(format!("cannot read {}: {e}", dir.display()));
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("h5") {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            self.configs.push(ConfigFile { path, name, mtime });
+        }
+        self.configs.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        // Drop a selection that no longer exists on disk.
+        if let Some(selected) = &self.selected_config {
+            if !self.configs.iter().any(|c| &c.path == selected) {
+                self.selected_config = None;
+            }
+        }
+    }
+
+    /// Re-check the presence of every file of the runs in the list, and of
+    /// the upcoming run when auto-normalization is active.
+    fn check_runs(&mut self) {
+        self.run_files = match self.ipts_path() {
+            Some(ipts_path) if !self.runs.is_empty() => {
+                files::check_runs(&ipts_path, &self.runs)
+            }
+            _ => Vec::new(),
+        };
+        // The next NeXus that will land in the IPTS (latest one + 1): what
+        // auto-normalization will process next.
+        self.next_run = if self.is_active() {
+            self.ipts_path().and_then(|ipts_path| {
+                files::latest_nexus_run(&ipts_path)
+                    .map(|latest| files::check_runs(&ipts_path, &[latest + 1]).remove(0))
+            })
+        } else {
+            None
+        };
+        self.update_windows();
+    }
+
+    /// Recompute which runs fall in each rolling window: the user's run
+    /// list when one was given, otherwise every run of the IPTS (live
+    /// mode). Acquisition end times come from the NeXus files (cached).
+    fn update_windows(&mut self) {
+        let Some(ipts_path) = self.ipts_path() else {
+            for w in &mut self.windows {
+                w.runs.clear();
+            }
+            return;
+        };
+        let live = self.runs.is_empty();
+        let candidates = if live {
+            files::list_nexus_runs(&ipts_path)
+        } else {
+            self.runs.clone()
+        };
+        let max_minutes = self.windows.iter().map(|w| w.minutes).max().unwrap_or(0);
+        let mut end_times: Vec<(u64, chrono::DateTime<chrono::FixedOffset>)> = Vec::new();
+        let mut anchor: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+        // Newest runs first; the first readable end time is the anchor and,
+        // in live mode, the scan stops at the first run older than the
+        // widest window (no point opening thousands of old NeXus files).
+        for &run in candidates.iter().rev() {
+            let time = match self.end_time_cache.get(&run) {
+                Some(t) => *t,
+                None => {
+                    let Some(t) = h5::nexus_end_time(&files::nexus_path(&ipts_path, run))
+                    else {
+                        // Missing or still being written — retry next refresh.
+                        continue;
+                    };
+                    self.end_time_cache.insert(run, t);
+                    t
+                }
+            };
+            let anchor = *anchor.get_or_insert(time);
+            if time < anchor - chrono::Duration::minutes(i64::from(max_minutes)) {
+                if live {
+                    break;
+                }
+                continue;
+            }
+            end_times.push((run, time));
+        }
+        norm::assign_windows(&mut self.windows, &end_times);
+
+        // Live mode: a new anchor run (a NeXus that just showed up) fires
+        // the window normalizations. The first anchor seen only arms the
+        // trigger — the app should not fire for a run that landed before
+        // it was even watching.
+        if live && self.is_active() {
+            let anchor_run = self.windows.iter().flat_map(|w| w.runs.iter()).max().copied();
+            if let Some(anchor_run) = anchor_run {
+                match self.last_live_anchor {
+                    None => self.last_live_anchor = Some(anchor_run),
+                    Some(prev) if anchor_run > prev => {
+                        self.last_live_anchor = Some(anchor_run);
+                        if self.selected_config.is_some() {
+                            self.launch_windows();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            // Re-armed when live mode resumes.
+            self.last_live_anchor = None;
+        }
+    }
+
+    /// Launch the combine normalization of every window that has runs and
+    /// is not already running.
+    fn launch_windows(&mut self) {
+        let (Some(ipts_path), Some(config)) = (self.ipts_path(), self.selected_config.clone())
+        else {
+            return;
+        };
+        let info = match h5::read_config_info(&config) {
+            Ok(info) => info,
+            Err(e) => {
+                for w in &mut self.windows {
+                    w.state = norm::JobState::Failed { message: e.clone() };
+                }
+                return;
+            }
+        };
+        for i in 0..self.windows.len() {
+            if matches!(self.windows[i].state, norm::JobState::Running { .. }) {
+                continue;
+            }
+            match norm::prepare_job(i, &self.windows[i], &ipts_path, &config, &info) {
+                Ok(spec) => {
+                    self.windows[i].state = norm::JobState::Running {
+                        runs: spec.runs.clone(),
+                        stage: "starting…".to_owned(),
+                        fraction: None,
+                    };
+                    norm::launch(spec, self.norm_tx.clone());
+                }
+                Err(message) => self.windows[i].state = norm::JobState::Failed { message },
+            }
+        }
+    }
+
+    /// Open normalized-data folders in ONE TIFF viewer session (detached):
+    /// the first folder is the main stack, the others are `--compare`
+    /// stacks shown side by side (shared colorscale, mirrored regions).
+    fn open_in_viewer(&mut self, folders: &[PathBuf]) {
+        let Some((first, rest)) = folders.split_first() else {
+            return;
+        };
+        self.viewer_error = if let Some(missing) = folders.iter().find(|f| !f.is_dir()) {
+            Some(format!("folder not found: {}", missing.display()))
+        } else {
+            let mut cmd = std::process::Command::new(TIFF_VIEWER_CMD);
+            cmd.arg(first);
+            for folder in rest {
+                cmd.arg("--compare").arg(folder);
+            }
+            cmd.spawn()
+                .map(|_| ())
+                .err()
+                .map(|e| format!("cannot launch {TIFF_VIEWER_CMD}: {e}"))
+        };
+    }
+
+    fn refresh(&mut self) {
+        self.cfg_path = resolve_config_path();
+        self.cfg = config::read(&self.cfg_path);
+        if self.ipts.is_some() {
+            self.rescan_configs();
+        }
+        self.check_runs();
         self.last_refresh = Instant::now();
     }
 
-    /// (Re)read the file selected in the Monitor viewer. Clears the selection
-    /// if its run dropped out of the table.
-    fn reload_viewer(&mut self) {
-        let Some((run_number, kind)) = self.viewer else {
+    /// Is auto-normalization currently active (per the shared config file)?
+    fn is_active(&self) -> bool {
+        self.cfg.as_ref().map(|c| c.activate).unwrap_or(false)
+    }
+
+    /// Turn auto-normalization ON: register the selected IPTS +
+    /// configuration file in the shared config and set the flag.
+    fn turn_on(&mut self) {
+        let (Some(ipts), Some(config_file)) = (self.ipts.clone(), self.selected_config.clone())
+        else {
             return;
         };
-        let path = self
-            .runs
-            .as_ref()
-            .ok()
-            .and_then(|runs| runs.iter().find(|r| r.run_number == run_number))
-            .and_then(|r| match kind {
-                LogKind::Log => r.log_path.clone(),
-                LogKind::Err => r.err_path.clone(),
-            });
-        match path {
-            Some(path) => {
-                self.viewer_content = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| format!("cannot read {}: {e}", path.display()));
-            }
-            None => {
-                self.viewer = None;
-                self.viewer_content.clear();
-            }
+        match config::write_full(
+            &self.cfg_path,
+            &ipts,
+            &config_file.display().to_string(),
+            true,
+        ) {
+            Ok(()) => self.write_error = None,
+            Err(e) => self.write_error = Some(e),
         }
+        self.refresh();
     }
 
-    fn try_unlock(&mut self) {
-        if password_matches(self.password_input.trim()) {
-            self.admin_unlocked = true;
-            self.password_error = false;
-            // Fresh scan on every unlock so newly granted IPTS show up.
-            self.ipts_list = list_accessible_ipts(Path::new(IPTS_ROOT));
-        } else {
-            self.password_error = true;
-        }
-        self.password_input.clear();
-    }
-
-    /// Flip the `activate` flag on disk, then re-read the file so the button
-    /// shows what is actually stored.
-    fn toggle_activate(&mut self, current: bool) {
-        match config::set_activate(Path::new(CONFIG_PATH), !current) {
+    /// Turn auto-normalization OFF (only the flag is touched, the registered
+    /// configuration file is kept).
+    fn turn_off(&mut self) {
+        match config::set_activate(&self.cfg_path, false) {
             Ok(()) => self.write_error = None,
             Err(e) => self.write_error = Some(e),
         }
@@ -327,216 +573,13 @@ impl MonitorApp {
             });
     }
 
-    /// The big ON/OFF status button. Read-only unless admin mode is unlocked;
-    /// when unlocked, clicking it toggles the flag in the configuration file.
-    fn status_button(&mut self, ui: &mut egui::Ui, activate: bool) {
-        let (label, fill) = if activate {
-            ("ON", theme::SUCCESS)
-        } else {
-            ("OFF", theme::DANGER)
-        };
-        let text = egui::RichText::new(label)
-            .color(theme::TEXT_WHITE)
-            .strong()
-            .size(34.0);
-        let button = egui::Button::new(text)
-            .fill(fill)
-            .corner_radius(10.0)
-            .min_size(egui::vec2(220.0, 64.0));
-        ui.vertical_centered(|ui| {
-            ui.label(theme::section_heading("Auto normalization status"));
-            ui.add_space(theme::SPACE_SM);
-            let response = ui.add_enabled(self.admin_unlocked, button);
-            let response = if self.admin_unlocked {
-                response.on_hover_text("Click to turn auto normalization ".to_owned()
-                    + if activate { "OFF" } else { "ON" })
-            } else {
-                response.on_disabled_hover_text("Admin unlock required to change the state")
-            };
-            if response.clicked() {
-                self.toggle_activate(activate);
-            }
-            ui.add_space(theme::SPACE_XS);
-            ui.label(
-                egui::RichText::new(if self.admin_unlocked {
-                    "Admin mode: click the button to change the state"
-                } else {
-                    "Read-only — unlock admin mode below to change the state"
-                })
-                .color(theme::text_emphasis(ui.visuals())),
-            );
-        });
-    }
-
-    /// Admin-only: choose which IPTS the autoreduction should use, among the
-    /// IPTS-* folders the current user can access. Selecting one writes the
-    /// `ipts` field of the configuration file.
-    fn ipts_section(&mut self, ui: &mut egui::Ui, current: &str) {
-        ui.label(theme::section_heading("Autoreduction IPTS"));
-        ui.add_space(theme::SPACE_XS);
-        theme::container_frame(ui.visuals()).show(ui, |ui| {
-            match &self.ipts_list {
-                Ok(list) if list.is_empty() => {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "No accessible IPTS found under {IPTS_ROOT}"
-                        ))
-                        .color(theme::WARNING),
-                    );
-                }
-                Ok(list) => {
-                    // Type-to-filter: keep the entries whose IPTS number
-                    // contains the typed text (e.g. "369" → IPTS-36967).
-                    let filter = self
-                        .ipts_filter
-                        .trim()
-                        .trim_start_matches("IPTS-")
-                        .trim_start_matches("ipts-")
-                        .to_owned();
-                    let filtered: Vec<&String> =
-                        list.iter().filter(|name| name.contains(&filter)).collect();
-                    let mut selected: Option<String> = None;
-                    ui.horizontal(|ui| {
-                        ui.label("IPTS to use:");
-                        egui::ComboBox::from_id_salt("ipts_combo")
-                            .selected_text(if current.is_empty() {
-                                "— select —"
-                            } else {
-                                current
-                            })
-                            .show_ui(ui, |ui| {
-                                for name in &filtered {
-                                    if ui
-                                        .selectable_label(*name == current, *name)
-                                        .clicked()
-                                        && *name != current
-                                    {
-                                        selected = Some((*name).clone());
-                                    }
-                                }
-                            });
-                        ui.label("Filter:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.ipts_filter)
-                                .hint_text("type IPTS number…")
-                                .desired_width(130.0),
-                        );
-                        ui.label(
-                            egui::RichText::new(if filter.is_empty() {
-                                format!("({} accessible)", list.len())
-                            } else {
-                                format!("({} of {} match)", filtered.len(), list.len())
-                            })
-                            .color(theme::text_emphasis(ui.visuals())),
-                        );
-                    });
-                    if !filter.is_empty() && filtered.is_empty() {
-                        ui.label(
-                            egui::RichText::new("No accessible IPTS matches the filter")
-                                .color(theme::WARNING),
-                        );
-                    }
-                    if let Some(name) = selected {
-                        match config::set_value(Path::new(CONFIG_PATH), "ipts", &name) {
-                            Ok(()) => self.write_error = None,
-                            Err(e) => self.write_error = Some(e),
-                        }
-                        self.refresh();
-                    }
-                }
-                Err(e) => {
-                    ui.label(
-                        egui::RichText::new(format!("Cannot list IPTS: {e}"))
-                            .color(theme::DANGER),
-                    );
-                }
-            }
-        });
-    }
-
-    /// Read-only view of every `key: value` pair of the configuration file.
-    fn details(&self, ui: &mut egui::Ui, cfg: &config::AutoNormConfig) {
-        ui.label(theme::section_heading("Configuration"));
-        ui.add_space(theme::SPACE_XS);
-        theme::container_frame(ui.visuals()).show(ui, |ui| {
-            egui::Grid::new("cfg_grid")
-                .num_columns(2)
-                .spacing([theme::SPACE_LG, theme::SPACE_XS])
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("file").color(theme::text_emphasis(ui.visuals())));
-                    ui.label(CONFIG_PATH);
-                    ui.end_row();
-                    for (key, value) in &cfg.entries {
-                        ui.label(egui::RichText::new(key).color(theme::text_emphasis(ui.visuals())));
-                        ui.label(value);
-                        ui.end_row();
-                    }
-                });
-        });
-    }
-
-    /// Launch the rust_tiff_viewer on a data folder (detached), passing the
-    /// detector offset found in the folder's config.json / summary.json.
-    fn launch_visualizer(&mut self, folder: &Path) {
-        let result = if folder.is_dir() {
-            let mut cmd = std::process::Command::new(DATA_VISUALIZER_CMD);
-            cmd.arg(folder);
-            if let Some(offset_us) = runs::detector_offset_us(folder) {
-                cmd.arg("--offset").arg(offset_us.to_string());
-            }
-            cmd.spawn()
-                .map(|_| ())
-                .map_err(|e| format!("cannot launch {DATA_VISUALIZER_CMD}: {e}"))
-        } else {
-            Err(format!("data folder not found: {}", folder.display()))
-        };
-        self.launch_error = result.err();
-    }
-
-    /// Admin tab: ON/OFF status button, admin unlock, and (once unlocked) the
-    /// raw configuration content.
-    fn admin_tab(&mut self, ui: &mut egui::Ui) {
-        match self.cfg.clone() {
-            Ok(cfg) => {
-                self.status_button(ui, cfg.activate);
-                if let Some(err) = &self.write_error {
-                    ui.add_space(theme::SPACE_SM);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("Failed to update flag: {err}"))
-                                .color(theme::DANGER),
-                        );
-                    });
-                }
-                // The raw configuration content and the IPTS selector are
-                // admin-only.
-                if self.admin_unlocked {
-                    ui.add_space(theme::SPACE_LG);
-                    self.ipts_section(ui, cfg.get("ipts").unwrap_or(""));
-                    ui.add_space(theme::SPACE_LG);
-                    self.details(ui, &cfg);
-                }
-            }
-            Err(e) => {
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Cannot read configuration: {e}"))
-                            .color(theme::DANGER),
-                    );
-                });
-            }
-        }
-        ui.add_space(theme::SPACE_LG);
-        self.admin_section(ui);
-    }
-
     /// Auto-refresh controls: enable/disable the periodic re-read of the
     /// config file and runs table, and pick its period.
     fn refresh_controls(&mut self, ui: &mut egui::Ui) {
         // Laid out right-to-left, so add the widgets in reverse order.
         if ui
             .button("⟳ Refresh now")
-            .on_hover_text("Re-read the config file and the runs table")
+            .on_hover_text("Re-read the configuration and re-check the files")
             .clicked()
         {
             self.refresh();
@@ -552,228 +595,626 @@ impl MonitorApp {
         ui.checkbox(&mut self.auto_refresh, "Auto-refresh");
     }
 
-    /// Monitor tab: master table of the last reduced runs, with switches to
-    /// open each run's reduction log / error log in a viewer below the table.
-    fn monitor_tab(&mut self, ui: &mut egui::Ui) {
-        let ipts = self
-            .cfg
-            .as_ref()
-            .ok()
-            .and_then(|cfg| cfg.get("ipts"))
-            .unwrap_or("?")
-            .to_owned();
-        // Heading on the left, auto-refresh controls on the right.
-        ui.horizontal(|ui| {
-            ui.label(theme::section_heading(&format!(
-                "Last {MONITOR_RUN_COUNT} reduced runs — {ipts}"
-            )));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.refresh_controls(ui);
-            });
-        });
+    /// Section 1 — pick the experiment. Dropdown of accessible IPTS with a
+    /// type-to-filter box, plus a manual entry for an IPTS not listed.
+    fn ipts_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(theme::section_heading("1. Experiment (IPTS)"));
         ui.add_space(theme::SPACE_XS);
+        theme::section_frame(ui, |ui| {
+            let current = self.ipts.clone().unwrap_or_default();
+            let mut selected: Option<String> = None;
+            match &self.ipts_list {
+                Ok(list) => {
+                    let filter = self
+                        .ipts_filter
+                        .trim()
+                        .trim_start_matches("IPTS-")
+                        .trim_start_matches("ipts-")
+                        .to_owned();
+                    let filtered: Vec<&String> =
+                        list.iter().filter(|name| name.contains(&filter)).collect();
+                    ui.horizontal(|ui| {
+                        ui.label("IPTS:");
+                        egui::ComboBox::from_id_salt("ipts_combo")
+                            .selected_text(if current.is_empty() {
+                                "— select —"
+                            } else {
+                                &current
+                            })
+                            .show_ui(ui, |ui| {
+                                for name in &filtered {
+                                    if ui
+                                        .selectable_label(**name == current, *name)
+                                        .clicked()
+                                        && **name != current
+                                    {
+                                        selected = Some((*name).clone());
+                                    }
+                                }
+                            });
+                        ui.label("Filter:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ipts_filter)
+                                .hint_text("type IPTS number…")
+                                .desired_width(110.0),
+                        );
+                        ui.label(
+                            egui::RichText::new(if filter.is_empty() {
+                                format!("({} accessible)", list.len())
+                            } else {
+                                format!("({} of {} match)", filtered.len(), list.len())
+                            })
+                            .color(theme::text_emphasis(ui.visuals())),
+                        );
+                    });
+                }
+                Err(e) => {
+                    ui.label(
+                        egui::RichText::new(format!("Cannot list IPTS: {e}"))
+                            .color(theme::DANGER),
+                    );
+                }
+            }
+            // Manual entry, for an IPTS the scan did not list.
+            ui.horizontal(|ui| {
+                ui.label("Manual entry:");
+                let edit = egui::TextEdit::singleline(&mut self.manual_ipts)
+                    .hint_text("e.g. 36967")
+                    .desired_width(110.0);
+                let response = ui.add(edit);
+                let submitted =
+                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Use").clicked() || submitted {
+                    self.apply_manual_ipts();
+                }
+                if let Some(err) = &self.manual_ipts_error {
+                    ui.label(egui::RichText::new(err).color(theme::DANGER));
+                }
+            });
+            if let Some(name) = selected {
+                self.select_ipts(name);
+            }
+        });
+    }
 
-        let run_list = match self.runs.clone() {
-            Ok(list) => list,
-            Err(e) => {
+    /// Open the selected configuration file in the NeXus viewer (detached).
+    fn preview_config(&mut self) {
+        let Some(path) = self.selected_config.clone() else {
+            return;
+        };
+        self.preview_error = if !path.is_file() {
+            Some(format!("configuration file not found: {}", path.display()))
+        } else {
+            std::process::Command::new(NEXUS_VIEWER_CMD)
+                .arg(&path)
+                .spawn()
+                .map(|_| ())
+                .err()
+                .map(|e| format!("cannot launch {NEXUS_VIEWER_CMD}: {e}"))
+        };
+    }
+
+    /// Section 2 — pick the normalization configuration file, or launch the
+    /// marimo notebook to create one.
+    fn config_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(theme::section_heading("2. Normalization configuration"));
+        ui.add_space(theme::SPACE_XS);
+        theme::section_frame(ui, |ui| {
+            let mut selected: Option<PathBuf> = None;
+            ui.horizontal(|ui| {
+                ui.label("Configuration file:");
+                let current_name = self
+                    .selected_config
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "— select —".to_owned());
+                let combo = egui::ComboBox::from_id_salt("config_combo")
+                    .selected_text(current_name)
+                    .width(340.0);
+                let response = combo.show_ui(ui, |ui| {
+                    for cfg_file in &self.configs {
+                        let active = self.selected_config.as_ref() == Some(&cfg_file.path);
+                        let when: chrono::DateTime<chrono::Local> = cfg_file.mtime.into();
+                        if ui
+                            .selectable_label(active, &cfg_file.name)
+                            .on_hover_text(format!(
+                                "{}\nmodified {}",
+                                cfg_file.path.display(),
+                                when.format("%Y-%m-%d %H:%M:%S")
+                            ))
+                            .clicked()
+                        {
+                            selected = Some(cfg_file.path.clone());
+                        }
+                    }
+                });
+                if let Some(path) = &self.selected_config {
+                    response.response.on_hover_text(path.display().to_string());
+                }
+                if ui
+                    .button("⟳")
+                    .on_hover_text("Rescan the configs folder")
+                    .clicked()
+                {
+                    self.rescan_configs();
+                }
+                // Preview the selected configuration in the NeXus viewer
+                // (the config is a plain HDF5 file).
+                let preview = ui.add_enabled(
+                    self.selected_config.is_some(),
+                    egui::Button::new("👁 Preview"),
+                );
+                let preview = match &self.selected_config {
+                    Some(path) => preview.on_hover_text(format!(
+                        "Open the configuration in the NeXus viewer\n{}",
+                        path.display()
+                    )),
+                    None => preview
+                        .on_disabled_hover_text("Select a configuration file first"),
+                };
+                if preview.clicked() {
+                    self.preview_config();
+                }
+            });
+            if let Some(err) = &self.preview_error {
                 ui.label(
-                    egui::RichText::new(format!("Cannot list reduced runs: {e}"))
+                    egui::RichText::new(format!("Cannot preview the configuration: {err}"))
                         .color(theme::DANGER),
                 );
-                return;
             }
-        };
-        if run_list.is_empty() {
-            ui.label(
-                egui::RichText::new("No reduced runs found in the reduction_log folder")
-                    .color(theme::text_emphasis(ui.visuals())),
-            );
-            return;
-        }
+            match (&self.configs_error, self.configs.is_empty()) {
+                (Some(e), _) => {
+                    ui.label(egui::RichText::new(e.as_str()).color(theme::WARNING));
+                }
+                (None, true) => {
+                    ui.label(
+                        egui::RichText::new(
+                            "No configuration file found — create one with the notebook below",
+                        )
+                        .color(theme::text_emphasis(ui.visuals())),
+                    );
+                }
+                _ => {}
+            }
+            ui.add_space(theme::SPACE_SM);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(theme::primary_button("🚀 Create new configuration (normalization notebook)"))
+                    .on_hover_text(format!(
+                        "Launch the marimo \"Normalization TOF at VENUS\" notebook\n\
+                         directly in the selected IPTS\n{}",
+                        notebook::NOTEBOOK_PATH
+                    ))
+                    .clicked()
+                {
+                    if let Some(ipts_path) = self.ipts_path() {
+                        self.launch_status = Some(match notebook::launch(&ipts_path) {
+                            Ok(msg) => (msg, theme::SUCCESS),
+                            Err(e) => (e, theme::DANGER),
+                        });
+                    }
+                }
+                if let Some((msg, color)) = &self.launch_status {
+                    ui.label(egui::RichText::new(msg).color(*color));
+                }
+            });
+            if let Some(path) = selected {
+                self.selected_config = Some(path);
+                self.preview_error = None;
+            }
+        });
+    }
 
-        // Master table: run number | log switch | error-log switch. A switch
-        // opens that file in the viewer below; only one file is open at a
-        // time, and clicking the active switch closes the viewer.
-        let mut toggled: Option<(u64, LogKind)> = None;
-        theme::container_frame(ui.visuals()).show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("runs_table")
-                .max_height(ui.available_height() * 0.45)
+    /// Section 3 — auto-normalization ON/OFF, or a manual list of runs.
+    fn mode_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(theme::section_heading("3. What to normalize"));
+        ui.add_space(theme::SPACE_XS);
+        theme::section_frame(ui, |ui| {
+            let active = self.is_active();
+            ui.horizontal(|ui| {
+                let (label, fill) = if active {
+                    ("Auto normalization: ON", theme::SUCCESS)
+                } else {
+                    ("Auto normalization: OFF", theme::DANGER)
+                };
+                let text = egui::RichText::new(label)
+                    .color(theme::TEXT_WHITE)
+                    .strong()
+                    .size(18.0);
+                let button = egui::Button::new(text)
+                    .fill(fill)
+                    .corner_radius(8.0)
+                    .min_size(egui::vec2(260.0, 40.0));
+                let can_turn_on = self.selected_config.is_some();
+                let response = ui.add_enabled(active || can_turn_on, button);
+                let response = if active {
+                    response.on_hover_text(
+                        "Every upcoming run is normalized automatically — click to turn OFF",
+                    )
+                } else if can_turn_on {
+                    response.on_hover_text(
+                        "Click to normalize every upcoming run with the selected configuration",
+                    )
+                } else {
+                    response.on_disabled_hover_text(
+                        "Select a normalization configuration file first",
+                    )
+                };
+                if response.clicked() {
+                    if active {
+                        self.turn_off();
+                    } else {
+                        self.turn_on();
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(format!("({})", self.cfg_path.display()))
+                        .color(theme::text_emphasis(ui.visuals()))
+                        .small(),
+                );
+            });
+            if let Some(err) = &self.write_error {
+                ui.label(
+                    egui::RichText::new(format!("Failed to update the configuration: {err}"))
+                        .color(theme::DANGER),
+                );
+            }
+            // The shared config may point at another IPTS/config than the
+            // one selected here — make that visible.
+            if active {
+                if let Ok(cfg) = &self.cfg {
+                    let reg_ipts = cfg.get("ipts").unwrap_or("?");
+                    let reg_file = cfg.get("user_autoreduction_config_file").unwrap_or("?");
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Active on {reg_ipts} with {}",
+                            Path::new(reg_file)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| reg_file.to_owned())
+                        ))
+                        .color(theme::text_emphasis(ui.visuals())),
+                    )
+                    .on_hover_text(reg_file);
+                }
+            }
+
+            ui.add_space(theme::SPACE_SM);
+            ui.separator();
+            ui.add_space(theme::SPACE_XS);
+            ui.horizontal(|ui| {
+                ui.label("…or normalize a list of runs:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.run_list_text)
+                        .hint_text("e.g. 23615-23620, 23642")
+                        .desired_width(260.0),
+                );
+                let submitted =
+                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Show").clicked() || submitted {
+                    match files::parse_run_list(&self.run_list_text) {
+                        Ok(runs) => {
+                            self.run_list_error = None;
+                            self.runs = runs;
+                            self.check_runs();
+                        }
+                        Err(e) => {
+                            self.run_list_error = Some(e);
+                            self.runs.clear();
+                            self.run_files.clear();
+                        }
+                    }
+                }
+                if !self.runs.is_empty() && ui.button("Clear").clicked() {
+                    self.runs.clear();
+                    self.run_files.clear();
+                    self.run_list_text.clear();
+                    self.run_list_error = None;
+                    // Back to live mode: windows follow the whole IPTS again.
+                    self.check_runs();
+                }
+            });
+            if let Some(err) = &self.run_list_error {
+                ui.label(egui::RichText::new(err).color(theme::DANGER));
+            }
+        });
+    }
+
+    /// Section 4 — the rolling combine-normalization windows: editable
+    /// durations, the runs currently inside each window, job status, and
+    /// view/compare buttons, laid out as an aligned grid. In live mode the
+    /// jobs fire on every new NeXus; with a run list they are launched by
+    /// hand.
+    fn windows_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(theme::section_heading(
+            "4. Rolling combine & compare (NeuNorm)",
+        ));
+        ui.add_space(theme::SPACE_XS);
+        theme::section_frame(ui, |ui| {
+            let live = self.runs.is_empty();
+            ui.label(
+                egui::RichText::new(if live {
+                    "Live: the windows follow the latest run of the IPTS, and the \
+                     normalizations fire when a new NeXus shows up (auto \
+                     normalization ON + configuration selected)."
+                } else {
+                    "The windows look at the listed runs only — launch by hand."
+                })
+                .color(theme::text_emphasis(ui.visuals())),
+            );
+            ui.add_space(theme::SPACE_SM);
+
+            let mut minutes_changed = false;
+            let mut view_folder: Option<PathBuf> = None;
+            egui::Grid::new("windows_grid")
+                .num_columns(4)
+                .spacing([theme::SPACE_LG * 2.0, theme::SPACE_SM])
                 .show(ui, |ui| {
-                    egui::Grid::new("runs_grid")
-                        .num_columns(7)
-                        .striped(true)
-                        .spacing([theme::SPACE_LG * 2.0, theme::SPACE_XS])
-                        .show(ui, |ui| {
-                            ui.label(theme::section_heading("Run"));
-                            ui.label(theme::section_heading("Date/time"));
-                            ui.label(theme::section_heading("Status"));
-                            ui.label(theme::section_heading("Log"));
-                            ui.label(theme::section_heading("Error log"));
-                            ui.label(theme::section_heading("Corrected"));
-                            ui.label(theme::section_heading("Normalized"));
-                            ui.end_row();
-                            for run in &run_list {
-                                let failed = run.err_path.is_some();
-                                let mut run_text =
-                                    egui::RichText::new(run.run_number.to_string()).strong();
-                                if failed {
-                                    run_text = run_text.color(theme::DANGER);
+                    ui.label(theme::section_heading("Window"));
+                    ui.label(theme::section_heading("Runs"));
+                    ui.label(theme::section_heading("Status"));
+                    ui.label(theme::section_heading("Result"));
+                    ui.end_row();
+                    for w in &mut self.windows {
+                        ui.horizontal(|ui| {
+                            ui.label("last");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut w.minutes)
+                                        .range(1..=1440)
+                                        .suffix(" min")
+                                        .speed(1),
+                                )
+                                .on_hover_text(
+                                    "Acquisition-time window, ending at the newest run",
+                                )
+                                .changed()
+                            {
+                                minutes_changed = true;
+                            }
+                        });
+                        // Which runs the window currently holds.
+                        let summary = match (w.runs.first(), w.runs.last()) {
+                            (Some(first), Some(last)) if first == last => {
+                                format!("1 run ({first})")
+                            }
+                            (Some(first), Some(last)) => {
+                                format!("{} runs ({first}–{last})", w.runs.len())
+                            }
+                            _ => "no run in window".to_owned(),
+                        };
+                        ui.label(
+                            egui::RichText::new(summary)
+                                .color(theme::text_emphasis(ui.visuals())),
+                        )
+                        .on_hover_text(
+                            w.runs
+                                .iter()
+                                .map(|r| r.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                        // Status column, then the Result (view) column.
+                        match &w.state {
+                            norm::JobState::Idle => {
+                                ui.label(
+                                    egui::RichText::new("—")
+                                        .color(theme::text_emphasis(ui.visuals())),
+                                );
+                                ui.label("");
+                            }
+                            norm::JobState::Running { runs, stage, fraction } => {
+                                ui.horizontal(|ui| {
+                                    // NeuNorm's own stage progress: a filling
+                                    // bar when the total is known, a moving
+                                    // one while it is not.
+                                    let bar = match fraction {
+                                        Some(f) => egui::ProgressBar::new(*f)
+                                            .desired_width(140.0)
+                                            .desired_height(14.0)
+                                            .corner_radius(3.0)
+                                            .show_percentage(),
+                                        None => egui::ProgressBar::new(0.99)
+                                            .desired_width(140.0)
+                                            .desired_height(14.0)
+                                            .corner_radius(3.0)
+                                            .animate(true),
+                                    };
+                                    ui.add(bar).on_hover_text(format!(
+                                        "normalizing {} run(s)",
+                                        runs.len()
+                                    ));
+                                    ui.label(
+                                        egui::RichText::new(stage.as_str())
+                                            .color(theme::INFO),
+                                    );
+                                });
+                                ui.label("");
+                            }
+                            norm::JobState::Done { output, finished, runs } => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "✔ {} ({} run(s))",
+                                        finished.format("%H:%M:%S"),
+                                        runs.len()
+                                    ))
+                                    .color(theme::SUCCESS),
+                                )
+                                .on_hover_text(output.display().to_string());
+                                if ui
+                                    .button("👁 view")
+                                    .on_hover_text(format!(
+                                        "Open in the TIFF viewer\n{}",
+                                        output.display()
+                                    ))
+                                    .clicked()
+                                {
+                                    view_folder = Some(output.clone());
                                 }
-                                ui.label(run_text);
-                                let when: chrono::DateTime<chrono::Local> = run.mtime.into();
-                                ui.label(when.format("%Y-%m-%d %H:%M:%S").to_string());
-                                // An error log means the reduction failed.
-                                let status = if failed {
+                            }
+                            norm::JobState::Failed { message } => {
+                                ui.label(
                                     egui::RichText::new("✖ failed")
                                         .color(theme::DANGER)
-                                        .strong()
-                                } else {
-                                    egui::RichText::new("✔ success")
-                                        .color(theme::SUCCESS)
-                                        .strong()
-                                };
-                                ui.label(status);
-                                for (kind, path) in [
-                                    (LogKind::Log, &run.log_path),
-                                    (LogKind::Err, &run.err_path),
-                                ] {
-                                    if path.is_some() {
-                                        let active =
-                                            self.viewer == Some((run.run_number, kind));
-                                        if ui.selectable_label(active, "view").clicked() {
-                                            toggled = Some((run.run_number, kind));
-                                        }
-                                    } else {
-                                        ui.label(
-                                            egui::RichText::new("—")
-                                                .color(theme::text_emphasis(ui.visuals())),
-                                        );
-                                    }
-                                }
-                                // Corrected / Normalized data: launch the
-                                // external visualizer on the folder named in
-                                // the run's log. A dash means the log does
-                                // not name that folder (e.g. the run was
-                                // never normalized).
-                                let folders =
-                                    self.run_folders.get(&run.run_number).cloned();
-                                for (folder, what) in [
-                                    (
-                                        folders.as_ref().and_then(|f| f.corrected.clone()),
-                                        "detector efficiency corrected",
-                                    ),
-                                    (
-                                        folders.as_ref().and_then(|f| f.normalized.clone()),
-                                        "normalized",
-                                    ),
-                                ] {
-                                    match folder {
-                                        Some(folder) => {
-                                            let clicked = ui
-                                                .button("▶ visualize")
-                                                .on_hover_text(format!(
-                                                    "Open the {what} data in the visualizer\n{}",
-                                                    folder.display()
-                                                ))
-                                                .clicked();
-                                            if clicked {
-                                                self.launch_error = None;
-                                                self.launch_visualizer(&folder);
-                                            }
-                                        }
-                                        None => {
-                                            ui.label(
-                                                egui::RichText::new("—")
-                                                    .color(theme::text_emphasis(ui.visuals())),
-                                            );
-                                        }
-                                    }
-                                }
+                                        .strong(),
+                                )
+                                .on_hover_text(message);
+                                ui.label("");
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+            if minutes_changed {
+                self.update_windows();
+            }
+            if let Some(folder) = view_folder {
+                self.viewer_error = None;
+                self.open_in_viewer(std::slice::from_ref(&folder));
+            }
+
+            ui.add_space(theme::SPACE_SM);
+            ui.horizontal(|ui| {
+                let any_runs = self.windows.iter().any(|w| !w.runs.is_empty());
+                let launchable = self.selected_config.is_some() && any_runs;
+                let launch = ui.add_enabled(
+                    launchable,
+                    theme::primary_button("▶ Normalize windows now"),
+                );
+                let launch = if launchable {
+                    launch.on_hover_text("Run the combine normalization of every window")
+                } else {
+                    launch.on_disabled_hover_text(
+                        "Needs a selected configuration file and at least one run in a window",
+                    )
+                };
+                if launch.clicked() {
+                    self.launch_windows();
+                }
+                // Compare needs every window normalized: one TIFF viewer
+                // session with the 5/15/30 min stacks side by side.
+                let done: Vec<PathBuf> = self
+                    .windows
+                    .iter()
+                    .filter_map(|w| match &w.state {
+                        norm::JobState::Done { output, .. } => Some(output.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let total = self.windows.len();
+                let all_ready = done.len() == total;
+                let compare = ui.add_enabled(
+                    all_ready,
+                    egui::Button::new(if all_ready {
+                        format!("👁 Compare all {total} (ready)")
+                    } else {
+                        format!("👁 Compare all {total}")
+                    }),
+                );
+                let compare = if all_ready {
+                    compare.on_hover_text(
+                        "Open ONE TIFF viewer with the windows side by side \
+                         (shared colorscale, regions mirrored)",
+                    )
+                } else {
+                    compare.on_disabled_hover_text(format!(
+                        "All windows must be normalized first ({} of {total} ready)",
+                        done.len()
+                    ))
+                };
+                if compare.clicked() {
+                    self.viewer_error = None;
+                    self.open_in_viewer(&done);
+                }
+            });
+            if let Some(err) = &self.viewer_error {
+                ui.label(
+                    egui::RichText::new(format!("Cannot open the viewer: {err}"))
+                        .color(theme::DANGER),
+                );
+            }
+        });
+    }
+
+    /// One ✔/✘ cell of the runs table, with the full path on hover.
+    fn status_cell(ui: &mut egui::Ui, status: &files::FileStatus) {
+        match status {
+            files::FileStatus::Present(path) => {
+                ui.label(
+                    egui::RichText::new("✔")
+                        .color(theme::SUCCESS)
+                        .strong()
+                        .size(16.0),
+                )
+                .on_hover_text(path.display().to_string());
+            }
+            files::FileStatus::Missing(path) => {
+                ui.label(
+                    egui::RichText::new("✘")
+                        .color(theme::text_emphasis(ui.visuals()))
+                        .size(16.0),
+                )
+                .on_hover_text(format!("not there yet — expected at\n{}", path.display()));
+            }
+        }
+    }
+
+    /// Section 4 — the per-run file status table. Shown when a run list was
+    /// given and/or auto-normalization is ON (upcoming-run row on top).
+    fn runs_table(&mut self, ui: &mut egui::Ui) {
+        if self.runs.is_empty() && self.next_run.is_none() {
+            return;
+        }
+        let heading = if self.runs.is_empty() {
+            "5. Runs — next auto-normalized run".to_owned()
+        } else {
+            format!("5. Runs ({})", self.runs.len())
+        };
+        ui.label(theme::section_heading(&heading));
+        ui.add_space(theme::SPACE_XS);
+        theme::section_frame(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("runs_table")
+                .show(ui, |ui| {
+                    egui::Grid::new("runs_grid")
+                        .num_columns(4)
+                        .striped(true)
+                        .spacing([theme::SPACE_LG * 2.5, theme::SPACE_XS])
+                        .show(ui, |ui| {
+                            ui.label(theme::section_heading("Run"));
+                            ui.label(theme::section_heading("NeXus"));
+                            ui.label(theme::section_heading("Raw"));
+                            ui.label(theme::section_heading("Corrected"));
+                            ui.end_row();
+                            // Upcoming run first: not acquired yet, its
+                            // NeXus is what auto-normalization waits for.
+                            if let Some(next) = &self.next_run {
+                                ui.label(
+                                    egui::RichText::new(format!("{} (next)", next.run))
+                                        .color(theme::INFO)
+                                        .strong(),
+                                )
+                                .on_hover_text(
+                                    "Next run that will be auto-normalized — its NeXus \
+                                     is not in the IPTS yet",
+                                );
+                                Self::status_cell(ui, &next.nexus);
+                                Self::status_cell(ui, &next.raw);
+                                Self::status_cell(ui, &next.corrected);
+                                ui.end_row();
+                            }
+                            for run in &self.run_files {
+                                ui.label(
+                                    egui::RichText::new(run.run.to_string()).strong(),
+                                );
+                                Self::status_cell(ui, &run.nexus);
+                                Self::status_cell(ui, &run.raw);
+                                Self::status_cell(ui, &run.corrected);
                                 ui.end_row();
                             }
                         });
                 });
-        });
-        if let Some(err) = &self.launch_error {
-            ui.add_space(theme::SPACE_XS);
-            ui.label(
-                egui::RichText::new(format!("Cannot visualize data: {err}"))
-                    .color(theme::DANGER),
-            );
-        }
-        if let Some(selection) = toggled {
-            // Same switch again → off; otherwise switch the viewer over.
-            self.viewer = if self.viewer == Some(selection) {
-                None
-            } else {
-                Some(selection)
-            };
-            self.viewer_content.clear();
-            self.reload_viewer();
-        }
-
-        // Viewer: content of the selected file, below the table.
-        if let Some((run_number, kind)) = self.viewer {
-            ui.add_space(theme::SPACE_MD);
-            ui.label(theme::section_heading(&format!(
-                "Run {run_number} — {} (VENUS_{run_number}.nxs.h5.{})",
-                kind.label(),
-                match kind {
-                    LogKind::Log => "log",
-                    LogKind::Err => "err",
-                }
-            )));
-            ui.add_space(theme::SPACE_XS);
-            theme::container_frame(ui.visuals()).show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("log_viewer")
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.viewer_content.as_str())
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY),
-                        );
-                    });
-            });
-        }
-    }
-
-    /// Admin unlock (password prompt) / lock control.
-    fn admin_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(theme::section_heading("Admin"));
-        ui.add_space(theme::SPACE_XS);
-        theme::container_frame(ui.visuals()).show(ui, |ui| {
-            if self.admin_unlocked {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Admin mode unlocked")
-                            .color(theme::primary_text(ui.visuals()))
-                            .strong(),
-                    );
-                    if ui.button("Lock").clicked() {
-                        self.admin_unlocked = false;
-                    }
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("Password:");
-                    let edit = egui::TextEdit::singleline(&mut self.password_input)
-                        .password(true)
-                        .desired_width(180.0);
-                    let response = ui.add(edit);
-                    let submitted =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("Unlock").clicked() || submitted {
-                        self.try_unlock();
-                    }
-                });
-                if self.password_error {
-                    ui.label(
-                        egui::RichText::new("Incorrect password").color(theme::DANGER),
-                    );
-                }
-            }
         });
     }
 }
@@ -785,7 +1226,48 @@ impl eframe::App for MonitorApp {
             self.logo_loaded = true;
         }
 
-        // Poll the file so changes made elsewhere show up without user action;
+        // Collect progress and outcomes of the normalization jobs.
+        while let Ok(message) = self.norm_rx.try_recv() {
+            match message {
+                norm::JobMessage::Progress { window_index, stage, fraction } => {
+                    if let Some(w) = self.windows.get_mut(window_index) {
+                        if let norm::JobState::Running {
+                            stage: s,
+                            fraction: f,
+                            ..
+                        } = &mut w.state
+                        {
+                            *s = stage;
+                            *f = fraction;
+                        }
+                    }
+                }
+                norm::JobMessage::Finished { window_index, runs, result } => {
+                    if let Some(w) = self.windows.get_mut(window_index) {
+                        w.state = match result {
+                            Ok(output) => norm::JobState::Done {
+                                output,
+                                finished: chrono::Local::now(),
+                                runs,
+                            },
+                            Err(message) => norm::JobState::Failed { message },
+                        };
+                    }
+                }
+            }
+        }
+
+        // While jobs run, keep frames coming so the spinner moves and the
+        // finished jobs are collected promptly.
+        if self
+            .windows
+            .iter()
+            .any(|w| matches!(w.state, norm::JobState::Running { .. }))
+        {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+
+        // Poll the disk so changes made elsewhere show up without user action;
         // request_repaint keeps frames coming while the window is idle.
         if self.auto_refresh {
             let period = Duration::from_secs(self.refresh_secs.max(1) as u64);
@@ -797,9 +1279,8 @@ impl eframe::App for MonitorApp {
 
         self.header(ctx);
 
-        // Tab bar directly under the header (same pattern as the template's
-        // selector bar).
-        egui::TopBottomPanel::top("tab_bar")
+        // Slim strip under the header: theme toggle + refresh controls.
+        egui::TopBottomPanel::top("controls_bar")
             .frame(
                 egui::Frame::new()
                     .fill(theme::surface_weak(&ctx.style().visuals))
@@ -812,22 +1293,30 @@ impl eframe::App for MonitorApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for (tab, label) in TABS {
-                        if ui.selectable_label(self.tab == *tab, *label).clicked() {
-                            self.tab = *tab;
-                        }
-                    }
-                    ui.separator();
                     theme::toggle_button(ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.refresh_controls(ui);
+                    });
                 });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(theme::SPACE_LG);
-            match self.tab {
-                Tab::Admin => self.admin_tab(ui),
-                Tab::Monitor => self.monitor_tab(ui),
-            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(theme::SPACE_LG);
+                self.ipts_section(ui);
+                ui.add_space(theme::SPACE_LG);
+                // Everything below needs an IPTS.
+                ui.add_enabled_ui(self.ipts.is_some(), |ui| {
+                    self.config_section(ui);
+                    ui.add_space(theme::SPACE_LG);
+                    self.mode_section(ui);
+                    ui.add_space(theme::SPACE_LG);
+                    self.windows_section(ui);
+                    ui.add_space(theme::SPACE_LG);
+                    self.runs_table(ui);
+                });
+                ui.add_space(theme::SPACE_LG);
+            });
         });
     }
 }
@@ -835,7 +1324,7 @@ impl eframe::App for MonitorApp {
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 560.0])
+            .with_inner_size([880.0, 820.0])
             .with_title(APP_TITLE),
         ..Default::default()
     };
@@ -844,7 +1333,7 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             // Saved light/dark preference, shared by all the VENUS rust
-            // tools (dark when none is saved); the tab bar has a toggle.
+            // tools (dark when none is saved); the controls bar has a toggle.
             cc.egui_ctx.set_theme(theme::load());
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(MonitorApp::new()))

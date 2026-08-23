@@ -152,6 +152,18 @@ pub fn container_frame(visuals: &egui::Visuals) -> egui::Frame {
         .inner_margin(SPACE_XS)
 }
 
+/// A [`container_frame`] stretched to the full available width so every
+/// section box lines up (content no longer dictates the box width), with a
+/// touch more inner padding.
+pub fn section_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    container_frame(ui.visuals())
+        .inner_margin(SPACE_SM)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add_contents(ui);
+        });
+}
+
 /// A section heading (Header type role): weight + color structure content at
 /// the default body size (no enlargement). The color comes from the active
 /// theme's strong text token (installed by [`apply`]).

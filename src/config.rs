@@ -118,6 +118,31 @@ pub fn set_activate(path: &Path, activate: bool) -> Result<(), String> {
     set_value(path, "activate", if activate { "true" } else { "false" })
 }
 
+/// (Re)write the whole configuration file with the same 5-key schema the
+/// normalization notebook uses (`register_config_for_autoreduction`),
+/// creating the parent folder / file if needed.
+pub fn write_full(
+    path: &Path,
+    ipts: &str,
+    config_file: &str,
+    activate: bool,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let content = format!(
+        "user_autoreduction_config_file: {config_file}\n\
+         activate: {activate}\n\
+         ipts: {ipts}\n\
+         last_modified: '{now}'\n\
+         last_modified_by: {user}\n"
+    );
+    fs::write(path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +215,19 @@ last_modified_by: j35
         // Unknown keys are rejected, nothing is appended.
         assert!(set_value(&path, "not_a_key", "x").is_err());
         assert!(read(&path).unwrap().get("not_a_key").is_none());
+    }
+
+    #[test]
+    fn write_full_creates_the_file_with_the_notebook_schema() {
+        let dir = std::env::temp_dir().join("anm_test_write_full/sub");
+        let _ = fs::remove_dir_all(std::env::temp_dir().join("anm_test_write_full"));
+        let path = dir.join("autoreduction.cfg");
+        write_full(&path, "IPTS-36967", "/tmp/config.h5", true).unwrap();
+        let cfg = read(&path).unwrap();
+        assert!(cfg.activate);
+        assert_eq!(cfg.get("ipts"), Some("IPTS-36967"));
+        assert_eq!(cfg.get("user_autoreduction_config_file"), Some("/tmp/config.h5"));
+        assert!(cfg.get("last_modified").is_some());
     }
 
     #[test]

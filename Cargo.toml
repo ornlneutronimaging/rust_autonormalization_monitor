@@ -2,12 +2,11 @@
 name = "autonormalization_monitor"
 version = "0.1.0"
 edition = "2024"
-description = "Monitor and (admin-only) toggle the VENUS auto normalization state"
+description = "Select an IPTS + normalization configuration, turn auto normalization on or check the files of a list of runs"
 
 [dependencies]
 chrono = "0.4"
 eframe = "0.31"
+hdf5-metno = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
-serde_json = "1"
-sha2 = "0.10"
