@@ -1048,13 +1048,31 @@ impl MonitorApp {
                                 minutes_changed = true;
                             }
                         });
-                        // Which runs the window currently holds.
+                        // Which runs the window currently holds. A range
+                        // ("23640–23642") only when truly contiguous —
+                        // with a hole (e.g. a rejected run) the actual
+                        // numbers are spelled out.
                         let summary = match (w.runs.first(), w.runs.last()) {
                             (Some(first), Some(last)) if first == last => {
                                 format!("1 run ({first})")
                             }
                             (Some(first), Some(last)) => {
-                                format!("{} runs ({first}–{last})", w.runs.len())
+                                let n = w.runs.len();
+                                let contiguous = last - first + 1 == n as u64;
+                                if contiguous {
+                                    format!("{n} runs ({first}–{last})")
+                                } else if n <= 8 {
+                                    format!(
+                                        "{n} runs ({})",
+                                        w.runs
+                                            .iter()
+                                            .map(|r| r.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                } else {
+                                    format!("{n} runs ({first}, …, {last})")
+                                }
                             }
                             _ => "no run in window".to_owned(),
                         };
