@@ -22,7 +22,7 @@ mod notebook;
 mod theme;
 
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -152,9 +152,15 @@ struct MonitorApp {
     /// Raw text of the run-list field and its parse error, if any.
     run_list_text: String,
     run_list_error: Option<String>,
-    /// Parsed run numbers currently shown in the table.
+    /// Parsed run numbers of the user's list (empty = live mode).
     runs: Vec<u64>,
-    /// File presence for each run in `runs` (rebuilt on refresh).
+    /// Runs rejected by the user: still listed in the table (crossed out)
+    /// but excluded from the windows and their normalizations.
+    rejected: HashSet<u64>,
+    /// Live mode: every run inside the widest window (rejected included),
+    /// so the table can show the runs the windows use.
+    window_span: Vec<u64>,
+    /// File presence for each run shown in the table (rebuilt on refresh).
     run_files: Vec<files::RunFiles>,
     /// When auto-normalization is ON: the upcoming run (latest NeXus in the
     /// IPTS + 1) that will be normalized next, shown on top of the table.
@@ -200,6 +206,8 @@ impl MonitorApp {
             run_list_text: String::new(),
             run_list_error: None,
             runs: Vec::new(),
+            rejected: HashSet::new(),
+            window_span: Vec::new(),
             run_files: Vec::new(),
             next_run: None,
             windows: DEFAULT_WINDOWS_MIN
@@ -248,6 +256,7 @@ impl MonitorApp {
         self.viewer_error = None;
         self.selected_config = None;
         self.end_time_cache.clear();
+        self.rejected.clear();
         self.last_live_anchor = None;
         for w in &mut self.windows {
             w.runs.clear();
@@ -317,12 +326,19 @@ impl MonitorApp {
         }
     }
 
-    /// Re-check the presence of every file of the runs in the list, and of
+    /// Recompute the windows, then the table: file presence of every run
+    /// in use (the user's list, or the widest window in live mode) and of
     /// the upcoming run when auto-normalization is active.
     fn check_runs(&mut self) {
+        self.update_windows();
+        let table_runs = if !self.runs.is_empty() {
+            self.runs.clone()
+        } else {
+            self.window_span.clone()
+        };
         self.run_files = match self.ipts_path() {
-            Some(ipts_path) if !self.runs.is_empty() => {
-                files::check_runs(&ipts_path, &self.runs)
+            Some(ipts_path) if !table_runs.is_empty() => {
+                files::check_runs(&ipts_path, &table_runs)
             }
             _ => Vec::new(),
         };
@@ -336,7 +352,6 @@ impl MonitorApp {
         } else {
             None
         };
-        self.update_windows();
     }
 
     /// Recompute which runs fall in each rolling window: the user's run
@@ -374,16 +389,43 @@ impl MonitorApp {
                     t
                 }
             };
-            let anchor = *anchor.get_or_insert(time);
-            if time < anchor - chrono::Duration::minutes(i64::from(max_minutes)) {
-                if live {
-                    break;
+            // The anchor is the newest NON-rejected run, so rejecting the
+            // latest run slides the windows back to the previous one.
+            if anchor.is_none() && !self.rejected.contains(&run) {
+                anchor = Some(time);
+            }
+            if let Some(anchor) = anchor {
+                if time < anchor - chrono::Duration::minutes(i64::from(max_minutes)) {
+                    if live {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
             }
             end_times.push((run, time));
         }
-        norm::assign_windows(&mut self.windows, &end_times);
+        // Rejected runs never enter the windows (nor set the anchor), but
+        // stay in the live table span so they can be restored.
+        let kept: Vec<(u64, chrono::DateTime<chrono::FixedOffset>)> = end_times
+            .iter()
+            .filter(|(run, _)| !self.rejected.contains(run))
+            .copied()
+            .collect();
+        norm::assign_windows(&mut self.windows, &kept);
+        self.window_span = match kept.iter().map(|(_, t)| *t).max() {
+            Some(kept_anchor) => {
+                let cutoff =
+                    kept_anchor - chrono::Duration::minutes(i64::from(max_minutes));
+                let mut span: Vec<u64> = end_times
+                    .iter()
+                    .filter(|(_, t)| *t >= cutoff)
+                    .map(|(run, _)| *run)
+                    .collect();
+                span.sort_unstable();
+                span
+            }
+            None => Vec::new(),
+        };
 
         // Live and hybrid modes: a new anchor run (a NeXus that just
         // showed up — in hybrid mode, just joined the list) fires the
@@ -1099,7 +1141,7 @@ impl MonitorApp {
                     }
                 });
             if minutes_changed {
-                self.update_windows();
+                self.check_runs();
             }
             if let Some(folder) = view_folder {
                 self.viewer_error = None;
@@ -1192,25 +1234,41 @@ impl MonitorApp {
         }
     }
 
-    /// Section 4 — the per-run file status table. Shown when a run list was
-    /// given and/or auto-normalization is ON (upcoming-run row on top).
+    /// Section 5 — the runs in use (the list, or the widest window in live
+    /// mode): file status per run, a preview of the corrected data in the
+    /// TIFF viewer, and a reject/restore toggle — rejected runs stay
+    /// listed, crossed out, but leave the windows and their
+    /// normalizations. The upcoming run tops the table when
+    /// auto-normalization is ON.
     fn runs_table(&mut self, ui: &mut egui::Ui) {
-        if self.runs.is_empty() && self.next_run.is_none() {
+        if self.run_files.is_empty() && self.next_run.is_none() {
             return;
         }
-        let heading = if self.runs.is_empty() {
-            "5. Runs — next auto-normalized run".to_owned()
+        let rejected_count = self
+            .run_files
+            .iter()
+            .filter(|r| self.rejected.contains(&r.run))
+            .count();
+        let heading = if self.run_files.is_empty() {
+            "5. Runs in use — next auto-normalized run".to_owned()
+        } else if rejected_count > 0 {
+            format!(
+                "5. Runs in use ({}, {rejected_count} rejected)",
+                self.run_files.len() - rejected_count
+            )
         } else {
-            format!("5. Runs ({})", self.runs.len())
+            format!("5. Runs in use ({})", self.run_files.len())
         };
         ui.label(theme::section_heading(&heading));
         ui.add_space(theme::SPACE_XS);
+        let mut toggle_run: Option<u64> = None;
+        let mut preview_folder: Option<PathBuf> = None;
         theme::section_frame(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("runs_table")
                 .show(ui, |ui| {
                     egui::Grid::new("runs_grid")
-                        .num_columns(4)
+                        .num_columns(6)
                         .striped(true)
                         .spacing([theme::SPACE_LG * 2.5, theme::SPACE_XS])
                         .show(ui, |ui| {
@@ -1218,6 +1276,8 @@ impl MonitorApp {
                             ui.label(theme::section_heading("NeXus"));
                             ui.label(theme::section_heading("Raw"));
                             ui.label(theme::section_heading("Corrected"));
+                            ui.label(theme::section_heading("Preview"));
+                            ui.label(theme::section_heading("Use"));
                             ui.end_row();
                             // Upcoming run first: not acquired yet, its
                             // NeXus is what auto-normalization waits for.
@@ -1234,20 +1294,81 @@ impl MonitorApp {
                                 Self::status_cell(ui, &next.nexus);
                                 Self::status_cell(ui, &next.raw);
                                 Self::status_cell(ui, &next.corrected);
+                                ui.label("");
+                                ui.label("");
                                 ui.end_row();
                             }
                             for run in &self.run_files {
-                                ui.label(
-                                    egui::RichText::new(run.run.to_string()).strong(),
-                                );
+                                let rejected = self.rejected.contains(&run.run);
+                                let mut run_text =
+                                    egui::RichText::new(run.run.to_string()).strong();
+                                if rejected {
+                                    run_text = run_text
+                                        .strikethrough()
+                                        .color(theme::text_emphasis(ui.visuals()));
+                                }
+                                let label = ui.label(run_text);
+                                if rejected {
+                                    label.on_hover_text(
+                                        "Rejected — excluded from the windows",
+                                    );
+                                }
                                 Self::status_cell(ui, &run.nexus);
                                 Self::status_cell(ui, &run.raw);
                                 Self::status_cell(ui, &run.corrected);
+                                // Preview: the corrected data in the viewer.
+                                match &run.corrected {
+                                    files::FileStatus::Present(folder) => {
+                                        if ui
+                                            .button("👁")
+                                            .on_hover_text(format!(
+                                                "Open the corrected data in the TIFF \
+                                                 viewer\n{}",
+                                                folder.display()
+                                            ))
+                                            .clicked()
+                                        {
+                                            preview_folder = Some(folder.clone());
+                                        }
+                                    }
+                                    _ => {
+                                        ui.label(
+                                            egui::RichText::new("—").color(
+                                                theme::text_emphasis(ui.visuals()),
+                                            ),
+                                        )
+                                        .on_hover_text("No corrected data yet");
+                                    }
+                                }
+                                // Reject / restore toggle.
+                                let (text, hover) = if rejected {
+                                    ("↩ restore", "Put this run back in the windows")
+                                } else {
+                                    (
+                                        "✖ reject",
+                                        "Exclude this run from the windows and their \
+                                         normalizations",
+                                    )
+                                };
+                                if ui.button(text).on_hover_text(hover).clicked() {
+                                    toggle_run = Some(run.run);
+                                }
                                 ui.end_row();
                             }
                         });
                 });
         });
+        if let Some(run) = toggle_run {
+            if !self.rejected.remove(&run) {
+                self.rejected.insert(run);
+            }
+            // Windows (and the table span) follow the new selection.
+            self.check_runs();
+        }
+        if let Some(folder) = preview_folder {
+            self.viewer_error = None;
+            self.open_in_viewer(std::slice::from_ref(&folder));
+        }
     }
 }
 

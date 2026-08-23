@@ -44,10 +44,16 @@ Single view, top to bottom:
      side (`--compare`: shared colorscale, regions mirrored, one profile
      curve per stack — images only for now).
      Configurations with a crop region are not supported yet.
-5. **Runs table** — shown when a run list was given and/or auto
-   normalization is ON. When ON, the first row is the **upcoming run**
-   (highest run in `<IPTS>/nexus` + 1, refreshed automatically) that will
-   be normalized next. For each run, one column per file kind with a
+5. **Runs in use table** — lists the runs the windows use (the manual
+   list, or the widest window in live mode). When auto normalization is
+   ON, the first row is the **upcoming run** (highest run in
+   `<IPTS>/nexus` + 1, refreshed automatically) that will be normalized
+   next. Each row has a **👁 Preview** button opening the run's corrected
+   folder in the rust_tiff_viewer, and a **✖ reject / ↩ restore** toggle:
+   a rejected run stays listed (crossed out) but leaves the windows and
+   their normalizations — rejecting the newest run slides the window
+   anchor back to the previous one. For each run, one column per file
+   kind with a
    ✔ (found) / ✘ (not there yet) icon; hovering an icon shows the full
    path. Locations inside the IPTS folder:
    - **NeXus**: `nexus/VENUS_<run>.nxs.h5`
