@@ -1334,7 +1334,9 @@ impl MonitorApp {
                             theme::PRIMARY
                         })
                         .name(format!(
-                            "run {run}{}\n{} → {}  ({:.1} min)",
+                            // En dash, not "→": the arrow glyph is missing
+                            // from egui's default font (renders as a box).
+                            "run {run}{}\n{} – {}  ({:.1} min)",
                             if *rejected { " (rejected)" } else { "" },
                             start.format("%H:%M:%S"),
                             end.format("%H:%M:%S"),
