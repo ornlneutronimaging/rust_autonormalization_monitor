@@ -20,6 +20,7 @@ mod h5;
 mod norm;
 mod notebook;
 mod theme;
+mod zoom;
 
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
@@ -1665,6 +1666,7 @@ impl eframe::App for MonitorApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     theme::toggle_button(ui);
+                    zoom::toggle_button(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.refresh_controls(ui);
                     });
@@ -1706,6 +1708,7 @@ fn main() -> eframe::Result<()> {
             // Saved light/dark preference, shared by all the VENUS rust
             // tools (dark when none is saved); the controls bar has a toggle.
             cc.egui_ctx.set_theme(theme::load());
+            cc.egui_ctx.set_zoom_factor(zoom::load());
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(MonitorApp::new()))
         }),
