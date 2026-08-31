@@ -1301,6 +1301,17 @@ impl MonitorApp {
     /// start → end, from the NeXus times) and, on top, the coverage of the
     /// three rolling windows — all on a shared time axis in minutes
     /// relative to the anchor (the newest non-rejected run).
+    /// egui_plot draws hover text left-anchored at the pointer tip, where
+    /// the arrow cursor covers the first characters — indent every line so
+    /// the text starts clear of the cursor.
+    fn hover_indent(text: impl AsRef<str>) -> String {
+        text.as_ref()
+            .lines()
+            .map(|l| format!("      {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn runs_timeline(&mut self, ui: &mut egui::Ui) {
         use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text, VLine};
         theme::section_frame(ui, |ui| {
@@ -1521,18 +1532,22 @@ impl MonitorApp {
                         let v = lo + (point.y - b0) / (b1 - b0) * (hi - lo);
                         let at = anchor_for_cursor
                             + chrono::Duration::milliseconds((point.x * 60_000.0) as i64);
-                        return format!(
+                        return Self::hover_indent(format!(
                             "{label}: {v:.2}\nat {:.1} min  ({})",
                             point.x,
                             at.format("%H:%M:%S")
-                        );
+                        ));
                     }
                     if name.is_empty() {
                         let at = anchor_for_cursor
                             + chrono::Duration::milliseconds((point.x * 60_000.0) as i64);
-                        format!("{:.1} min  ({})", point.x, at.format("%H:%M:%S"))
+                        Self::hover_indent(format!(
+                            "{:.1} min  ({})",
+                            point.x,
+                            at.format("%H:%M:%S")
+                        ))
                     } else {
-                        name.to_owned()
+                        Self::hover_indent(name)
                     }
                 })
                 .show(ui, |plot_ui| {
@@ -1545,12 +1560,16 @@ impl MonitorApp {
                     plot_ui.bar_chart(
                         BarChart::new(band_bars)
                             .horizontal()
-                            .element_formatter(Box::new(|bar, _| bar.name.clone())),
+                            .element_formatter(Box::new(|bar, _| {
+                                Self::hover_indent(&bar.name)
+                            })),
                     );
                     plot_ui.bar_chart(
                         BarChart::new(run_bars)
                             .horizontal()
-                            .element_formatter(Box::new(|bar, _| bar.name.clone())),
+                            .element_formatter(Box::new(|bar, _| {
+                                Self::hover_indent(&bar.name)
+                            })),
                     );
                     for text in texts {
                         plot_ui.text(text);
