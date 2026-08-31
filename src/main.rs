@@ -54,6 +54,23 @@ const TIFF_VIEWER_CMD: &str =
 /// Default rolling time windows, in minutes of acquisition time.
 const DEFAULT_WINDOWS_MIN: [u32; 3] = [5, 15, 30];
 
+/// Sample-environment PVs that can be overlaid on the acquisition timeline:
+/// (dataset name under `/entry/DASlogs` of the NeXus files, annotation
+/// appended in the selector). The `SPSet`/`RateSet` names are what the DAS
+/// records for the Loop1/Loop2 setpoint and setpoint-rate PVs.
+const TIMELINE_PVS: &[(&str, &str)] = &[
+    ("BL10:SE:ND2:Loop1:SP:RateSet", ""),
+    ("BL10:SE:ND2:Loop2:SP:RateSet", ""),
+    ("BL10:SE:ND2:Loop1:SPSet", ""),
+    ("BL10:SE:ND2:Loop2:SPSet", ""),
+    ("BL10:SE:ND2:CH1:PV", " (zone 1)"),
+    ("BL10:SE:ND2:CH2:PV", " (zone 2)"),
+    ("BL10:SE:ND2:CH4:PV", " (sample)"),
+];
+
+/// The (absolute time, value) points of one DASlogs entry.
+type PvPoints = Vec<(chrono::DateTime<chrono::FixedOffset>, f64)>;
+
 /// The two views of the "Runs in use" section.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunsView {
@@ -188,6 +205,12 @@ struct MonitorApp {
     /// Which view of section 5 is open: the table or the acquisition
     /// timeline plot.
     runs_view: RunsView,
+    /// Sample-environment PV overlaid on the timeline (index into
+    /// [`TIMELINE_PVS`]), if any.
+    timeline_pv: Option<usize>,
+    /// DASlogs points already read: (run, PV dataset name) → (time, value).
+    /// An empty vector marks a NeXus without that log (not re-read).
+    pv_cache: HashMap<(u64, &'static str), PvPoints>,
     /// Latest (anchor) run the live mode already reacted to: a job volley
     /// fires only when a newer NeXus shows up.
     last_live_anchor: Option<u64>,
@@ -234,6 +257,8 @@ impl MonitorApp {
                 .collect(),
             time_cache: HashMap::new(),
             runs_view: RunsView::Table,
+            timeline_pv: None,
+            pv_cache: HashMap::new(),
             last_live_anchor: None,
             norm_tx,
             norm_rx,
@@ -275,6 +300,7 @@ impl MonitorApp {
         self.viewer_error = None;
         self.selected_config = None;
         self.time_cache.clear();
+        self.pv_cache.clear();
         self.rejected.clear();
         self.last_live_anchor = None;
         for w in &mut self.windows {
@@ -1297,6 +1323,28 @@ impl MonitorApp {
                 );
                 return;
             }
+            // Which sample-environment PV (NeXus DASlogs) to overlay on a
+            // second y-axis, on the right of the plot.
+            ui.horizontal(|ui| {
+                ui.label("Metadata overlay:");
+                let current = self.timeline_pv.map_or_else(
+                    || "none".to_owned(),
+                    |i| format!("{}{}", TIMELINE_PVS[i].0, TIMELINE_PVS[i].1),
+                );
+                egui::ComboBox::from_id_salt("timeline_pv")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.timeline_pv, None, "none");
+                        for (i, (name, extra)) in TIMELINE_PVS.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.timeline_pv,
+                                Some(i),
+                                format!("{name}{extra}"),
+                            );
+                        }
+                    });
+            });
+            ui.add_space(theme::SPACE_XS);
             // Same anchor as the windows: newest end among non-rejected runs.
             let anchor = bars_data
                 .iter()
@@ -1386,17 +1434,99 @@ impl MonitorApp {
                 );
             }
 
+            // Selected PV: (time, value) points of every run's DASlog, as
+            // one polyline per run (no line across the gaps between runs).
+            // The values live on their own scale, drawn inside the run-bar
+            // band [-0.5, n-0.5] and read back on the right-hand axis.
+            let band = (-0.5_f64, n as f64 - 0.5);
+            let mut pv_series: Vec<Vec<[f64; 2]>> = Vec::new();
+            let mut pv_scale: Option<(f64, f64)> = None;
+            let mut pv_label = String::new();
+            if let Some(idx) = self.timeline_pv {
+                let (pv_name, extra) = TIMELINE_PVS[idx];
+                pv_label = format!(
+                    "{}{extra}",
+                    pv_name.trim_start_matches("BL10:SE:ND2:")
+                );
+                if let Some(ipts_path) = self.ipts_path() {
+                    for (run, ..) in &bars_data {
+                        let points = self
+                            .pv_cache
+                            .entry((*run, pv_name))
+                            .or_insert_with(|| {
+                                h5::daslog(&files::nexus_path(&ipts_path, *run), pv_name)
+                                    .unwrap_or_default()
+                            });
+                        let series: Vec<[f64; 2]> = points
+                            .iter()
+                            .filter(|(_, v)| v.is_finite())
+                            .map(|(t, v)| [to_min(t), *v])
+                            .collect();
+                        if !series.is_empty() {
+                            pv_series.push(series);
+                        }
+                    }
+                }
+                let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                for p in pv_series.iter().flatten() {
+                    lo = lo.min(p[1]);
+                    hi = hi.max(p[1]);
+                }
+                if lo.is_finite() {
+                    if hi - lo < 1e-9 {
+                        // Constant log — pad so the flat line sits mid-band.
+                        lo -= 1.0;
+                        hi += 1.0;
+                    }
+                    pv_scale = Some((lo, hi));
+                }
+            }
+            let mut y_axes =
+                vec![egui_plot::AxisHints::new_y().formatter(|_, _| String::new())];
+            if let Some((lo, hi)) = pv_scale {
+                let (b0, b1) = band;
+                y_axes.push(
+                    egui_plot::AxisHints::new_y()
+                        .placement(egui_plot::HPlacement::Right)
+                        .label(pv_label.clone())
+                        .formatter(move |mark, _| {
+                            if (b0..=b1).contains(&mark.value) {
+                                let v = lo + (mark.value - b0) / (b1 - b0) * (hi - lo);
+                                egui::emath::format_with_decimals_in_range(v, 0..=2)
+                            } else {
+                                String::new()
+                            }
+                        }),
+                );
+            }
+
             let height = ((n + 5) as f32 * 24.0).clamp(200.0, 440.0);
             let anchor_for_cursor = anchor;
-            Plot::new("acq_timeline")
+            let hover_pv = pv_scale.map(|scale| (pv_label.clone(), scale, band));
+            let response = Plot::new("acq_timeline")
                 .height(height)
                 .allow_scroll(false)
-                .y_axis_formatter(|_, _| String::new())
+                .custom_y_axes(y_axes)
+                .x_axis_label("time [minutes] relative to the latest run")
                 .include_x(span_min * 1.12)
                 .include_x(-span_min * 0.03)
                 .include_y(-0.7)
                 .include_y(n as f64 + 3.9)
                 .label_formatter(move |name, point| {
+                    // Hovering the PV curve: map the plot y back to the
+                    // PV's own scale so the real value is shown.
+                    if let Some((label, (lo, hi), (b0, b1))) =
+                        hover_pv.as_ref().filter(|(label, ..)| name == label)
+                    {
+                        let v = lo + (point.y - b0) / (b1 - b0) * (hi - lo);
+                        let at = anchor_for_cursor
+                            + chrono::Duration::milliseconds((point.x * 60_000.0) as i64);
+                        return format!(
+                            "{label}: {v:.2}\nat {:.1} min  ({})",
+                            point.x,
+                            at.format("%H:%M:%S")
+                        );
+                    }
                     if name.is_empty() {
                         let at = anchor_for_cursor
                             + chrono::Duration::milliseconds((point.x * 60_000.0) as i64);
@@ -1425,11 +1555,59 @@ impl MonitorApp {
                     for text in texts {
                         plot_ui.text(text);
                     }
+                    // The PV curves, values mapped into the run-bar band
+                    // (their true scale is the right-hand axis). Markers on
+                    // top so single-point logs of short runs stay visible.
+                    if let Some((lo, hi)) = pv_scale {
+                        let (b0, b1) = band;
+                        let to_y =
+                            move |v: f64| b0 + (v - lo) / (hi - lo) * (b1 - b0);
+                        for series in &pv_series {
+                            plot_ui.line(
+                                egui_plot::Line::new(
+                                    series
+                                        .iter()
+                                        .map(|p| [p[0], to_y(p[1])])
+                                        .collect::<Vec<_>>(),
+                                )
+                                .color(theme::DANGER)
+                                .width(1.8)
+                                .name(&pv_label),
+                            );
+                            plot_ui.points(
+                                egui_plot::Points::new(
+                                    series
+                                        .iter()
+                                        .map(|p| [p[0], to_y(p[1])])
+                                        .collect::<Vec<_>>(),
+                                )
+                                .radius(2.5)
+                                .color(theme::DANGER)
+                                .name(&pv_label),
+                            );
+                        }
+                    }
                 });
+            // A thin crosshair instead of the arrow, which sat right on top
+            // of the hover text next to the data points.
+            if response.response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            if self.timeline_pv.is_some() && pv_scale.is_none() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "No {pv_label} values in the NeXus files of these runs"
+                    ))
+                    .color(theme::WARNING)
+                    .small(),
+                );
+            }
             ui.label(
                 egui::RichText::new(
-                    "Time axis: minutes relative to the latest (non-rejected) run — \
-                     hover a bar for the run's start/end and duration",
+                    "X axis: minutes relative to the latest (non-rejected) run — \
+                     hover a bar for the run's start/end and duration. The red \
+                     curve (if a metadata PV is selected) reads on the right-hand \
+                     axis.",
                 )
                 .color(theme::text_emphasis(ui.visuals()))
                 .small(),

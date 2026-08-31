@@ -63,6 +63,46 @@ pub fn nexus_times(path: &Path) -> Option<(DateTime<FixedOffset>, DateTime<Fixed
     ))
 }
 
+/// Numeric dataset read as f64 whatever its stored numeric flavor (the
+/// HDF5 library converts integers and narrower floats on the fly).
+fn read_f64s(c: &h5::Container) -> Option<Vec<f64>> {
+    use TypeDescriptor::*;
+    match c.dtype().and_then(|d| d.to_descriptor()).ok()? {
+        Float(_) | Integer(_) | Unsigned(_) => c.read_raw::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// One sample-environment log of a NeXus file: the (absolute time, value)
+/// points of `/entry/DASlogs/<name>`, where the `time` dataset holds
+/// seconds since its own `start` attribute (RFC-3339). `None` when the
+/// file or the log is missing or unreadable.
+pub fn daslog(path: &Path, name: &str) -> Option<Vec<(DateTime<FixedOffset>, f64)>> {
+    let file = h5::File::open(path).ok()?;
+    let group = file.group(&format!("entry/DASlogs/{name}")).ok()?;
+    let time_ds = group.dataset("time").ok()?;
+    let start = time_ds
+        .attr("start")
+        .ok()
+        .and_then(|a| read_strings(&a)?.into_iter().next())?;
+    let start = DateTime::parse_from_rfc3339(start.trim()).ok()?;
+    let times = read_f64s(&time_ds)?;
+    let value_ds = group.dataset("value").ok()?;
+    let values = read_f64s(&value_ds)?;
+    Some(
+        times
+            .into_iter()
+            .zip(values)
+            .map(|(t, v)| {
+                (
+                    start + chrono::Duration::milliseconds((t * 1000.0) as i64),
+                    v,
+                )
+            })
+            .collect(),
+    )
+}
+
 /// What the auto-normalization launcher needs out of a normalization
 /// session configuration file (schema of the marimo notebook, version 1).
 pub struct ConfigInfo {
@@ -107,6 +147,21 @@ mod tests {
         assert!(start <= end);
         // Missing file → None, no panic.
         assert!(nexus_times(Path::new("/nonexistent.nxs.h5")).is_none());
+    }
+
+    #[test]
+    fn reads_a_daslog_of_a_real_nexus() {
+        let path = Path::new("/SNS/VENUS/IPTS-36967/nexus/VENUS_23642.nxs.h5");
+        if !path.is_file() {
+            return;
+        }
+        let points = daslog(path, "BL10:SE:ND2:CH4:PV").expect("log should be readable");
+        assert!(!points.is_empty());
+        let (t, v) = points[0];
+        assert_eq!(t.format("%Y-%m-%d").to_string(), "2026-06-13");
+        assert!(v.is_finite());
+        // Missing log → None, no panic.
+        assert!(daslog(path, "BL10:SE:ND2:NoSuchLog").is_none());
     }
 
     #[test]
