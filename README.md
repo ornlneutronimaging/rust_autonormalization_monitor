@@ -11,8 +11,10 @@ Single view, top to bottom:
    below is disabled until an IPTS is selected.
 2. **Normalization configuration** — dropdown of the
    `<IPTS>/shared/autoreduce/configs/*.h5` files (newest first; hover for
-   the full path), with a **👁 Preview** button that opens the selected
-   file in the rust_nexus_viewer. A button launches the marimo
+   the full path), a **📂 Browse…** button to pick a configuration file
+   from anywhere (the native file dialog opens in `<IPTS>/shared`), and a
+   **👁 Preview** button that opens the selected file in the
+   rust_nexus_viewer. A button launches the marimo
    **Normalization TOF at VENUS** notebook to create/edit a configuration: the notebook is
    provisioned into `<IPTS>/shared/notebooks/imaging_marimo_<user>/` and
    started from there, so it opens directly on the selected IPTS.

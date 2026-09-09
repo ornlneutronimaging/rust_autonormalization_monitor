@@ -278,9 +278,8 @@ impl MonitorApp {
                     .map(PathBuf::from);
                 app.select_ipts(ipts);
                 if let Some(file) = registered {
-                    if app.configs.iter().any(|c| c.path == file) {
-                        app.selected_config = Some(file);
-                    }
+                    app.selected_config = Some(file);
+                    app.keep_selected_config();
                 }
             }
         }
@@ -363,11 +362,57 @@ impl MonitorApp {
             self.configs.push(ConfigFile { path, name, mtime });
         }
         self.configs.sort_by(|a, b| b.mtime.cmp(&a.mtime));
-        // Drop a selection that no longer exists on disk.
-        if let Some(selected) = &self.selected_config {
-            if !self.configs.iter().any(|c| &c.path == selected) {
-                self.selected_config = None;
+        self.keep_selected_config();
+    }
+
+    /// Reconcile the selection with the list: a selected file that lives
+    /// outside the configs folder (picked with "Browse…", or registered by
+    /// hand in autoreduction.cfg) is appended to the list so the dropdown
+    /// can show it; a selection that no longer exists on disk is dropped.
+    fn keep_selected_config(&mut self) {
+        let Some(selected) = self.selected_config.clone() else {
+            return;
+        };
+        if self.configs.iter().any(|c| c.path == selected) {
+            return;
+        }
+        match std::fs::metadata(&selected) {
+            Ok(meta) if meta.is_file() => {
+                let name = selected
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| selected.display().to_string());
+                let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                self.configs.push(ConfigFile {
+                    path: selected,
+                    name,
+                    mtime,
+                });
             }
+            _ => self.selected_config = None,
+        }
+    }
+
+    /// "Browse…": native file dialog to pick any `.h5` configuration file,
+    /// opened in the selected IPTS `shared` folder.
+    fn browse_config(&mut self) {
+        let Some(ipts_path) = self.ipts_path() else {
+            return;
+        };
+        let start_dir = ipts_path.join("shared");
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("Normalization configuration (HDF5)", &["h5", "hdf5"])
+            .add_filter("All files", &["*"])
+            .set_title("Select a normalization configuration file");
+        if start_dir.is_dir() {
+            dialog = dialog.set_directory(&start_dir);
+        } else {
+            dialog = dialog.set_directory(&ipts_path);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.selected_config = Some(path);
+            self.preview_error = None;
+            self.keep_selected_config();
         }
     }
 
@@ -893,6 +938,18 @@ impl MonitorApp {
                     .clicked()
                 {
                     self.rescan_configs();
+                }
+                if ui
+                    .button("📂 Browse…")
+                    .on_hover_text(format!(
+                        "Pick a configuration file anywhere on disk\n(opens in {})",
+                        self.ipts_path()
+                            .map(|p| p.join("shared").display().to_string())
+                            .unwrap_or_default()
+                    ))
+                    .clicked()
+                {
+                    self.browse_config();
                 }
                 // Preview the selected configuration in the NeXus viewer
                 // (the config is a plain HDF5 file).
