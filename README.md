@@ -22,12 +22,12 @@ Single view, top to bottom:
      and sets its `activate` flag, so every upcoming run gets normalized;
      turning it OFF only clears the flag;
    - or a **list of runs** (e.g. `23615-23620, 23642`).
-4. **Rolling combine & compare (NeuNorm)** — **opt-in**: a checkbox
-     (*Include the rolling windows in the auto normalization*, saved as the
-     `rolling_combine` flag of the shared `autoreduction.cfg`) makes the
-     windows part of the auto normalization. Unchecked (the default for
-     everybody), the auto normalization only normalizes each run on its
-     own and the windows are launched by hand. The windows (default last 5 / 15 /
+4. **Rolling combine & compare (NeuNorm)** — **opt-in**: the section
+     heading is a checkbox (saved as the `rolling_combine` flag of the
+     shared `autoreduction.cfg`) that makes the windows part of the auto
+     normalization. Unchecked (the default for everybody), the auto
+     normalization only normalizes each run on its own and the whole
+     section is hidden. The windows (default last 5 / 15 /
      30 min of acquisition time, editable): each window collects the runs
      whose acquisition (NeXus `end_time`) ended within its last N minutes,
      anchored at the newest run considered. The runs of each window are

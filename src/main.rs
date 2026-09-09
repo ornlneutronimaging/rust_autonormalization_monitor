@@ -1081,56 +1081,52 @@ impl MonitorApp {
         });
     }
 
-    /// Section 4 — the rolling combine-normalization windows: an opt-in
-    /// box (shared `rolling_combine` flag) that makes them part of the auto
-    /// normalization, editable durations, the runs currently inside each
-    /// window, job status, and view/compare buttons, laid out as an aligned
-    /// grid. Opted in, the jobs fire on every new NeXus (live / hybrid
-    /// mode); otherwise they are only launched by hand.
+    /// Section 4 — the rolling combine-normalization windows. The heading
+    /// line carries the opt-in box (shared `rolling_combine` flag) that
+    /// makes them part of the auto normalization; unchecked, the whole
+    /// section is folded away. Checked, the frame shows the editable
+    /// durations, the runs currently inside each window, job status, and
+    /// view/compare buttons, laid out as an aligned grid; the jobs fire on
+    /// every new NeXus (live / hybrid mode) or by hand.
     fn windows_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(theme::section_heading(
-            "4. Rolling combine & compare (NeuNorm)",
-        ));
-        ui.add_space(theme::SPACE_XS);
-        theme::section_frame(ui, |ui| {
+        ui.horizontal(|ui| {
             let mut opted_in = self.rolling_enabled();
             let response = ui
                 .checkbox(
                     &mut opted_in,
-                    "Include the rolling windows in the auto normalization",
+                    theme::section_heading("4. Rolling combine & compare (NeuNorm)"),
                 )
                 .on_hover_text(
                     "Opt-in, saved in the shared configuration: when checked, the \
                      auto normalization also combines the runs of each window \
                      through NeuNorm every time a new NeXus shows up. Unchecked \
                      (the default for everybody), the auto normalization only \
-                     normalizes each run on its own and the windows below are \
-                     launched by hand.",
+                     normalizes each run on its own and this section is hidden.",
                 );
             if response.changed() {
                 self.set_rolling_enabled(opted_in);
             }
-            let opted_in = self.rolling_enabled();
+        });
+        if !self.rolling_enabled() {
+            return;
+        }
+        ui.add_space(theme::SPACE_XS);
+        theme::section_frame(ui, |ui| {
             let live = self.runs.is_empty();
             let active = self.is_active();
             ui.label(
-                egui::RichText::new(match (opted_in, live, active) {
-                    (false, _, _) => {
-                        "Not part of the auto normalization: the windows below \
-                         are only normalized when launched by hand (▶ Normalize \
-                         windows now)."
-                    }
-                    (true, true, _) => {
+                egui::RichText::new(match (live, active) {
+                    (true, _) => {
                         "Live: the windows follow the latest run of the IPTS, and \
                          the normalizations fire when a new NeXus shows up (auto \
                          normalization ON + configuration selected)."
                     }
-                    (true, false, true) => {
+                    (false, true) => {
                         "Hybrid: the windows look at the listed runs, new runs \
                          join the list as they land, and the normalizations fire \
                          on each new NeXus."
                     }
-                    (true, false, false) => {
+                    (false, false) => {
                         "The windows look at the listed runs only — launch by \
                          hand (turn auto normalization ON to have new runs join \
                          the list)."
