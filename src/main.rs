@@ -975,11 +975,19 @@ impl MonitorApp {
                         .color(theme::DANGER),
                 );
             }
-            match (&self.configs_error, self.configs.is_empty()) {
-                (Some(e), _) => {
+            // The folder-scan warning only matters while nothing is selected:
+            // a file picked with Browse… (or registered in autoreduction.cfg)
+            // works fine without the configs folder.
+            match (
+                &self.configs_error,
+                self.configs.is_empty(),
+                self.selected_config.is_some(),
+            ) {
+                (Some(_), _, true) => {}
+                (Some(e), _, false) => {
                     ui.label(egui::RichText::new(e.as_str()).color(theme::WARNING));
                 }
-                (None, true) => {
+                (None, true, _) => {
                     ui.label(
                         egui::RichText::new(
                             "No configuration file found — create one with the notebook below",
