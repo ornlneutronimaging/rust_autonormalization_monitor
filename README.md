@@ -57,13 +57,26 @@ Single view, top to bottom:
    ON, the first row is the **upcoming run** (highest run in
    `<IPTS>/nexus` + 1, refreshed automatically) that will be normalized
    next. Each row has a **👁 Preview** button opening the run's corrected
-   folder in the rust_tiff_viewer, and a **✖ reject / ↩ restore** toggle:
+   folder in the rust_tiff_viewer, a **Normalized** column, and a
+   **✖ reject / ↩ restore** toggle:
    a rejected run stays listed (crossed out) but leaves the windows and
    their normalizations. The span of runs listed is anchored at the
    newest run whether rejected or not, so rejecting the latest run(s)
    does not pull older runs back into the table: once everything in the
    span is rejected the windows are empty and the app simply waits for
-   the next run. A **📈 Timeline** tab next to the
+   the next run.
+   With auto normalization ON, every run that lands from then on is
+   normalized **on its own** by this app: the row shows **⏳ waiting**
+   until the run's corrected folder exists (the Corrected column turns
+   green), then NeuNorm runs with the selected configuration file whose
+   sample is replaced by that run (open beams and settings unchanged) —
+   a progress bar fills in the Normalized column, and once done a
+   **👁** icon opens the result in the rust_tiff_viewer and a **📂** icon
+   opens the folder in the file manager (**↻** retries a failed run).
+   Output: `<IPTS>/shared/autoreduce/normalized/<corrected folder name>`;
+   a folder already there (e.g. from a previous session) is shown as done
+   and not redone. Runs already in the IPTS when auto normalization was
+   turned on are left alone. A **📈 Timeline** tab next to the
    table shows when each run was acquired (start → end bar per run, run
    number and duration on hover, rejected runs grayed/struck) with the
    5/15/30 min window coverage bands on top, on a shared axis in minutes

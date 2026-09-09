@@ -1,12 +1,18 @@
-//! Rolling-window combine normalization: pick the runs acquired within the
-//! last N minutes (acquisition time from the NeXus `end_time`), then run
-//! them together through NeuNorm via the VENUS workflow-runner script
-//! (`normalize_tof.py`), one job per time window.
+//! NeuNorm normalizations run through the VENUS workflow-runner script
+//! (`normalize_tof.py`), in background threads:
+//!
+//! - **Per-run** (auto normalization ON): every new run gets normalized on
+//!   its own, with the configuration file's sample replaced by that run,
+//!   as soon as its detector-corrected folder shows up. Output:
+//!   `<IPTS>/shared/autoreduce/normalized/<corrected folder name>`.
+//! - **Rolling windows**: the runs acquired within the last N minutes
+//!   (acquisition time from the NeXus `end_time`) normalized together, one
+//!   job per time window. Output:
+//!   `<IPTS>/shared/autoreduce/normalized/rolling/anchor_<run>/last_<N>min`.
 //!
 //! Sample inputs are the runs' detector-corrected folders; open-beam
-//! folders come from the normalization configuration file. Each job writes
-//! into `<IPTS>/shared/autoreduce/normalized/rolling/anchor_<run>/last_<N>min`
-//! (staged in a `.partial` folder, promoted on success — workflow-runner
+//! folders come from the normalization configuration file. Each job stages
+//! into a `.partial` folder, promoted on success (workflow-runner
 //! convention).
 
 use crate::{files, h5};
@@ -40,7 +46,14 @@ impl Window {
     }
 }
 
-/// Lifecycle of one window's normalization job.
+/// What a job normalizes: one rolling window (by index) or one run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobTarget {
+    Window(usize),
+    Run(u64),
+}
+
+/// Lifecycle of one normalization job (a window's or a run's).
 pub enum JobState {
     Idle,
     Running {
@@ -65,12 +78,12 @@ pub enum JobState {
 pub enum JobMessage {
     /// A PROGRESS line of the normalization script.
     Progress {
-        window_index: usize,
+        target: JobTarget,
         stage: String,
         fraction: Option<f32>,
     },
     Finished {
-        window_index: usize,
+        target: JobTarget,
         runs: Vec<u64>,
         result: Result<PathBuf, String>,
     },
@@ -117,11 +130,20 @@ pub fn output_dir(ipts_path: &Path, anchor_run: u64, minutes: u32) -> PathBuf {
     ))
 }
 
+/// Output folder of one run's own normalization: named after its
+/// corrected folder, next to the `rolling/` results.
+pub fn run_output_dir(ipts_path: &Path, corrected_folder: &Path) -> PathBuf {
+    let name = corrected_folder
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "run".to_owned());
+    ipts_path.join("shared/autoreduce/normalized").join(name)
+}
+
 /// Everything a normalization job needs, resolved up-front so problems are
 /// reported before any thread is spawned.
 pub struct JobSpec {
-    pub window_index: usize,
-    pub minutes: u32,
+    pub target: JobTarget,
     pub runs: Vec<u64>,
     /// (corrected folder, NeXus file) per sample run.
     samples: Vec<(PathBuf, PathBuf)>,
@@ -129,6 +151,41 @@ pub struct JobSpec {
     obs: Vec<(PathBuf, PathBuf)>,
     config: PathBuf,
     output: PathBuf,
+}
+
+/// Configuration checks shared by every job, then the open beams: folder
+/// from the config; NeXus derived from the folder (run number in its name,
+/// IPTS from its path — OBs may live in another IPTS than the samples).
+fn resolve_obs(
+    ipts_path: &Path,
+    config_info: &h5::ConfigInfo,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    if config_info.has_crop {
+        return Err(
+            "the configuration has a crop region — not supported here yet \
+             (use the workflow runner)"
+                .to_owned(),
+        );
+    }
+    if config_info.ob_folders.is_empty() {
+        return Err("the configuration file names no open-beam folder".to_owned());
+    }
+    let mut obs = Vec::new();
+    for folder in &config_info.ob_folders {
+        let name = folder
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let run = files::run_number_in_name(&name)
+            .ok_or_else(|| format!("no run number in OB folder name '{name}'"))?;
+        let ob_ipts = folder
+            .iter()
+            .find(|part| part.to_string_lossy().starts_with("IPTS-"))
+            .map(|p| Path::new("/SNS/VENUS").join(p))
+            .unwrap_or_else(|| ipts_path.to_path_buf());
+        obs.push((folder.clone(), files::nexus_path(&ob_ipts, run)));
+    }
+    Ok(obs)
 }
 
 /// Resolve one window into a launchable job. Errors name what is missing
@@ -143,16 +200,7 @@ pub fn prepare_job(
     if window.runs.is_empty() {
         return Err("no run in the window".to_owned());
     }
-    if config_info.has_crop {
-        return Err(
-            "the configuration has a crop region — not supported here yet \
-             (use the workflow runner)"
-                .to_owned(),
-        );
-    }
-    if config_info.ob_folders.is_empty() {
-        return Err("the configuration file names no open-beam folder".to_owned());
-    }
+    let obs = resolve_obs(ipts_path, config_info)?;
 
     // Corrected folders of the window's runs; every run must be there (a
     // missing folder means the autoreduction has not caught up yet).
@@ -174,34 +222,38 @@ pub fn prepare_job(
         ));
     }
 
-    // Open beams: folder from the config; NeXus derived from the folder
-    // (run number in its name, IPTS from its path — OBs may live in
-    // another IPTS than the samples).
-    let mut obs = Vec::new();
-    for folder in &config_info.ob_folders {
-        let name = folder
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let run = files::run_number_in_name(&name)
-            .ok_or_else(|| format!("no run number in OB folder name '{name}'"))?;
-        let ob_ipts = folder
-            .iter()
-            .find(|part| part.to_string_lossy().starts_with("IPTS-"))
-            .map(|p| Path::new("/SNS/VENUS").join(p))
-            .unwrap_or_else(|| ipts_path.to_path_buf());
-        obs.push((folder.clone(), files::nexus_path(&ob_ipts, run)));
-    }
-
     let anchor_run = *window.runs.iter().max().expect("runs not empty");
     Ok(JobSpec {
-        window_index,
-        minutes: window.minutes,
+        target: JobTarget::Window(window_index),
         runs: window.runs.clone(),
         samples,
         obs,
         config: config_path.to_path_buf(),
         output: output_dir(ipts_path, anchor_run, window.minutes),
+    })
+}
+
+/// Resolve one run's own normalization: the configuration's sample is
+/// replaced by that run's corrected folder, everything else (open beams,
+/// settings) comes from the configuration file.
+pub fn prepare_run_job(
+    run: u64,
+    corrected_folder: &Path,
+    ipts_path: &Path,
+    config_path: &Path,
+    config_info: &h5::ConfigInfo,
+) -> Result<JobSpec, String> {
+    let obs = resolve_obs(ipts_path, config_info)?;
+    Ok(JobSpec {
+        target: JobTarget::Run(run),
+        runs: vec![run],
+        samples: vec![(
+            corrected_folder.to_path_buf(),
+            files::nexus_path(ipts_path, run),
+        )],
+        obs,
+        config: config_path.to_path_buf(),
+        output: run_output_dir(ipts_path, corrected_folder),
     })
 }
 
@@ -212,7 +264,7 @@ pub fn launch(spec: JobSpec, tx: Sender<JobMessage>) {
     std::thread::spawn(move || {
         let result = run_job(&spec, &tx);
         let _ = tx.send(JobMessage::Finished {
-            window_index: spec.window_index,
+            target: spec.target,
             runs: spec.runs.clone(),
             result,
         });
@@ -231,7 +283,7 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
         .output
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| format!("last_{}min", spec.minutes));
+        .unwrap_or_else(|| "normalized".to_owned());
     let mut cmd = std::process::Command::new(PYTHON_BIN);
     cmd.arg(NORMALIZE_SCRIPT)
         .arg("--config")
@@ -268,7 +320,7 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
         for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Some((stage, fraction)) = parse_progress(&line) {
                 let _ = tx.send(JobMessage::Progress {
-                    window_index: spec.window_index,
+                    target: spec.target,
                     stage,
                     fraction,
                 });
@@ -348,6 +400,19 @@ mod tests {
         );
         assert_eq!(parse_progress("Writing data to /tmp"), None);
         assert_eq!(parse_progress("PROGRESS garbage"), None);
+    }
+
+    #[test]
+    fn run_output_dir_is_named_after_the_corrected_folder() {
+        assert_eq!(
+            run_output_dir(
+                Path::new("/SNS/VENUS/IPTS-1"),
+                Path::new("/SNS/VENUS/IPTS-1/shared/autoreduce/images/tpx1/20260613_Run_23642_x_0")
+            ),
+            PathBuf::from(
+                "/SNS/VENUS/IPTS-1/shared/autoreduce/normalized/20260613_Run_23642_x_0"
+            )
+        );
     }
 
     #[test]
