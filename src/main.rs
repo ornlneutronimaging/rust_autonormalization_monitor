@@ -474,10 +474,13 @@ impl MonitorApp {
 
         // Live and hybrid modes: a new anchor run (a NeXus that just
         // showed up — in hybrid mode, just joined the list) fires the
-        // window normalizations. The first anchor seen only arms the
-        // trigger — the app should not fire for a run that landed before
-        // it was even watching.
-        if self.is_active() {
+        // window normalizations — only when the user opted the windows
+        // into the auto normalization (shared `rolling_combine` flag);
+        // otherwise the auto normalization does the plain per-run work
+        // alone. The first anchor seen only arms the trigger — the app
+        // should not fire for a run that landed before it was even
+        // watching.
+        if self.is_active() && self.rolling_enabled() {
             let anchor_run = self.windows.iter().flat_map(|w| w.runs.iter()).max().copied();
             if let Some(anchor_run) = anchor_run {
                 match self.last_live_anchor {
@@ -492,7 +495,7 @@ impl MonitorApp {
                 }
             }
         } else {
-            // Re-armed when auto normalization resumes.
+            // Re-armed when auto normalization (or the opt-in) resumes.
             self.last_live_anchor = None;
         }
     }
@@ -594,6 +597,41 @@ impl MonitorApp {
         self.cfg.as_ref().map(|c| c.activate).unwrap_or(false)
     }
 
+    /// Did the user opt the rolling combine & compare windows into the
+    /// auto normalization (shared `rolling_combine` flag, false when the
+    /// key is absent)?
+    fn rolling_enabled(&self) -> bool {
+        self.cfg.as_ref().map(|c| c.rolling_combine).unwrap_or(false)
+    }
+
+    /// Opt the rolling windows in/out of the auto normalization: written to
+    /// the shared config so it survives restarts and is visible to every
+    /// user (the line is added when the notebook-written file lacks it).
+    fn set_rolling_enabled(&mut self, enabled: bool) {
+        let result = if self.cfg_path.is_file() {
+            config::set_rolling_combine(&self.cfg_path, enabled)
+        } else {
+            // No shared file yet (auto normalization never turned ON):
+            // create it, OFF, with the selected IPTS/configuration if any.
+            config::write_full(
+                &self.cfg_path,
+                self.ipts.as_deref().unwrap_or(""),
+                &self
+                    .selected_config
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                false,
+                enabled,
+            )
+        };
+        match result {
+            Ok(()) => self.write_error = None,
+            Err(e) => self.write_error = Some(e),
+        }
+        self.refresh();
+    }
+
     /// Turn auto-normalization ON: register the selected IPTS +
     /// configuration file in the shared config and set the flag.
     fn turn_on(&mut self) {
@@ -601,11 +639,14 @@ impl MonitorApp {
         else {
             return;
         };
+        // The rolling opt-in is the user's own choice: keep it as is.
+        let rolling = self.rolling_enabled();
         match config::write_full(
             &self.cfg_path,
             &ipts,
             &config_file.display().to_string(),
             true,
+            rolling,
         ) {
             Ok(()) => self.write_error = None,
             Err(e) => self.write_error = Some(e),
@@ -980,9 +1021,14 @@ impl MonitorApp {
                 if let Ok(cfg) = &self.cfg {
                     let reg_ipts = cfg.get("ipts").unwrap_or("?");
                     let reg_file = cfg.get("user_autoreduction_config_file").unwrap_or("?");
+                    let windows = if cfg.rolling_combine {
+                        " + rolling combine & compare windows"
+                    } else {
+                        " (per-run normalization only)"
+                    };
                     ui.label(
                         egui::RichText::new(format!(
-                            "Active on {reg_ipts} with {}",
+                            "Active on {reg_ipts} with {}{windows}",
                             Path::new(reg_file)
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
@@ -1035,30 +1081,60 @@ impl MonitorApp {
         });
     }
 
-    /// Section 4 — the rolling combine-normalization windows: editable
-    /// durations, the runs currently inside each window, job status, and
-    /// view/compare buttons, laid out as an aligned grid. In live mode the
-    /// jobs fire on every new NeXus; with a run list they are launched by
-    /// hand.
+    /// Section 4 — the rolling combine-normalization windows: an opt-in
+    /// box (shared `rolling_combine` flag) that makes them part of the auto
+    /// normalization, editable durations, the runs currently inside each
+    /// window, job status, and view/compare buttons, laid out as an aligned
+    /// grid. Opted in, the jobs fire on every new NeXus (live / hybrid
+    /// mode); otherwise they are only launched by hand.
     fn windows_section(&mut self, ui: &mut egui::Ui) {
         ui.label(theme::section_heading(
             "4. Rolling combine & compare (NeuNorm)",
         ));
         ui.add_space(theme::SPACE_XS);
         theme::section_frame(ui, |ui| {
+            let mut opted_in = self.rolling_enabled();
+            let response = ui
+                .checkbox(
+                    &mut opted_in,
+                    "Include the rolling windows in the auto normalization",
+                )
+                .on_hover_text(
+                    "Opt-in, saved in the shared configuration: when checked, the \
+                     auto normalization also combines the runs of each window \
+                     through NeuNorm every time a new NeXus shows up. Unchecked \
+                     (the default for everybody), the auto normalization only \
+                     normalizes each run on its own and the windows below are \
+                     launched by hand.",
+                );
+            if response.changed() {
+                self.set_rolling_enabled(opted_in);
+            }
+            let opted_in = self.rolling_enabled();
             let live = self.runs.is_empty();
+            let active = self.is_active();
             ui.label(
-                egui::RichText::new(if live {
-                    "Live: the windows follow the latest run of the IPTS, and the \
-                     normalizations fire when a new NeXus shows up (auto \
-                     normalization ON + configuration selected)."
-                } else if self.is_active() {
-                    "Hybrid: the windows look at the listed runs, new runs join \
-                     the list as they land, and the normalizations fire on each \
-                     new NeXus."
-                } else {
-                    "The windows look at the listed runs only — launch by hand \
-                     (turn auto normalization ON to have new runs join the list)."
+                egui::RichText::new(match (opted_in, live, active) {
+                    (false, _, _) => {
+                        "Not part of the auto normalization: the windows below \
+                         are only normalized when launched by hand (▶ Normalize \
+                         windows now)."
+                    }
+                    (true, true, _) => {
+                        "Live: the windows follow the latest run of the IPTS, and \
+                         the normalizations fire when a new NeXus shows up (auto \
+                         normalization ON + configuration selected)."
+                    }
+                    (true, false, true) => {
+                        "Hybrid: the windows look at the listed runs, new runs \
+                         join the list as they land, and the normalizations fire \
+                         on each new NeXus."
+                    }
+                    (true, false, false) => {
+                        "The windows look at the listed runs only — launch by \
+                         hand (turn auto normalization ON to have new runs join \
+                         the list)."
+                    }
                 })
                 .color(theme::text_emphasis(ui.visuals())),
             );

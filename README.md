@@ -22,7 +22,12 @@ Single view, top to bottom:
      and sets its `activate` flag, so every upcoming run gets normalized;
      turning it OFF only clears the flag;
    - or a **list of runs** (e.g. `23615-23620, 23642`).
-4. **Rolling combine & compare (NeuNorm)** — the windows (default last 5 / 15 /
+4. **Rolling combine & compare (NeuNorm)** — **opt-in**: a checkbox
+     (*Include the rolling windows in the auto normalization*, saved as the
+     `rolling_combine` flag of the shared `autoreduction.cfg`) makes the
+     windows part of the auto normalization. Unchecked (the default for
+     everybody), the auto normalization only normalizes each run on its
+     own and the windows are launched by hand. The windows (default last 5 / 15 /
      30 min of acquisition time, editable): each window collects the runs
      whose acquisition (NeXus `end_time`) ended within its last N minutes,
      anchored at the newest run considered. The runs of each window are
@@ -31,9 +36,10 @@ Single view, top to bottom:
      python) — samples are the runs' corrected folders, open beams come
      from the selected configuration file. Output:
      `<IPTS>/shared/autoreduce/normalized/rolling/anchor_<run>/last_<N>min`
-     (staged in `.partial`, promoted on success). In **live mode** (no run
-     list) the three normalizations fire automatically each time a new
-     NeXus shows up (auto normalization ON + config selected). With a run
+     (staged in `.partial`, promoted on success). Once opted in, in
+     **live mode** (no run list) the three normalizations fire
+     automatically each time a new NeXus shows up (auto normalization ON +
+     config selected). With a run
      list and auto normalization OFF the windows look at those runs only,
      launched by hand (**▶ Normalize windows now**); with auto
      normalization ON (hybrid mode) every run landing after the newest
@@ -68,7 +74,10 @@ The shared configuration is `/SNS/VENUS/shared/autoreduction/autoreduction.cfg`
 (the file the notebook writes), falling back to the legacy
 `/SNS/VENUS/shared/autoreduce/autoreduction.cfg` when only that one exists.
 It is re-read on the auto-refresh period (default 5 s, adjustable in the
-top bar) so the display always reflects changes made by other tools.
+top bar) so the display always reflects changes made by other tools. The
+monitor adds its own `rolling_combine` key to the notebook's schema; the
+notebook rewrites the file without it when a configuration is registered,
+which resets the opt-in to unchecked.
 
 ## Run
 
