@@ -479,9 +479,10 @@ impl MonitorApp {
                     times.1
                 }
             };
-            // The anchor is the newest NON-rejected run, so rejecting the
-            // latest run slides the windows back to the previous one.
-            if anchor.is_none() && !self.rejected.contains(&run) {
+            // The anchor is the newest run, rejected or not: rejecting the
+            // latest run(s) must not slide the span back onto older runs —
+            // the table just keeps waiting for the next run to show up.
+            if anchor.is_none() {
                 anchor = Some(time);
             }
             if let Some(anchor) = anchor {
@@ -494,28 +495,19 @@ impl MonitorApp {
             }
             end_times.push((run, time));
         }
-        // Rejected runs never enter the windows (nor set the anchor), but
-        // stay in the live table span so they can be restored.
+        // Rejected runs never enter the windows (the windows anchor on the
+        // newest kept run inside the span), but stay in the table span so
+        // they can be restored. When every run of the span is rejected the
+        // windows are simply empty until a new run lands.
         let kept: Vec<(u64, chrono::DateTime<chrono::FixedOffset>)> = end_times
             .iter()
             .filter(|(run, _)| !self.rejected.contains(run))
             .copied()
             .collect();
         norm::assign_windows(&mut self.windows, &kept);
-        self.window_span = match kept.iter().map(|(_, t)| *t).max() {
-            Some(kept_anchor) => {
-                let cutoff =
-                    kept_anchor - chrono::Duration::minutes(i64::from(max_minutes));
-                let mut span: Vec<u64> = end_times
-                    .iter()
-                    .filter(|(_, t)| *t >= cutoff)
-                    .map(|(run, _)| *run)
-                    .collect();
-                span.sort_unstable();
-                span
-            }
-            None => Vec::new(),
-        };
+        let mut span: Vec<u64> = end_times.iter().map(|(run, _)| *run).collect();
+        span.sort_unstable();
+        self.window_span = span;
 
         // Live and hybrid modes: a new anchor run (a NeXus that just
         // showed up — in hybrid mode, just joined the list) fires the

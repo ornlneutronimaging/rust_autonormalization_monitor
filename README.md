@@ -59,8 +59,11 @@ Single view, top to bottom:
    next. Each row has a **👁 Preview** button opening the run's corrected
    folder in the rust_tiff_viewer, and a **✖ reject / ↩ restore** toggle:
    a rejected run stays listed (crossed out) but leaves the windows and
-   their normalizations — rejecting the newest run slides the window
-   anchor back to the previous one. A **📈 Timeline** tab next to the
+   their normalizations. The span of runs listed is anchored at the
+   newest run whether rejected or not, so rejecting the latest run(s)
+   does not pull older runs back into the table: once everything in the
+   span is rejected the windows are empty and the app simply waits for
+   the next run. A **📈 Timeline** tab next to the
    table shows when each run was acquired (start → end bar per run, run
    number and duration on hover, rejected runs grayed/struck) with the
    5/15/30 min window coverage bands on top, on a shared axis in minutes
