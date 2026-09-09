@@ -1,10 +1,14 @@
 //! NeuNorm normalizations run through the VENUS workflow-runner script
 //! (`normalize_tof.py`), in background threads:
 //!
-//! - **Per-run** (auto normalization ON): every new run gets normalized on
-//!   its own, with the configuration file's sample replaced by that run,
-//!   as soon as its detector-corrected folder shows up. Output:
-//!   `<IPTS>/shared/autoreduce/normalized/<corrected folder name>`.
+//! - **Per-run**: a run normalized on its own, with the configuration
+//!   file's sample replaced by that run — automatically for every new run
+//!   when auto normalization is ON (as soon as its detector-corrected
+//!   folder shows up), on demand for older runs. Output follows the
+//!   workflow runner: `<config output folder>/Run_<run>/normalization`
+//!   (`<IPTS>/shared/autoreduce/normalized/Run_<run>/normalization` when
+//!   the configuration names no output folder), so a run already
+//!   normalized by either tool is found and not redone.
 //! - **Rolling windows**: the runs acquired within the last N minutes
 //!   (acquisition time from the NeXus `end_time`) normalized together, one
 //!   job per time window. Output:
@@ -130,14 +134,31 @@ pub fn output_dir(ipts_path: &Path, anchor_run: u64, minutes: u32) -> PathBuf {
     ))
 }
 
-/// Output folder of one run's own normalization: named after its
-/// corrected folder, next to the `rolling/` results.
-pub fn run_output_dir(ipts_path: &Path, corrected_folder: &Path) -> PathBuf {
-    let name = corrected_folder
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "run".to_owned());
-    ipts_path.join("shared/autoreduce/normalized").join(name)
+/// Output folder of one run's own normalization — the workflow runner's
+/// layout under the configuration's output folder, so results are shared
+/// between the tools: `<output folder>/Run_<run>/normalization`. Without
+/// an output folder in the configuration, the same layout under
+/// `<IPTS>/shared/autoreduce/normalized`.
+pub fn run_output_dir(ipts_path: &Path, run: u64, config_info: &h5::ConfigInfo) -> PathBuf {
+    let base = config_info
+        .output_folder
+        .clone()
+        .unwrap_or_else(|| ipts_path.join("shared/autoreduce/normalized"));
+    base.join(format!("Run_{run}")).join("normalization")
+}
+
+/// Is a normalization output folder complete (holds at least one TIFF)?
+/// A folder still being written is a `.partial` sibling, so any TIFF in
+/// the final folder means the job finished.
+pub fn output_is_done(output: &Path) -> bool {
+    std::fs::read_dir(output)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+                name.ends_with(".tif") || name.ends_with(".tiff")
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Everything a normalization job needs, resolved up-front so problems are
@@ -253,7 +274,7 @@ pub fn prepare_run_job(
         )],
         obs,
         config: config_path.to_path_buf(),
-        output: run_output_dir(ipts_path, corrected_folder),
+        output: run_output_dir(ipts_path, run, config_info),
     })
 }
 
@@ -403,16 +424,40 @@ mod tests {
     }
 
     #[test]
-    fn run_output_dir_is_named_after_the_corrected_folder() {
+    fn run_output_dir_follows_the_workflow_runner_layout() {
+        let with_folder = h5::ConfigInfo {
+            ob_folders: vec![],
+            has_crop: false,
+            output_folder: Some(PathBuf::from("/SNS/VENUS/IPTS-1/shared/jean")),
+        };
         assert_eq!(
-            run_output_dir(
-                Path::new("/SNS/VENUS/IPTS-1"),
-                Path::new("/SNS/VENUS/IPTS-1/shared/autoreduce/images/tpx1/20260613_Run_23642_x_0")
-            ),
+            run_output_dir(Path::new("/SNS/VENUS/IPTS-1"), 23642, &with_folder),
+            PathBuf::from("/SNS/VENUS/IPTS-1/shared/jean/Run_23642/normalization")
+        );
+        let without = h5::ConfigInfo {
+            ob_folders: vec![],
+            has_crop: false,
+            output_folder: None,
+        };
+        assert_eq!(
+            run_output_dir(Path::new("/SNS/VENUS/IPTS-1"), 23642, &without),
             PathBuf::from(
-                "/SNS/VENUS/IPTS-1/shared/autoreduce/normalized/20260613_Run_23642_x_0"
+                "/SNS/VENUS/IPTS-1/shared/autoreduce/normalized/Run_23642/normalization"
             )
         );
+    }
+
+    #[test]
+    fn output_is_done_needs_a_tiff() {
+        let dir = std::env::temp_dir().join("anm_test_output_done");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!output_is_done(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!output_is_done(&dir));
+        std::fs::write(dir.join("logs.txt"), "x").unwrap();
+        assert!(!output_is_done(&dir));
+        std::fs::write(dir.join("Run_23642_0001.tiff"), "x").unwrap();
+        assert!(output_is_done(&dir));
     }
 
     #[test]

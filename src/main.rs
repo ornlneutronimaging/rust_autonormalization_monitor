@@ -15,7 +15,9 @@
 //!    for the full path). With auto-normalization ON, every run landing
 //!    from then on is normalized by this app on its own (configuration's
 //!    sample replaced by the run) as soon as its corrected folder exists;
-//!    the row shows the progress, then view / open-folder icons.
+//!    the row shows the progress, then view / open-folder icons. Older
+//!    runs show the same icons when their result already sits in the
+//!    configuration's output folder, or a button to normalize them now.
 
 mod config;
 mod files;
@@ -217,10 +219,14 @@ struct MonitorApp {
     /// Latest (anchor) run the live mode already reacted to: a job volley
     /// fires only when a newer NeXus shows up.
     last_live_anchor: Option<u64>,
-    /// Per-run normalizations (auto normalization ON): state of each run's
-    /// own job, keyed by run number — Running while NeuNorm works, Done
-    /// (output folder) or Failed afterwards.
+    /// Per-run normalizations: state of each run's own job, keyed by run
+    /// number — Running while NeuNorm works, Done (output folder) or Failed
+    /// afterwards. Done also marks a result found on disk (workflow runner,
+    /// previous session).
     run_jobs: HashMap<u64, norm::JobState>,
+    /// The configuration the Done-on-disk entries of `run_jobs` were
+    /// looked up with — its output folder decides where results live.
+    run_jobs_config: Option<PathBuf>,
     /// Latest NeXus run present when auto normalization was seen active:
     /// only runs landing AFTER it get their own normalization (the app
     /// must not chew through the whole IPTS on startup). `None` while
@@ -273,6 +279,7 @@ impl MonitorApp {
             pv_cache: HashMap::new(),
             last_live_anchor: None,
             run_jobs: HashMap::new(),
+            run_jobs_config: None,
             run_jobs_from: None,
             norm_tx,
             norm_rx,
@@ -317,6 +324,7 @@ impl MonitorApp {
         self.rejected.clear();
         self.last_live_anchor = None;
         self.run_jobs.clear();
+        self.run_jobs_config = None;
         self.run_jobs_from = None;
         for w in &mut self.windows {
             w.runs.clear();
@@ -588,48 +596,63 @@ impl MonitorApp {
         }
     }
 
-    /// Auto normalization ON: normalize on its own every run that landed
-    /// after the app started watching, as soon as its corrected folder is
-    /// there (the "Corrected" column turned green). The configuration's
-    /// sample is replaced by that run; open beams and settings come from
-    /// the configuration file. A run is normalized once — an output folder
-    /// already on disk (previous session) counts as done.
+    /// Keep the per-run normalizations in step with the table.
+    ///
+    /// 1. A different configuration file (its output folder decides where
+    ///    results live) drops what was found on disk with the previous one.
+    /// 2. Every listed run whose result already exists in the
+    ///    configuration's output folder (workflow runner, previous session)
+    ///    is marked Done — never redone.
+    /// 3. Auto normalization ON: every run that landed after the app
+    ///    started watching is normalized on its own as soon as its
+    ///    corrected folder is there (the "Corrected" column turned green).
+    ///    Older runs get a "▶ normalize" button in the table instead.
     fn launch_run_jobs(&mut self) {
-        if !self.is_active() {
-            // Re-armed when auto normalization resumes.
-            self.run_jobs_from = None;
-            return;
-        }
         let Some(ipts_path) = self.ipts_path() else {
             return;
         };
-        if self.run_jobs_from.is_none() {
-            // First look while active: everything already there is old news.
-            self.run_jobs_from = Some(files::latest_nexus_run(&ipts_path).unwrap_or(0));
+        if self.run_jobs_config != self.selected_config {
+            self.run_jobs
+                .retain(|_, state| matches!(state, norm::JobState::Running { .. }));
+            self.run_jobs_config = self.selected_config.clone();
         }
-        let from = self.run_jobs_from.unwrap_or(0);
-        let candidates: Vec<(u64, PathBuf)> = self
-            .run_files
-            .iter()
-            .filter(|rf| rf.run > from && !self.rejected.contains(&rf.run))
-            .filter(|rf| !self.run_jobs.contains_key(&rf.run))
-            .filter_map(|rf| match &rf.corrected {
-                files::FileStatus::Present(folder) => Some((rf.run, folder.clone())),
-                _ => None,
-            })
-            .collect();
-        if candidates.is_empty() {
-            return;
+        if self.is_active() {
+            if self.run_jobs_from.is_none() {
+                // First look while active: everything already there is
+                // old news — the "▶ normalize" button covers it.
+                self.run_jobs_from =
+                    Some(files::latest_nexus_run(&ipts_path).unwrap_or(0));
+            }
+        } else {
+            // Re-armed when auto normalization resumes.
+            self.run_jobs_from = None;
         }
         let Some(config) = self.selected_config.clone() else {
-            return; // nothing to normalize with yet — retried next refresh
+            return; // nothing to look up or normalize with — retried next refresh
         };
-        // Read the configuration once per volley (it does not change
-        // between the runs of one refresh).
-        let mut info: Option<Result<h5::ConfigInfo, String>> = None;
-        for (run, corrected) in candidates {
-            let output = norm::run_output_dir(&ipts_path, &corrected);
-            if output.is_dir() {
+        let pending: Vec<u64> = self
+            .run_files
+            .iter()
+            .map(|rf| rf.run)
+            .filter(|run| !self.run_jobs.contains_key(run))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let info = match h5::read_config_info(&config) {
+            Ok(info) => info,
+            Err(e) => {
+                // Surface the problem on the runs that would need it.
+                for run in pending {
+                    self.run_jobs
+                        .insert(run, norm::JobState::Failed { message: e.clone() });
+                }
+                return;
+            }
+        };
+        for run in pending {
+            let output = norm::run_output_dir(&ipts_path, run, &info);
+            if norm::output_is_done(&output) {
                 let finished = std::fs::metadata(&output)
                     .and_then(|m| m.modified())
                     .map(chrono::DateTime::<chrono::Local>::from)
@@ -644,24 +667,60 @@ impl MonitorApp {
                 );
                 continue;
             }
-            let info = info.get_or_insert_with(|| h5::read_config_info(&config));
-            let state = match info {
-                Err(e) => norm::JobState::Failed { message: e.clone() },
-                Ok(info) => {
-                    match norm::prepare_run_job(run, &corrected, &ipts_path, &config, info) {
-                        Ok(spec) => {
-                            norm::launch(spec, self.norm_tx.clone());
-                            norm::JobState::Running {
-                                runs: vec![run],
-                                stage: "starting…".to_owned(),
-                                fraction: None,
-                            }
-                        }
-                        Err(message) => norm::JobState::Failed { message },
-                    }
+            let watched = self.run_jobs_from.is_some_and(|from| run > from);
+            if watched && !self.rejected.contains(&run) {
+                self.start_run_job(run, &ipts_path, &config, &info);
+            }
+        }
+    }
+
+    /// Normalize one run on its own (configuration's sample replaced by the
+    /// run) if its corrected folder is there; the outcome lands in
+    /// `run_jobs[run]`. Without corrected data nothing happens — the next
+    /// pass retries.
+    fn start_run_job(
+        &mut self,
+        run: u64,
+        ipts_path: &Path,
+        config: &Path,
+        info: &h5::ConfigInfo,
+    ) {
+        let corrected = self.run_files.iter().find(|rf| rf.run == run).and_then(|rf| {
+            match &rf.corrected {
+                files::FileStatus::Present(folder) => Some(folder.clone()),
+                _ => None,
+            }
+        });
+        let Some(corrected) = corrected else {
+            return;
+        };
+        let state = match norm::prepare_run_job(run, &corrected, ipts_path, config, info) {
+            Ok(spec) => {
+                norm::launch(spec, self.norm_tx.clone());
+                norm::JobState::Running {
+                    runs: vec![run],
+                    stage: "starting…".to_owned(),
+                    fraction: None,
                 }
-            };
-            self.run_jobs.insert(run, state);
+            }
+            Err(message) => norm::JobState::Failed { message },
+        };
+        self.run_jobs.insert(run, state);
+    }
+
+    /// "▶ normalize" / "↻" in the table: normalize one run now, whatever
+    /// its age.
+    fn normalize_run_now(&mut self, run: u64) {
+        let (Some(ipts_path), Some(config)) = (self.ipts_path(), self.selected_config.clone())
+        else {
+            return;
+        };
+        self.run_jobs.remove(&run);
+        match h5::read_config_info(&config) {
+            Ok(info) => self.start_run_job(run, &ipts_path, &config, &info),
+            Err(message) => {
+                self.run_jobs.insert(run, norm::JobState::Failed { message });
+            }
         }
     }
 
@@ -2065,9 +2124,7 @@ impl MonitorApp {
             self.open_folder(&folder);
         }
         if let Some(run) = retry_run {
-            // Forget the failed attempt; the next pass relaunches it.
-            self.run_jobs.remove(&run);
-            self.launch_run_jobs();
+            self.normalize_run_now(run);
         }
         if let Some(err) = &self.viewer_error {
             ui.label(
@@ -2076,9 +2133,11 @@ impl MonitorApp {
         }
     }
 
-    /// The "Normalized" cell of one table row: waiting marker, progress bar
-    /// while NeuNorm runs, view/open icons when done, error + retry when
-    /// failed. `watched` = auto normalization will (or did) pick this run.
+    /// The "Normalized" cell of one table row: waiting marker (or a
+    /// "▶ normalize" button for runs auto normalization does not cover),
+    /// progress bar while NeuNorm runs, view/open icons when done, error +
+    /// retry when failed. `watched` = auto normalization will (or did)
+    /// pick this run.
     fn normalized_cell(
         ui: &mut egui::Ui,
         run: &files::RunFiles,
@@ -2115,8 +2174,33 @@ impl MonitorApp {
                     ui.label(egui::RichText::new(text).color(color))
                         .on_hover_text(hover);
                 } else {
-                    ui.label(egui::RichText::new("—").color(dim))
-                        .on_hover_text("Not normalized by this session");
+                    // Not covered by auto normalization (older run, or
+                    // auto normalization OFF): offer to do it now.
+                    match &run.corrected {
+                        files::FileStatus::Present(_) if no_config => {
+                            ui.label(egui::RichText::new("—").color(dim)).on_hover_text(
+                                "No normalized data found — select a configuration \
+                                 file (section 2) to normalize this run",
+                            );
+                        }
+                        files::FileStatus::Present(_) => {
+                            if ui
+                                .button("▶ normalize")
+                                .on_hover_text(
+                                    "No normalized data found in the configuration's \
+                                     output folder — normalize this run now \
+                                     (configuration's sample replaced by the run)",
+                                )
+                                .clicked()
+                            {
+                                *retry_run = Some(run.run);
+                            }
+                        }
+                        files::FileStatus::Missing(_) => {
+                            ui.label(egui::RichText::new("—").color(dim))
+                                .on_hover_text("No corrected data yet — nothing to normalize");
+                        }
+                    }
                 }
             }
             Some(norm::JobState::Running { stage, fraction, .. }) => {

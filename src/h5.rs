@@ -111,9 +111,14 @@ pub struct ConfigInfo {
     /// The notebook's crop region, if any — the workflow-runner pre-crops
     /// inputs when set, which this application does not implement yet.
     pub has_crop: bool,
+    /// The notebook's output folder (root attribute `output_folder`), where
+    /// the workflow runner writes `Run_<run>/normalization`. `None` when
+    /// absent or empty.
+    pub output_folder: Option<PathBuf>,
 }
 
-/// Read the open-beam entries (and crop flag) of a configuration file.
+/// Read the open-beam entries, crop flag and output folder of a
+/// configuration file.
 pub fn read_config_info(path: &Path) -> Result<ConfigInfo, String> {
     let file = h5::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let ob_folders = dataset_strings(&file, "ob/folders")
@@ -126,7 +131,18 @@ pub fn read_config_info(path: &Path) -> Result<ConfigInfo, String> {
         .ok()
         .and_then(|g| g.attr("crop_region").ok())
         .is_some();
-    Ok(ConfigInfo { ob_folders, has_crop })
+    let output_folder = file
+        .attr("output_folder")
+        .ok()
+        .and_then(|a| read_strings(&a)?.into_iter().next())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    Ok(ConfigInfo {
+        ob_folders,
+        has_crop,
+        output_folder,
+    })
 }
 
 #[cfg(test)]
@@ -177,5 +193,9 @@ mod tests {
         for folder in &info.ob_folders {
             assert!(folder.is_absolute());
         }
+        assert_eq!(
+            info.output_folder,
+            Some(PathBuf::from("/SNS/VENUS/IPTS-36967/shared/jean"))
+        );
     }
 }
