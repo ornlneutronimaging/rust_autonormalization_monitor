@@ -1680,8 +1680,9 @@ impl MonitorApp {
                         .size(16.0),
                 )
                 .on_hover_text(format!(
-                    "being written — the folder is there but not complete yet \
-                     (images, then Spectra.txt for raw / summary.json for corrected)\n{}",
+                    "being written — the folder is there but not complete yet: the \
+                     Spectra.txt rows must match the frames (raw: .fits minus the \
+                     SummedImg; corrected: .tif, plus summary.json)\n{}",
                     path.display()
                 ));
             }

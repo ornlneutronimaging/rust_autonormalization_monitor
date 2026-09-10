@@ -149,39 +149,74 @@ pub enum FileStatus {
 }
 
 /// Which run folder a completeness check looks at — each has its own
-/// end-of-run marker.
+/// image format and end-of-run files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FolderKind {
-    /// DAQ output (`<IPTS>/images`): the `*_Spectra.txt` lands last.
+    /// DAQ output (`<IPTS>/images`): one `.fits` per frame plus the
+    /// integrated `*_SummedImg.fits`; the `*_Spectra.txt` (no header, one
+    /// row per frame) lands last.
     Raw,
-    /// Reduction output (`shared/autoreduce/images`): `summary.json` lands
-    /// last (the folder also gets its own Spectra file before it).
+    /// Reduction output (`shared/autoreduce/images`): one `.tif` per frame;
+    /// its `*_Spectra.txt` has a header line, then one row per frame;
+    /// `summary.json` lands last.
     Corrected,
 }
 
 /// Is a run folder complete? The DAQ / the reduction create the folder
-/// first, write the TIFF images, then the sidecars, the kind's marker
-/// last. Complete = at least one TIFF and that marker.
+/// first, write the frames, then the sidecars. Complete = the Spectra file
+/// is there and its number of data rows equals the number of frames (raw:
+/// `.fits` files minus the SummedImg one; corrected: `.tif` files) — and,
+/// for a corrected folder, `summary.json` (written last) is there too.
 pub fn folder_complete(folder: &Path, kind: FolderKind) -> bool {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return false;
     };
-    let (mut tiff, mut marker) = (false, false);
+    let mut frames = 0usize;
+    let mut spectra: Option<PathBuf> = None;
+    let mut summary = false;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name.ends_with(".tif") || name.ends_with(".tiff") {
-            tiff = true;
-        } else {
-            marker |= match kind {
-                FolderKind::Raw => name.ends_with("_spectra.txt"),
-                FolderKind::Corrected => name == "summary.json",
-            };
+        match kind {
+            FolderKind::Raw => {
+                if name.ends_with(".fits") && !name.contains("summedimg") {
+                    frames += 1;
+                }
+            }
+            FolderKind::Corrected => {
+                if name.ends_with(".tif") || name.ends_with(".tiff") {
+                    frames += 1;
+                } else if name == "summary.json" {
+                    summary = true;
+                }
+            }
         }
-        if tiff && marker {
-            return true;
+        if name.ends_with("_spectra.txt") && spectra.is_none() {
+            spectra = Some(entry.path());
         }
     }
-    false
+    if frames == 0 || (kind == FolderKind::Corrected && !summary) {
+        return false;
+    }
+    let Some(spectra) = spectra else {
+        return false;
+    };
+    spectra_rows(&spectra) == Some(frames)
+}
+
+/// Number of data rows of a `*_Spectra.txt` file (header lines — anything
+/// not starting with a digit, sign or dot — and blank lines excluded).
+pub fn spectra_rows(path: &Path) -> Option<usize> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(
+        text.lines()
+            .filter(|l| {
+                l.trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit() || c == '-' || c == '.')
+            })
+            .count(),
+    )
 }
 
 /// Status of every tracked file of one run.
@@ -296,6 +331,22 @@ mod tests {
         assert_eq!(latest_nexus_run(&ipts), Some(23642));
     }
 
+    // Reads real shared folders; passes trivially where VENUS is not mounted.
+    #[test]
+    fn real_run_folders_are_complete() {
+        let ipts = Path::new("/SNS/VENUS/IPTS-37705");
+        if !ipts.join("nexus/VENUS_29909.nxs.h5").is_file() {
+            return;
+        }
+        let status = check_runs(ipts, &[29909]).remove(0);
+        assert!(matches!(status.raw, FileStatus::Present(_)), "{:?}", status.raw);
+        assert!(
+            matches!(status.corrected, FileStatus::Present(_)),
+            "{:?}",
+            status.corrected
+        );
+    }
+
     #[test]
     fn checks_runs_inside_an_ipts_layout() {
         let ipts = std::env::temp_dir().join("anm_test_ipts_layout");
@@ -304,16 +355,24 @@ mod tests {
         fs::write(ipts.join("nexus/VENUS_11.nxs.h5"), "x").unwrap();
         let raw11 = ipts.join("images/tpx1/raw/radiography/t/20260101_Run_11_t_0");
         fs::create_dir_all(&raw11).unwrap();
-        // Complete folder: images + the end-of-run sidecar.
-        fs::write(raw11.join("20260101_Run_11_t_0_00000.tif"), "x").unwrap();
-        fs::write(raw11.join("20260101_Run_11_t_0_Spectra.txt"), "x").unwrap();
+        // Complete raw folder: 2 frames + the SummedImg, a headerless
+        // Spectra file with 2 rows.
+        fs::write(raw11.join("20260101_Run_11_t_0_00000.fits"), "x").unwrap();
+        fs::write(raw11.join("20260101_Run_11_t_0_00001.fits"), "x").unwrap();
+        fs::write(raw11.join("20260101_Run_11_t_0_SummedImg.fits"), "x").unwrap();
+        fs::write(raw11.join("20260101_Run_11_t_0_Spectra.txt"), "0.0003\t0\r\n0.0004\t5\r\n")
+            .unwrap();
         let corr12 =
             ipts.join("shared/autoreduce/images/tpx1/raw/radiography/t/20260101_Run_12_t_0");
         fs::create_dir_all(&corr12).unwrap();
-        // Still being written: images and its Spectra file, but the
-        // reduction's summary.json (written last) is not there yet.
+        // Still being written: one of two images and the Spectra file
+        // (header + 2 rows), no summary.json yet.
         fs::write(corr12.join("20260101_Run_12_t_0_00000.tif"), "x").unwrap();
-        fs::write(corr12.join("20260101_Run_12_t_0_Spectra.txt"), "x").unwrap();
+        fs::write(
+            corr12.join("20260101_Run_12_t_0_Spectra.txt"),
+            "shutter_time,counts\n3.0e-4,0\n4.0e-4,5\n",
+        )
+        .unwrap();
 
         let status = check_runs(&ipts, &[11, 12]);
         assert_eq!(status.len(), 2);
@@ -323,16 +382,23 @@ mod tests {
         assert!(matches!(status[1].nexus, FileStatus::Missing(_)));
         assert!(matches!(status[1].raw, FileStatus::Missing(_)));
         assert!(matches!(status[1].corrected, FileStatus::Writing(_)));
-        // The reduction finishes: summary.json lands last.
+        // The reduction finishes: summary.json lands, but one image is
+        // still missing versus the Spectra rows → not complete.
         fs::write(corr12.join("summary.json"), "{}").unwrap();
+        assert!(!folder_complete(&corr12, FolderKind::Corrected));
+        fs::write(corr12.join("20260101_Run_12_t_0_00001.tif"), "x").unwrap();
         let status = check_runs(&ipts, &[12]);
         assert!(matches!(status[0].corrected, FileStatus::Present(_)));
         // An empty folder is being written too, not complete.
         let empty = ipts.join("shared/autoreduce/images/tpx1/raw/radiography/t/20260101_Run_13_t_0");
         fs::create_dir_all(&empty).unwrap();
         assert!(!folder_complete(&empty, FolderKind::Corrected));
-        // A raw folder never gets a summary.json: its Spectra file is the marker.
+        // Raw: frames (SummedImg excluded) must match the rows; one frame
+        // short → still writing.
         assert!(folder_complete(&raw11, FolderKind::Raw));
-        assert!(!folder_complete(&raw11, FolderKind::Corrected));
+        fs::remove_file(raw11.join("20260101_Run_11_t_0_00001.fits")).unwrap();
+        assert!(!folder_complete(&raw11, FolderKind::Raw));
+        assert_eq!(spectra_rows(&raw11.join("20260101_Run_11_t_0_Spectra.txt")), Some(2));
+        assert_eq!(spectra_rows(&corr12.join("20260101_Run_12_t_0_Spectra.txt")), Some(2));
     }
 }
