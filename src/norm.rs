@@ -15,9 +15,12 @@
 //!   `<IPTS>/shared/autoreduce/normalized/rolling/anchor_<run>/last_<N>min`.
 //!
 //! Sample inputs are the runs' detector-corrected folders; open-beam
-//! folders come from the normalization configuration file. Each job stages
-//! into a `.partial` folder, promoted on success (workflow-runner
-//! convention).
+//! folders come from the normalization configuration file. Every job runs
+//! the workflow runner's process: a result already there is never redone,
+//! the inputs are pre-cropped on disk when the configuration has a crop
+//! region, the script's output is streamed into `logs/<name>.log` next to
+//! the result, the job stages into a `.partial` folder and is promoted on
+//! success.
 
 use crate::{files, h5};
 use chrono::{DateTime, FixedOffset};
@@ -75,6 +78,8 @@ pub enum JobState {
     },
     Failed {
         message: String,
+        /// The job's log file, when the job got far enough to open one.
+        log: Option<PathBuf>,
     },
 }
 
@@ -90,6 +95,8 @@ pub enum JobMessage {
         target: JobTarget,
         runs: Vec<u64>,
         result: Result<PathBuf, String>,
+        /// The job's log file (what happened, in full).
+        log: PathBuf,
     },
 }
 
@@ -171,23 +178,27 @@ pub struct JobSpec {
     /// (corrected folder, NeXus file) per open-beam run.
     obs: Vec<(PathBuf, PathBuf)>,
     config: PathBuf,
+    /// Final result folder (`<row>/normalization`, or a window's folder).
     output: PathBuf,
+    /// The job's log file (`<row>/logs/<name>.log`).
+    pub log: PathBuf,
+    /// Pre-crop region from the configuration, and where the cropped
+    /// copies of the inputs go (`<base>/cropped_x0…_y1…/<folder name>`).
+    crop: Option<((usize, usize, usize, usize), PathBuf)>,
 }
 
-/// Configuration checks shared by every job, then the open beams: folder
-/// from the config; NeXus derived from the folder (run number in its name,
-/// IPTS from its path — OBs may live in another IPTS than the samples).
+/// The workflow runner's crop-copy parent folder for a region.
+fn crop_parent(base: &Path, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> PathBuf {
+    base.join(format!("cropped_x0{x0}_y0{y0}_x1{x1}_y1{y1}"))
+}
+
+/// Open beams: folder from the config; NeXus derived from the folder (run
+/// number in its name, IPTS from its path — OBs may live in another IPTS
+/// than the samples).
 fn resolve_obs(
     ipts_path: &Path,
     config_info: &h5::ConfigInfo,
 ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    if config_info.has_crop {
-        return Err(
-            "the configuration has a crop region — not supported here yet \
-             (use the workflow runner)"
-                .to_owned(),
-        );
-    }
     if config_info.ob_folders.is_empty() {
         return Err("the configuration file names no open-beam folder".to_owned());
     }
@@ -244,13 +255,22 @@ pub fn prepare_job(
     }
 
     let anchor_run = *window.runs.iter().max().expect("runs not empty");
+    let output = output_dir(ipts_path, anchor_run, window.minutes);
+    let anchor_dir = output.parent().expect("window output has a parent").to_path_buf();
     Ok(JobSpec {
         target: JobTarget::Window(window_index),
         runs: window.runs.clone(),
         samples,
         obs,
         config: config_path.to_path_buf(),
-        output: output_dir(ipts_path, anchor_run, window.minutes),
+        log: anchor_dir.join("logs").join(format!("last_{}min.log", window.minutes)),
+        crop: config_info.crop_region.map(|region| {
+            (
+                region,
+                crop_parent(&ipts_path.join("shared/autoreduce/normalized/rolling"), region),
+            )
+        }),
+        output,
     })
 }
 
@@ -265,6 +285,9 @@ pub fn prepare_run_job(
     config_info: &h5::ConfigInfo,
 ) -> Result<JobSpec, String> {
     let obs = resolve_obs(ipts_path, config_info)?;
+    let output = run_output_dir(ipts_path, run, config_info);
+    let row_dir = output.parent().expect("run output has a parent").to_path_buf();
+    let base = row_dir.parent().expect("row dir has a parent").to_path_buf();
     Ok(JobSpec {
         target: JobTarget::Run(run),
         runs: vec![run],
@@ -274,7 +297,11 @@ pub fn prepare_run_job(
         )],
         obs,
         config: config_path.to_path_buf(),
-        output: run_output_dir(ipts_path, run, config_info),
+        log: row_dir.join("logs").join("normalization.log"),
+        crop: config_info
+            .crop_region
+            .map(|region| (region, crop_parent(&base, region))),
+        output,
     })
 }
 
@@ -288,11 +315,88 @@ pub fn launch(spec: JobSpec, tx: Sender<JobMessage>) {
             target: spec.target,
             runs: spec.runs.clone(),
             result,
+            log: spec.log.clone(),
         });
     });
 }
 
+/// Append-only job log (`<row>/logs/<name>.log`), the workflow runner's
+/// format: timestamped lines for the runner's own steps, `  | ` lines for
+/// the streamed script output.
+struct Log {
+    path: PathBuf,
+}
+
+impl Log {
+    fn open(path: &Path) -> Result<Log, String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        Ok(Log {
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn line(&self, msg: &str) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = writeln!(f, "[{}] {msg}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"));
+        }
+    }
+
+    fn raw_line(&self, msg: &str) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = writeln!(f, "  | {msg}");
+        }
+    }
+}
+
 fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
+    let log = Log::open(&spec.log)?;
+    let progress = |stage: String, fraction: Option<f32>| {
+        let _ = tx.send(JobMessage::Progress {
+            target: spec.target,
+            stage,
+            fraction,
+        });
+    };
+
+    // Never run twice: a complete result is reused as is.
+    if output_is_done(&spec.output) {
+        log.line("normalization output already there — skipped (never run twice)");
+        return Ok(spec.output.clone());
+    }
+
+    // Pre-crop every sample/OB folder when the configuration asks for it
+    // (notebook convention), and normalize the cropped copies.
+    let (mut samples, mut obs) = (spec.samples.clone(), spec.obs.clone());
+    if let Some((region, parent)) = &spec.crop {
+        let (x0, y0, x1, y1) = *region;
+        log.line(&format!(
+            "pre-crop (x0, y0, x1, y1) = ({x0}, {y0}, {x1}, {y1}) into {}",
+            parent.display()
+        ));
+        for (folder, _) in samples.iter_mut().chain(obs.iter_mut()) {
+            let name = folder
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            progress(format!("pre-cropping {name}…"), None);
+            *folder = precrop_folder(folder, *region, parent, &log)?;
+        }
+    }
+
+    progress("running NeuNorm…".to_owned(), None);
     let partial = spec.output.with_extension("partial");
     // A leftover staging folder from a crashed run would confuse the
     // promote step: start clean.
@@ -300,11 +404,12 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&partial)
         .map_err(|e| format!("cannot create {}: {e}", partial.display()))?;
 
+    // Images are named after the final folder, not the .partial staging one.
     let basename = spec
         .output
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "normalized".to_owned());
+        .unwrap_or_else(|| "normalization".to_owned());
     let mut cmd = std::process::Command::new(PYTHON_BIN);
     cmd.arg(NORMALIZE_SCRIPT)
         .arg("--config")
@@ -313,73 +418,223 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
         .arg(&partial)
         .arg("--basename")
         .arg(&basename);
-    for (folder, nexus) in &spec.samples {
+    for (folder, nexus) in &samples {
         cmd.arg("--sample").arg(folder).arg("--sample-nexus").arg(nexus);
     }
-    for (folder, nexus) in &spec.obs {
+    for (folder, nexus) in &obs {
         cmd.arg("--ob").arg(folder).arg("--ob-nexus").arg(nexus);
     }
+    log.line(&format!("running: {cmd:?}"));
 
-    // Stream the script's output: its PROGRESS lines feed the status
-    // column's progress bar while everything is kept for the error tail.
+    // Stream the script's output: both pipes drained concurrently (a full
+    // one would block the child) into one channel; PROGRESS lines feed the
+    // progress bar, everything else goes to the log (and the error tail).
     use std::io::BufRead;
+    use std::process::Stdio;
     let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot launch {PYTHON_BIN}: {e}"))?;
-    let stderr_lines = child.stderr.take().map(|stderr| {
-        std::thread::spawn(move || {
-            std::io::BufReader::new(stderr)
-                .lines()
-                .map_while(Result::ok)
-                .collect::<Vec<String>>()
-        })
-    });
-    let mut stdout_lines: Vec<String> = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some((stage, fraction)) = parse_progress(&line) {
-                let _ = tx.send(JobMessage::Progress {
-                    target: spec.target,
-                    stage,
-                    fraction,
-                });
+    let (ltx, lrx) = std::sync::mpsc::channel::<String>();
+    let mut readers = Vec::new();
+    let pipes: [Option<Box<dyn std::io::Read + Send>>; 2] = [
+        child.stdout.take().map(|p| Box::new(p) as _),
+        child.stderr.take().map(|p| Box::new(p) as _),
+    ];
+    for pipe in pipes.into_iter().flatten() {
+        let ltx = ltx.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                if ltx.send(line).is_err() {
+                    break;
+                }
             }
-            stdout_lines.push(line);
+        }));
+    }
+    drop(ltx);
+    let mut tail: Vec<String> = Vec::new();
+    for line in lrx {
+        if let Some((stage, fraction)) = parse_progress(&line) {
+            progress(stage, fraction);
+            continue;
         }
+        log.raw_line(&line);
+        if !line.trim().is_empty() {
+            tail.push(line);
+            if tail.len() > 8 {
+                tail.remove(0);
+            }
+        }
+    }
+    for reader in readers {
+        let _ = reader.join();
     }
     let status = child
         .wait()
         .map_err(|e| format!("cannot wait for the normalization: {e}"))?;
     if !status.success() {
-        // The script prints its error last — keep the tail for the UI.
-        let mut all = stdout_lines;
-        if let Some(handle) = stderr_lines {
-            all.extend(handle.join().unwrap_or_default());
-        }
-        let tail: Vec<&String> = all
-            .iter()
-            .filter(|l| !l.trim().is_empty() && !l.starts_with("PROGRESS"))
-            .collect();
-        let n = tail.len();
-        return Err(tail[n.saturating_sub(6)..]
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"));
+        let message = format!(
+            "normalization script failed ({status})\n{}",
+            tail.join("\n")
+        );
+        log.line(&format!("ERROR: {message}"));
+        return Err(message);
     }
 
-    // Promote the staging folder to the final name.
-    let _ = std::fs::remove_dir_all(&spec.output);
+    // Promote the staging folder to the final name (a leftover empty
+    // destination would make the rename fail).
+    if spec.output.exists() && !output_is_done(&spec.output) {
+        let _ = std::fs::remove_dir_all(&spec.output);
+    }
     std::fs::rename(&partial, &spec.output).map_err(|e| {
-        format!(
+        let message = format!(
             "normalized, but cannot rename {} -> {}: {e}",
             partial.display(),
             spec.output.display()
-        )
+        );
+        log.line(&format!("ERROR: {message}"));
+        message
     })?;
+    log.line(&format!("normalized data written to {}", spec.output.display()));
     Ok(spec.output.clone())
+}
+
+/// Crop one input folder into `<crop_parent>/<folder name>/` (exclusive-stop
+/// bounds in the on-disk frame of the files), workflow-runner conventions:
+/// a destination already holding the same number of TIFFs is reused as is,
+/// and the `*_Spectra.txt` sidecars are copied along either way. Returns
+/// the destination folder.
+fn precrop_folder(
+    src: &Path,
+    (x0, y0, x1, y1): (usize, usize, usize, usize),
+    crop_parent: &Path,
+    log: &Log,
+) -> Result<PathBuf, String> {
+    use rayon::prelude::*;
+    let name = src
+        .file_name()
+        .ok_or_else(|| format!("input folder {} has no name", src.display()))?;
+    let dest = crop_parent.join(name);
+    let src_tiffs = list_tiff_in_dir(src)?;
+    let existing = list_tiff_in_dir(&dest).map(|v| v.len()).unwrap_or(0);
+    if existing == src_tiffs.len() {
+        log.line(&format!(
+            "pre-crop — {} already cropped ({existing} TIFF(s) in {}), reused",
+            name.to_string_lossy(),
+            dest.display()
+        ));
+    } else {
+        std::fs::create_dir_all(&dest)
+            .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+        src_tiffs.par_iter().try_for_each(|path| -> Result<(), String> {
+            let (values, w, h) = load_tiff_frame(path)?;
+            if x1 > w || y1 > h || x0 >= x1 || y0 >= y1 {
+                return Err(format!(
+                    "crop region ({x0}, {y0}, {x1}, {y1}) does not fit the {w}×{h} image {}",
+                    path.display()
+                ));
+            }
+            let cropped: Vec<f32> = (y0..y1)
+                .flat_map(|row| values[row * w + x0..row * w + x1].to_vec())
+                .collect();
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| format!("{} has no name", path.display()))?;
+            write_tiff_f32(&dest.join(file_name), x1 - x0, y1 - y0, &cropped)
+        })?;
+        log.line(&format!(
+            "pre-crop — {}: {} TIFF(s) cropped into {}",
+            name.to_string_lossy(),
+            src_tiffs.len(),
+            dest.display()
+        ));
+    }
+    let entries =
+        std::fs::read_dir(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let lower = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        if path.is_file() && lower.ends_with("_spectra.txt") {
+            std::fs::copy(&path, dest.join(path.file_name().unwrap_or_default()))
+                .map_err(|e| format!("cannot copy {}: {e}", path.display()))?;
+        }
+    }
+    Ok(dest)
+}
+
+fn list_tiff_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            p.is_file() && (ext == "tif" || ext == "tiff")
+        })
+        .collect();
+    if out.is_empty() {
+        return Err(format!("no TIFF files found in {}", dir.display()));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Read the first page of a TIFF as a flat row-major f32 buffer. Extra
+/// samples per pixel (e.g. RGB) keep only the first sample.
+fn load_tiff_frame(path: &Path) -> Result<(Vec<f32>, usize, usize), String> {
+    use tiff::decoder::{Decoder, DecodingResult};
+    let err = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let file = std::fs::File::open(path).map_err(|e| err(&e))?;
+    let mut decoder = Decoder::new(std::io::BufReader::new(file)).map_err(|e| err(&e))?;
+    let (w, h) = decoder.dimensions().map_err(|e| err(&e))?;
+    let (w, h) = (w as usize, h as usize);
+    let values: Vec<f32> = match decoder.read_image().map_err(|e| err(&e))? {
+        DecodingResult::U8(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::U16(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::U32(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::U64(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I8(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I16(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I64(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::F16(v) => v.into_iter().map(|x| x.to_f32()).collect(),
+        DecodingResult::F32(v) => v,
+        DecodingResult::F64(v) => v.into_iter().map(|x| x as f32).collect(),
+    };
+    let expected = w * h;
+    if values.len() == expected {
+        return Ok((values, w, h));
+    }
+    if expected > 0 && values.len() % expected == 0 {
+        let spp = values.len() / expected;
+        return Ok(((0..expected).map(|i| values[i * spp]).collect(), w, h));
+    }
+    Err(format!(
+        "pixel count {} not compatible with {w}×{h} in {}",
+        values.len(),
+        path.display()
+    ))
+}
+
+fn write_tiff_f32(path: &Path, w: usize, h: usize, values: &[f32]) -> Result<(), String> {
+    let err = |e: &dyn std::fmt::Display| format!("cannot write {}: {e}", path.display());
+    let file = std::fs::File::create(path).map_err(|e| err(&e))?;
+    let mut enc =
+        tiff::encoder::TiffEncoder::new(std::io::BufWriter::new(file)).map_err(|e| err(&e))?;
+    enc.write_image::<tiff::encoder::colortype::Gray32Float>(w as u32, h as u32, values)
+        .map_err(|e| err(&e))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -427,7 +682,7 @@ mod tests {
     fn run_output_dir_follows_the_workflow_runner_layout() {
         let with_folder = h5::ConfigInfo {
             ob_folders: vec![],
-            has_crop: false,
+            crop_region: None,
             output_folder: Some(PathBuf::from("/SNS/VENUS/IPTS-1/shared/jean")),
         };
         assert_eq!(
@@ -436,7 +691,7 @@ mod tests {
         );
         let without = h5::ConfigInfo {
             ob_folders: vec![],
-            has_crop: false,
+            crop_region: None,
             output_folder: None,
         };
         assert_eq!(
@@ -445,6 +700,82 @@ mod tests {
                 "/SNS/VENUS/IPTS-1/shared/autoreduce/normalized/Run_23642/normalization"
             )
         );
+    }
+
+    #[test]
+    fn precrops_with_the_runner_reuse_rule() {
+        let root = std::env::temp_dir().join("anm_test_precrop");
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("20260613_Run_1_x_0");
+        std::fs::create_dir_all(&src).unwrap();
+        // 10×6 frames holding their row index; two frames + a spectra file.
+        let frame: Vec<f32> = (0..6).flat_map(|r| vec![r as f32; 10]).collect();
+        write_tiff_f32(&src.join("img_0000.tiff"), 10, 6, &frame).unwrap();
+        write_tiff_f32(&src.join("img_0001.tiff"), 10, 6, &frame).unwrap();
+        std::fs::write(src.join("img_Spectra.txt"), "tof").unwrap();
+        let parent = crop_parent(&root, (2, 1, 8, 5));
+        let log = Log::open(&root.join("logs/test.log")).unwrap();
+        let dest = precrop_folder(&src, (2, 1, 8, 5), &parent, &log).unwrap();
+        assert_eq!(dest, parent.join("20260613_Run_1_x_0"));
+        let (values, w, h) = load_tiff_frame(&dest.join("img_0001.tiff")).unwrap();
+        assert_eq!((w, h), (6, 4));
+        assert_eq!(values[0], 1.0);
+        assert_eq!(values[values.len() - 1], 4.0);
+        assert!(dest.join("img_Spectra.txt").is_file());
+        // Same count already there: reused, not rewritten.
+        let before = std::fs::metadata(dest.join("img_0000.tiff")).unwrap().modified().unwrap();
+        precrop_folder(&src, (2, 1, 8, 5), &parent, &log).unwrap();
+        let after = std::fs::metadata(dest.join("img_0000.tiff")).unwrap().modified().unwrap();
+        assert_eq!(before, after);
+        // Region outside the frame is refused.
+        let err = precrop_folder(&src, (0, 0, 11, 6), &root.join("bad"), &log).unwrap_err();
+        assert!(err.contains("does not fit"), "{err}");
+    }
+
+    /// End-to-end check of the per-run job on real VENUS data (NeuNorm
+    /// takes about a minute): `cargo test --release -- --ignored`. Output
+    /// goes under `$ANM_TEST_OUTPUT` (default: the temp dir).
+    #[test]
+    #[ignore]
+    fn normalizes_a_real_run_end_to_end() {
+        let ipts_path = Path::new("/SNS/VENUS/IPTS-36967");
+        let config = Path::new(
+            "/SNS/VENUS/IPTS-36967/shared/autoreduce/configs/normalization_config_20260718_084258.h5",
+        );
+        if !config.is_file() {
+            return;
+        }
+        let base = std::env::var_os("ANM_TEST_OUTPUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("anm_test_e2e"));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut info = h5::read_config_info(config).unwrap();
+        info.output_folder = Some(base.clone());
+        let run = 23642;
+        let corrected = match files::check_runs(ipts_path, &[run]).remove(0).corrected {
+            files::FileStatus::Present(folder) => folder,
+            other => panic!("no corrected data for run {run}: {other:?}"),
+        };
+        let spec = prepare_run_job(run, &corrected, ipts_path, config, &info).unwrap();
+        assert_eq!(spec.output, base.join("Run_23642/normalization"));
+        assert_eq!(spec.log, base.join("Run_23642/logs/normalization.log"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let output = run_job(&spec, &tx).unwrap_or_else(|e| {
+            panic!(
+                "job failed: {e}\n--- log ---\n{}",
+                std::fs::read_to_string(&spec.log).unwrap_or_default()
+            )
+        });
+        assert!(output_is_done(&output));
+        assert!(!spec.output.with_extension("partial").exists());
+        let progress = rx.try_iter().count();
+        assert!(progress > 0, "no PROGRESS message reached the UI channel");
+        let log = std::fs::read_to_string(&spec.log).unwrap();
+        assert!(log.contains("running:"), "{log}");
+        assert!(log.contains("normalized data written to"), "{log}");
+        // Second call: reused, never run twice.
+        assert_eq!(run_job(&spec, &tx).unwrap(), output);
+        assert!(std::fs::read_to_string(&spec.log).unwrap().contains("skipped"));
     }
 
     #[test]

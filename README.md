@@ -51,7 +51,7 @@ Single view, top to bottom:
      normalized) opens a SINGLE viewer session with the three stacks side by
      side (`--compare`: shared colorscale, regions mirrored, one profile
      curve per stack — images only for now).
-     Configurations with a crop region are not supported yet.
+     Windows log into `rolling/anchor_<run>/logs/last_<N>min.log`.
 5. **Runs in use table** — lists the runs the windows use (the manual
    list, or the widest window in live mode). When auto normalization is
    ON, the first row is the **upcoming run** (highest run in
@@ -73,6 +73,11 @@ Single view, top to bottom:
    a progress bar fills in the Normalized column, and once done a
    **👁** icon opens the result in the rust_tiff_viewer and a **📂** icon
    opens the folder in the file manager (**↻** retries a failed run).
+   The job runs exactly like the workflow runner's: a result already
+   there is never redone, the inputs are pre-cropped on disk when the
+   configuration has a crop region, and the script's output is streamed
+   into `Run_<run>/logs/normalization.log` (a failed row's **📄** button
+   opens it; the hover shows the last lines).
    Output follows the workflow runner's layout under the configuration's
    output folder: `<output folder>/Run_<run>/normalization` (under
    `<IPTS>/shared/autoreduce/normalized` when the configuration names no

@@ -12,4 +12,6 @@ egui_plot = "0.31"
 hdf5-metno = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
+rayon = "1.11"
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
+tiff = "0.11"

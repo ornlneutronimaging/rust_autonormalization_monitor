@@ -108,9 +108,10 @@ pub fn daslog(path: &Path, name: &str) -> Option<Vec<(DateTime<FixedOffset>, f64
 pub struct ConfigInfo {
     /// Detector-corrected open-beam folders (NeuNorm `--ob` inputs).
     pub ob_folders: Vec<PathBuf>,
-    /// The notebook's crop region, if any — the workflow-runner pre-crops
-    /// inputs when set, which this application does not implement yet.
-    pub has_crop: bool,
+    /// The notebook's crop region `(x0, y0, x1, y1)` (exclusive stops, in
+    /// the on-disk frame of the TIFF files), if any — the inputs are
+    /// pre-cropped on disk before NeuNorm runs, as the workflow runner does.
+    pub crop_region: Option<(usize, usize, usize, usize)>,
     /// The notebook's output folder (root attribute `output_folder`), where
     /// the workflow runner writes `Run_<run>/normalization`. `None` when
     /// absent or empty.
@@ -126,11 +127,13 @@ pub fn read_config_info(path: &Path) -> Result<ConfigInfo, String> {
         .into_iter()
         .map(PathBuf::from)
         .collect();
-    let has_crop = file
+    let crop_region = file
         .group("normalization")
         .ok()
         .and_then(|g| g.attr("crop_region").ok())
-        .is_some();
+        .and_then(|a| read_f64s(&a))
+        .filter(|v| v.len() == 4 && v.iter().all(|x| x.is_finite() && *x >= 0.0))
+        .map(|v| (v[0] as usize, v[1] as usize, v[2] as usize, v[3] as usize));
     let output_folder = file
         .attr("output_folder")
         .ok()
@@ -140,7 +143,7 @@ pub fn read_config_info(path: &Path) -> Result<ConfigInfo, String> {
         .map(PathBuf::from);
     Ok(ConfigInfo {
         ob_folders,
-        has_crop,
+        crop_region,
         output_folder,
     })
 }

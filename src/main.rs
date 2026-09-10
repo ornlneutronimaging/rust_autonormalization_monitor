@@ -573,7 +573,7 @@ impl MonitorApp {
             Ok(info) => info,
             Err(e) => {
                 for w in &mut self.windows {
-                    w.state = norm::JobState::Failed { message: e.clone() };
+                    w.state = norm::JobState::Failed { message: e.clone(), log: None };
                 }
                 return;
             }
@@ -591,7 +591,7 @@ impl MonitorApp {
                     };
                     norm::launch(spec, self.norm_tx.clone());
                 }
-                Err(message) => self.windows[i].state = norm::JobState::Failed { message },
+                Err(message) => self.windows[i].state = norm::JobState::Failed { message, log: None },
             }
         }
     }
@@ -645,7 +645,7 @@ impl MonitorApp {
                 // Surface the problem on the runs that would need it.
                 for run in pending {
                     self.run_jobs
-                        .insert(run, norm::JobState::Failed { message: e.clone() });
+                        .insert(run, norm::JobState::Failed { message: e.clone(), log: None });
                 }
                 return;
             }
@@ -703,7 +703,7 @@ impl MonitorApp {
                     fraction: None,
                 }
             }
-            Err(message) => norm::JobState::Failed { message },
+            Err(message) => norm::JobState::Failed { message, log: None },
         };
         self.run_jobs.insert(run, state);
     }
@@ -719,15 +719,16 @@ impl MonitorApp {
         match h5::read_config_info(&config) {
             Ok(info) => self.start_run_job(run, &ipts_path, &config, &info),
             Err(message) => {
-                self.run_jobs.insert(run, norm::JobState::Failed { message });
+                self.run_jobs.insert(run, norm::JobState::Failed { message, log: None });
             }
         }
     }
 
-    /// Open a folder in the desktop file manager (detached, via xdg-open).
+    /// Open a folder in the desktop file manager, or a file (e.g. a job
+    /// log) in its default application — detached, via xdg-open.
     fn open_folder(&mut self, folder: &Path) {
-        self.viewer_error = if !folder.is_dir() {
-            Some(format!("folder not found: {}", folder.display()))
+        self.viewer_error = if !folder.exists() {
+            Some(format!("not found: {}", folder.display()))
         } else {
             std::process::Command::new("xdg-open")
                 .arg(folder)
@@ -1370,6 +1371,7 @@ impl MonitorApp {
 
             let mut minutes_changed = false;
             let mut view_folder: Option<PathBuf> = None;
+            let mut open_log: Option<PathBuf> = None;
             egui::Grid::new("windows_grid")
                 .num_columns(4)
                 .spacing([theme::SPACE_LG * 2.0, theme::SPACE_SM])
@@ -1494,14 +1496,35 @@ impl MonitorApp {
                                     view_folder = Some(output.clone());
                                 }
                             }
-                            norm::JobState::Failed { message } => {
+                            norm::JobState::Failed { message, log } => {
                                 ui.label(
                                     egui::RichText::new("✖ failed")
                                         .color(theme::DANGER)
                                         .strong(),
                                 )
-                                .on_hover_text(message);
-                                ui.label("");
+                                .on_hover_text(match log {
+                                    Some(log) => {
+                                        format!("{message}\n\nfull log: {}", log.display())
+                                    }
+                                    None => message.clone(),
+                                });
+                                match log {
+                                    Some(log) => {
+                                        if ui
+                                            .button("📄 log")
+                                            .on_hover_text(format!(
+                                                "Open the job log\n{}",
+                                                log.display()
+                                            ))
+                                            .clicked()
+                                        {
+                                            open_log = Some(log.clone());
+                                        }
+                                    }
+                                    None => {
+                                        ui.label("");
+                                    }
+                                }
                             }
                         }
                         ui.end_row();
@@ -1513,6 +1536,10 @@ impl MonitorApp {
             if let Some(folder) = view_folder {
                 self.viewer_error = None;
                 self.open_in_viewer(std::slice::from_ref(&folder));
+            }
+            if let Some(log) = open_log {
+                self.viewer_error = None;
+                self.open_folder(&log);
             }
 
             ui.add_space(theme::SPACE_SM);
@@ -2251,14 +2278,26 @@ impl MonitorApp {
                     }
                 });
             }
-            Some(norm::JobState::Failed { message }) => {
+            Some(norm::JobState::Failed { message, log }) => {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("✖ failed")
                             .color(theme::DANGER)
                             .strong(),
                     )
-                    .on_hover_text(message);
+                    .on_hover_text(match log {
+                        Some(log) => format!("{message}\n\nfull log: {}", log.display()),
+                        None => message.clone(),
+                    });
+                    if let Some(log) = log {
+                        if ui
+                            .button("📄")
+                            .on_hover_text(format!("Open the job log\n{}", log.display()))
+                            .clicked()
+                        {
+                            *open_normalized = Some(log.clone());
+                        }
+                    }
                     if ui
                         .button("↻")
                         .on_hover_text("Retry the normalization of this run")
@@ -2293,7 +2332,7 @@ impl eframe::App for MonitorApp {
                         *f = fraction;
                     }
                 }
-                norm::JobMessage::Finished { target, runs, result } => {
+                norm::JobMessage::Finished { target, runs, result, log } => {
                     if let Some(state) = self.job_state_mut(target) {
                         *state = match result {
                             Ok(output) => norm::JobState::Done {
@@ -2301,7 +2340,10 @@ impl eframe::App for MonitorApp {
                                 finished: chrono::Local::now(),
                                 runs,
                             },
-                            Err(message) => norm::JobState::Failed { message },
+                            Err(message) => norm::JobState::Failed {
+                                message,
+                                log: Some(log),
+                            },
                         };
                     }
                 }
