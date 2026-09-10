@@ -229,6 +229,10 @@ struct MonitorApp {
     /// The configuration the Done-on-disk entries of `run_jobs` were
     /// looked up with — its output folder decides where results live.
     run_jobs_config: Option<PathBuf>,
+    /// Where the per-run normalized data lands (`<here>/Run_<run>/
+    /// normalization`): the selected configuration's output folder, or the
+    /// IPTS default. Shown in the footer.
+    output_base: Option<PathBuf>,
     /// Live mode: every run the table has shown this session. Rows are
     /// never dropped when a new run lands (the windows slide, the table
     /// does not — a normalization in progress must stay visible).
@@ -293,6 +297,7 @@ impl MonitorApp {
             last_live_anchor: None,
             run_jobs: HashMap::new(),
             run_jobs_config: None,
+            output_base: None,
             table_runs: std::collections::BTreeSet::new(),
             job_output: HashMap::new(),
             output_view: None,
@@ -341,6 +346,7 @@ impl MonitorApp {
         self.last_live_anchor = None;
         self.run_jobs.clear();
         self.run_jobs_config = None;
+        self.output_base = None;
         self.run_jobs_from = None;
         self.table_runs.clear();
         self.job_output.clear();
@@ -639,6 +645,14 @@ impl MonitorApp {
             self.run_jobs
                 .retain(|_, state| matches!(state, norm::JobState::Running { .. }));
             self.run_jobs_config = self.selected_config.clone();
+            // Where the results go, for the footer: the configuration's
+            // output folder, else the IPTS default.
+            self.output_base = self.selected_config.as_ref().map(|config| {
+                h5::read_config_info(config)
+                    .ok()
+                    .and_then(|info| info.output_folder)
+                    .unwrap_or_else(|| ipts_path.join("shared/autoreduce/normalized"))
+            });
         }
         match self.cfg.as_ref().map(|c| c.activate) {
             Ok(true) => {
@@ -2237,6 +2251,62 @@ impl MonitorApp {
         }
     }
 
+    /// Footer: where the normalized data lands, with a shortcut to the
+    /// folder. The per-run results go to `<output folder>/Run_<run>/
+    /// normalization`, the output folder coming from the configuration.
+    fn output_footer(&mut self, ui: &mut egui::Ui) {
+        if self.ipts.is_none() {
+            return;
+        }
+        let mut open: Option<PathBuf> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("💾 Normalized data lands in").strong());
+            match &self.output_base {
+                Some(base) => {
+                    ui.label(
+                        egui::RichText::new(base.display().to_string())
+                            .monospace()
+                            .color(theme::primary_text(ui.visuals())),
+                    )
+                    .on_hover_text(
+                        "The configuration file's output folder — each run goes to \
+                         Run_<run>/normalization in there (rolling windows: \
+                         <IPTS>/shared/autoreduce/normalized/rolling)",
+                    );
+                    let exists = base.is_dir();
+                    let button = ui.add_enabled(exists, egui::Button::new("📂 open folder"));
+                    let button = if exists {
+                        button.on_hover_text(format!(
+                            "Jump to the output folder in the file manager\n{}",
+                            base.display()
+                        ))
+                    } else {
+                        button.on_disabled_hover_text(
+                            "The folder does not exist yet — created by the first \
+                             normalization",
+                        )
+                    };
+                    if button.clicked() {
+                        open = Some(base.clone());
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(
+                            "the configuration file's output folder — select a \
+                             configuration (section 2) to see it",
+                        )
+                        .color(theme::text_emphasis(ui.visuals())),
+                    );
+                }
+            }
+        });
+        if let Some(folder) = open {
+            self.viewer_error = None;
+            self.open_folder(&folder);
+        }
+    }
+
     fn toggle_output_view(&mut self, target: norm::JobTarget) {
         self.output_view = if self.output_view == Some(target) {
             None
@@ -2663,6 +2733,8 @@ impl eframe::App for MonitorApp {
                     self.windows_section(ui);
                     ui.add_space(theme::SPACE_LG);
                     self.runs_table(ui);
+                    ui.add_space(theme::SPACE_LG);
+                    self.output_footer(ui);
                 });
                 ui.add_space(theme::SPACE_LG);
             });

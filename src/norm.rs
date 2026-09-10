@@ -259,6 +259,49 @@ fn resolve_obs(
     Ok(obs)
 }
 
+/// NeuNorm divides the sample stack by the open-beam stack frame by frame:
+/// every sample and OB folder must hold the same number of images, or the
+/// run fails deep inside the pipeline ("Mismatch in coordinate 'tof'").
+/// The notebook refuses to launch on that (its Data Quality Check); so
+/// does this, with the counts spelled out.
+fn check_frame_counts(
+    samples: &[(PathBuf, PathBuf)],
+    obs: &[(PathBuf, PathBuf)],
+) -> Result<(), String> {
+    let describe = |(folder, _): &(PathBuf, PathBuf)| {
+        let name = folder
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let run = files::run_number_in_name(&name)
+            .map(|r| format!("run {r}"))
+            .unwrap_or(name);
+        (run, files::tiff_count(folder))
+    };
+    let samples: Vec<(String, usize)> = samples.iter().map(describe).collect();
+    let obs: Vec<(String, usize)> = obs.iter().map(describe).collect();
+    let first = samples.first().map(|(_, n)| *n).unwrap_or(0);
+    let same = samples.iter().chain(obs.iter()).all(|(_, n)| *n == first);
+    if same {
+        return Ok(());
+    }
+    let list = |items: &[(String, usize)]| {
+        items
+            .iter()
+            .map(|(what, n)| format!("{what}: {n} images"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(format!(
+        "sample and open beam do not have the same number of images — \
+         sample {}; open beam {}. NeuNorm needs matching stacks: pick open \
+         beams acquired with the same settings (and re-save the \
+         configuration from the notebook so it names them)",
+        list(&samples),
+        list(&obs)
+    ))
+}
+
 /// Resolve one window into a launchable job. Errors name what is missing
 /// (no runs, runs without corrected data, config problems, …).
 pub fn prepare_job(
@@ -293,6 +336,8 @@ pub fn prepare_job(
         ));
     }
 
+    check_frame_counts(&samples, &obs)?;
+
     let anchor_run = *window.runs.iter().max().expect("runs not empty");
     let output = output_dir(ipts_path, anchor_run, window.minutes);
     let anchor_dir = output.parent().expect("window output has a parent").to_path_buf();
@@ -324,16 +369,18 @@ pub fn prepare_run_job(
     config_info: &h5::ConfigInfo,
 ) -> Result<JobSpec, String> {
     let obs = resolve_obs(ipts_path, config_info)?;
+    let samples = vec![(
+        corrected_folder.to_path_buf(),
+        files::nexus_path(ipts_path, run),
+    )];
+    check_frame_counts(&samples, &obs)?;
     let output = run_output_dir(ipts_path, run, config_info);
     let row_dir = output.parent().expect("run output has a parent").to_path_buf();
     let base = row_dir.parent().expect("row dir has a parent").to_path_buf();
     Ok(JobSpec {
         target: JobTarget::Run(run),
         runs: vec![run],
-        samples: vec![(
-            corrected_folder.to_path_buf(),
-            files::nexus_path(ipts_path, run),
-        )],
+        samples,
         obs,
         config: config_path.to_path_buf(),
         log: row_dir.join("logs").join("normalization.log"),
@@ -850,6 +897,30 @@ mod tests {
         assert!((f - 0.75).abs() < 1e-6);
         assert!(overall_progress(&stages, "unknown", None).is_none());
         assert!(overall_progress(&[], "exporting", None).is_none());
+    }
+
+    #[test]
+    fn frame_counts_must_match() {
+        let root = std::env::temp_dir().join("anm_test_frame_counts");
+        let _ = std::fs::remove_dir_all(&root);
+        let sample = root.join("20260909_Run_29930_x_23");
+        let ob = root.join("20260909_Run_29902_x_ob_0");
+        std::fs::create_dir_all(&sample).unwrap();
+        std::fs::create_dir_all(&ob).unwrap();
+        for i in 0..3 {
+            std::fs::write(sample.join(format!("s_{i}.tif")), "x").unwrap();
+        }
+        for i in 0..2 {
+            std::fs::write(ob.join(format!("o_{i}.tif")), "x").unwrap();
+        }
+        let nexus = root.join("n.h5");
+        let samples = vec![(sample.clone(), nexus.clone())];
+        let obs = vec![(ob.clone(), nexus.clone())];
+        let err = check_frame_counts(&samples, &obs).unwrap_err();
+        assert!(err.contains("run 29930: 3 images"), "{err}");
+        assert!(err.contains("run 29902: 2 images"), "{err}");
+        std::fs::write(ob.join("o_2.tif"), "x").unwrap();
+        assert!(check_frame_counts(&samples, &obs).is_ok());
     }
 
     #[test]

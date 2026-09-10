@@ -67,6 +67,9 @@ Single view, top to bottom:
    does not pull older runs back into the table: once everything in the
    span is rejected the windows are empty and the app simply waits for
    the next run.
+   A footer under the table reminds where the normalized data lands (the
+   configuration's output folder — `Run_<run>/normalization` in there) with
+   a **📂 open folder** shortcut.
    With auto normalization ON, every run that lands from then on is
    normalized **on its own** by this app: the row shows **⏳ waiting**
    until the run's corrected folder is complete (the Corrected column
@@ -85,7 +88,10 @@ Single view, top to bottom:
    cell reads **✔ normalization done** (hover: time and path) with a
    **👁 view** button opening the result in the rust_tiff_viewer and a
    **📂 folder** button jumping to the folder in the file manager
-   (**↻** retries a failed run).
+   (**↻** retries a failed run). Before launching, the sample and every
+   open-beam folder must hold the same number of images (NeuNorm divides
+   the stacks frame by frame — the notebook's Data Quality Check refuses
+   the same way); otherwise the row fails at once with the counts.
    A **📋** button on any normalized row (running, done or failed) opens an
    output panel under the table with the job's output as it streams —
    the script's own messages, the NeuNorm log lines, the runner's steps.

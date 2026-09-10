@@ -203,6 +203,21 @@ pub fn folder_complete(folder: &Path, kind: FolderKind) -> bool {
     spectra_rows(&spectra) == Some(frames)
 }
 
+/// Number of TIFF images in a folder (0 when unreadable).
+pub fn tiff_count(folder: &Path) -> usize {
+    std::fs::read_dir(folder)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().to_lowercase();
+                    name.ends_with(".tif") || name.ends_with(".tiff")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 /// Number of data rows of a `*_Spectra.txt` file (header lines — anything
 /// not starting with a digit, sign or dot — and blank lines excluded).
 pub fn spectra_rows(path: &Path) -> Option<usize> {
