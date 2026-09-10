@@ -140,29 +140,44 @@ pub enum FileStatus {
     /// The file exists / the folder is complete at this path.
     Present(PathBuf),
     /// The folder exists but is still being written: no image yet, or the
-    /// end-of-run sidecars (`summary.json` / `*_Spectra.txt`, written last)
-    /// are not there yet. Not usable as an input.
+    /// end-of-run sidecar (`*_Spectra.txt` for a raw folder, `summary.json`
+    /// for a corrected one — written last) is not there yet. Not usable as
+    /// an input.
     Writing(PathBuf),
     /// Not found; the path is where it was expected / searched for.
     Missing(PathBuf),
 }
 
-/// Is a run folder complete? The reduction (and the DAQ) create the folder
-/// first, write the TIFF images, then the sidecars — `*_Spectra.txt`,
-/// `summary.json` last. Complete = at least one TIFF and one of those.
-pub fn folder_complete(folder: &Path) -> bool {
+/// Which run folder a completeness check looks at — each has its own
+/// end-of-run marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderKind {
+    /// DAQ output (`<IPTS>/images`): the `*_Spectra.txt` lands last.
+    Raw,
+    /// Reduction output (`shared/autoreduce/images`): `summary.json` lands
+    /// last (the folder also gets its own Spectra file before it).
+    Corrected,
+}
+
+/// Is a run folder complete? The DAQ / the reduction create the folder
+/// first, write the TIFF images, then the sidecars, the kind's marker
+/// last. Complete = at least one TIFF and that marker.
+pub fn folder_complete(folder: &Path, kind: FolderKind) -> bool {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return false;
     };
-    let (mut tiff, mut sidecar) = (false, false);
+    let (mut tiff, mut marker) = (false, false);
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         if name.ends_with(".tif") || name.ends_with(".tiff") {
             tiff = true;
-        } else if name == "summary.json" || name.ends_with("_spectra.txt") {
-            sidecar = true;
+        } else {
+            marker |= match kind {
+                FolderKind::Raw => name.ends_with("_spectra.txt"),
+                FolderKind::Corrected => name == "summary.json",
+            };
         }
-        if tiff && sidecar {
+        if tiff && marker {
             return true;
         }
     }
@@ -196,16 +211,21 @@ pub fn check_runs(ipts_path: &Path, runs: &[u64]) -> Vec<RunFiles> {
                 } else {
                     FileStatus::Missing(nexus)
                 },
-                raw: dir_status(&raw_dirs, run, &raw_root),
-                corrected: dir_status(&corrected_dirs, run, &corrected_root),
+                raw: dir_status(&raw_dirs, run, &raw_root, FolderKind::Raw),
+                corrected: dir_status(&corrected_dirs, run, &corrected_root, FolderKind::Corrected),
             }
         })
         .collect()
 }
 
-fn dir_status(found: &HashMap<u64, PathBuf>, run: u64, root: &Path) -> FileStatus {
+fn dir_status(
+    found: &HashMap<u64, PathBuf>,
+    run: u64,
+    root: &Path,
+    kind: FolderKind,
+) -> FileStatus {
     match found.get(&run) {
-        Some(path) if folder_complete(path) => FileStatus::Present(path.clone()),
+        Some(path) if folder_complete(path, kind) => FileStatus::Present(path.clone()),
         Some(path) => FileStatus::Writing(path.clone()),
         None => FileStatus::Missing(root.join(format!("**/*Run_{run}*"))),
     }
@@ -290,8 +310,10 @@ mod tests {
         let corr12 =
             ipts.join("shared/autoreduce/images/tpx1/raw/radiography/t/20260101_Run_12_t_0");
         fs::create_dir_all(&corr12).unwrap();
-        // Still being written: images only, no sidecar yet.
+        // Still being written: images and its Spectra file, but the
+        // reduction's summary.json (written last) is not there yet.
         fs::write(corr12.join("20260101_Run_12_t_0_00000.tif"), "x").unwrap();
+        fs::write(corr12.join("20260101_Run_12_t_0_Spectra.txt"), "x").unwrap();
 
         let status = check_runs(&ipts, &[11, 12]);
         assert_eq!(status.len(), 2);
@@ -308,6 +330,9 @@ mod tests {
         // An empty folder is being written too, not complete.
         let empty = ipts.join("shared/autoreduce/images/tpx1/raw/radiography/t/20260101_Run_13_t_0");
         fs::create_dir_all(&empty).unwrap();
-        assert!(!folder_complete(&empty));
+        assert!(!folder_complete(&empty, FolderKind::Corrected));
+        // A raw folder never gets a summary.json: its Spectra file is the marker.
+        assert!(folder_complete(&raw11, FolderKind::Raw));
+        assert!(!folder_complete(&raw11, FolderKind::Corrected));
     }
 }

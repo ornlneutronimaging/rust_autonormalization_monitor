@@ -1681,7 +1681,7 @@ impl MonitorApp {
                 )
                 .on_hover_text(format!(
                     "being written — the folder is there but not complete yet \
-                     (images + Spectra.txt / summary.json)\n{}",
+                     (images, then Spectra.txt for raw / summary.json for corrected)\n{}",
                     path.display()
                 ));
             }
