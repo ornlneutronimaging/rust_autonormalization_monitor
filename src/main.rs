@@ -238,10 +238,12 @@ struct MonitorApp {
     job_output: HashMap<norm::JobTarget, std::collections::VecDeque<String>>,
     /// The job whose output panel is open, if any.
     output_view: Option<norm::JobTarget>,
-    /// Latest NeXus run present when auto normalization was seen active:
-    /// only runs landing AFTER it get their own normalization (the app
-    /// must not chew through the whole IPTS on startup). `None` while
-    /// auto normalization is OFF — re-armed when it resumes.
+    /// Newest run whose corrected data already existed when auto
+    /// normalization was seen active: only runs AFTER it get their own
+    /// normalization automatically (the app must not chew through the
+    /// whole IPTS on startup) — a run still in flight at that moment (NeXus
+    /// there, corrected data not yet) counts as new. `None` while auto
+    /// normalization is OFF — re-armed when it resumes.
     run_jobs_from: Option<u64>,
     /// Channel the window jobs report their progress and outcome on.
     norm_tx: mpsc::Sender<norm::JobMessage>,
@@ -638,16 +640,22 @@ impl MonitorApp {
                 .retain(|_, state| matches!(state, norm::JobState::Running { .. }));
             self.run_jobs_config = self.selected_config.clone();
         }
-        if self.is_active() {
-            if self.run_jobs_from.is_none() {
-                // First look while active: everything already there is
-                // old news — the "▶ normalize" button covers it.
-                self.run_jobs_from =
-                    Some(files::latest_nexus_run(&ipts_path).unwrap_or(0));
+        match self.cfg.as_ref().map(|c| c.activate) {
+            Ok(true) => {
+                if self.run_jobs_from.is_none() {
+                    // First look while active: everything already
+                    // normalizable is old news — the "▶ normalize" button
+                    // covers it. A run whose corrected data is not there
+                    // yet is still in flight: it will be normalized.
+                    self.run_jobs_from = Some(Self::newest_corrected_run(&ipts_path));
+                }
             }
-        } else {
-            // Re-armed when auto normalization resumes.
-            self.run_jobs_from = None;
+            // Auto normalization OFF: re-armed when it resumes.
+            Ok(false) => self.run_jobs_from = None,
+            // Unreadable shared configuration (transient on the shared
+            // filesystem): keep the current arming, do not lose track of
+            // the runs that landed meanwhile.
+            Err(_) => {}
         }
         let Some(config) = self.selected_config.clone() else {
             return; // nothing to look up or normalize with — retried next refresh
@@ -694,6 +702,25 @@ impl MonitorApp {
                 self.start_run_job(run, &ipts_path, &config, &info);
             }
         }
+    }
+
+    /// The newest run of the IPTS whose corrected folder already exists,
+    /// looking at the newest runs only (older ones are irrelevant for the
+    /// arming). 0 when none of them has corrected data yet — then every
+    /// run is new.
+    fn newest_corrected_run(ipts_path: &Path) -> u64 {
+        const LOOKBACK: usize = 30;
+        let runs = files::list_nexus_runs(ipts_path);
+        let newest: Vec<u64> = runs.iter().rev().take(LOOKBACK).copied().collect();
+        if newest.is_empty() {
+            return 0;
+        }
+        files::check_runs(ipts_path, &newest)
+            .iter()
+            .filter(|rf| matches!(rf.corrected, files::FileStatus::Present(_)))
+            .map(|rf| rf.run)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Normalize one run on its own (configuration's sample replaced by the

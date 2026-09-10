@@ -91,11 +91,14 @@ Single view, top to bottom:
    output folder: `<output folder>/Run_<run>/normalization` (under
    `<IPTS>/shared/autoreduce/normalized` when the configuration names no
    output folder). A result already there — from the workflow runner or a
-   previous session — is shown as done and never redone. Runs already in
-   the IPTS when auto normalization was turned on are left alone: when
-   their result is not found in that output folder they get a
-   **▶ normalize** button that runs the same per-run normalization on
-   demand. A **📈 Timeline** tab next to the
+   previous session — is shown as done and never redone. Every run that
+   shows up as "(next)" — and any run still in flight when the app started
+   watching (NeXus there, corrected data not yet) — is normalized
+   automatically, no click needed. Runs that already had their corrected
+   data when auto normalization was turned on (older runs, typically the
+   ones typed into the run list) are left alone: when their result is not
+   found in that output folder they get a **▶ normalize** button that runs
+   the same per-run normalization on demand. A **📈 Timeline** tab next to the
    table shows when each run was acquired (start → end bar per run, run
    number and duration on hover, rejected runs grayed/struck) with the
    5/15/30 min window coverage bands on top, on a shared axis in minutes
