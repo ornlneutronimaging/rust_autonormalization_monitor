@@ -48,6 +48,13 @@ const LOGO_PATH: &str = "/SNS/VENUS/shared/software/logos/logo_with_green_neutro
 const APP_TITLE: &str = "VENUS Auto Normalization";
 /// Default auto-refresh period (config file + runs table), in seconds.
 const DEFAULT_REFRESH_SECS: u32 = 5;
+/// How many per-run normalizations may run side by side (the queue and
+/// the automatic pass respect it). Each NeuNorm job is a python process
+/// of its own: a few in parallel is cheap on the analysis machines (100+
+/// cores, >1 TB), the shared filesystem is the limit.
+const DEFAULT_PARALLEL_JOBS: usize = 4;
+/// Upper bound of the "parallel jobs" setting.
+const MAX_PARALLEL_JOBS: usize = 16;
 /// Application launched to preview a normalization configuration file
 /// (HDF5): the rust_nexus_viewer, called with the file as argument.
 const NEXUS_VIEWER_CMD: &str =
@@ -247,9 +254,13 @@ struct MonitorApp {
     job_output: HashMap<norm::JobTarget, std::collections::VecDeque<String>>,
     /// The job whose output panel is open, if any.
     output_view: Option<norm::JobTarget>,
-    /// Runs queued by "▶ normalize all missing": started one at a time
-    /// (each NeuNorm run is heavy) as the previous one finishes.
+    /// Runs queued by "▶ normalize all missing": started as slots free
+    /// up, at most `parallel_jobs` running at once.
     run_queue: std::collections::VecDeque<u64>,
+    /// How many per-run normalizations may run at the same time (queue
+    /// and automatic pass alike). Each job is heavy, but the machine has
+    /// the cores and memory for several.
+    parallel_jobs: usize,
     /// Newest run whose corrected data already existed when auto
     /// normalization was seen active: only runs AFTER it get their own
     /// normalization automatically (the app must not chew through the
@@ -311,6 +322,7 @@ impl MonitorApp {
             job_output: HashMap::new(),
             output_view: None,
             run_queue: std::collections::VecDeque::new(),
+            parallel_jobs: DEFAULT_PARALLEL_JOBS,
             run_jobs_from: None,
             norm_tx,
             norm_rx,
@@ -786,10 +798,25 @@ impl MonitorApp {
                 continue;
             }
             let watched = self.run_jobs_from.is_some_and(|from| run > from);
-            if watched && !self.rejected.contains(&run) {
+            // At the cap the run is simply not registered: the next pass
+            // picks it up once a slot frees up.
+            if watched && !self.rejected.contains(&run) && self.has_free_job_slot() {
                 self.start_run_job(run, &ipts_path, &config, &info);
             }
         }
+    }
+
+    /// Number of per-run normalizations currently running.
+    fn running_run_jobs(&self) -> usize {
+        self.run_jobs
+            .values()
+            .filter(|s| matches!(s, norm::JobState::Running { .. }))
+            .count()
+    }
+
+    /// May one more per-run normalization start now?
+    fn has_free_job_slot(&self) -> bool {
+        self.running_run_jobs() < self.parallel_jobs.max(1)
     }
 
     /// The newest run of the IPTS whose corrected folder already exists,
@@ -2202,7 +2229,7 @@ impl MonitorApp {
                 }
             }
             // Every listed run with complete corrected data and no result
-            // yet, normalized one after the other.
+            // yet, normalized `parallel_jobs` at a time.
             let missing: Vec<u64> = self
                 .run_files
                 .iter()
@@ -2233,10 +2260,11 @@ impl MonitorApp {
                     egui::Button::new(format!("▶ normalize all missing ({})", missing.len())),
                 );
                 let button = if enabled {
-                    button.on_hover_text(
+                    button.on_hover_text(format!(
                         "Normalize every listed run that has its corrected data and no \
-                         result yet — newest first, one at a time",
-                    )
+                         result yet — newest first, up to {} at a time",
+                        self.parallel_jobs
+                    ))
                 } else {
                     button.on_disabled_hover_text(
                         "Nothing to do: every listed run is normalized, running, or \
@@ -2247,6 +2275,23 @@ impl MonitorApp {
                     self.run_queue.extend(missing);
                 }
             }
+            ui.add_space(theme::SPACE_MD);
+            ui.add(
+                egui::DragValue::new(&mut self.parallel_jobs)
+                    .range(1..=MAX_PARALLEL_JOBS)
+                    .speed(0.1),
+            )
+            .on_hover_text(
+                "How many per-run normalizations may run at the same time (queue \
+                 and automatic normalization alike). Each one is a NeuNorm python \
+                 process; 4 is a safe default on the analysis machines.",
+            );
+            let running = self.running_run_jobs();
+            ui.label(if running == 0 {
+                "parallel jobs".to_owned()
+            } else {
+                format!("parallel jobs ({running} running)")
+            });
         });
         ui.add_space(theme::SPACE_XS);
         if self.runs_view == RunsView::Timeline {
@@ -2859,15 +2904,13 @@ impl eframe::App for MonitorApp {
             }
         }
 
-        // Queued runs ("normalize all missing"): one at a time.
-        let queue_running = self
-            .run_jobs
-            .values()
-            .any(|s| matches!(s, norm::JobState::Running { .. }));
-        if !queue_running {
-            if let Some(run) = self.run_queue.pop_front() {
-                self.normalize_run_now(run);
-            }
+        // Queued runs ("normalize all missing"): fill the free slots, up
+        // to `parallel_jobs` running at once.
+        while self.has_free_job_slot() {
+            let Some(run) = self.run_queue.pop_front() else {
+                break;
+            };
+            self.normalize_run_now(run);
         }
 
         // While jobs run, keep frames coming so the spinner moves and the

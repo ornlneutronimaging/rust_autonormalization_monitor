@@ -118,8 +118,12 @@ Single view, top to bottom:
    ones typed into the run list) are left alone: when their result is not
    found in that output folder they get a **▶ normalize** button that runs
    the same per-run normalization on demand; **▶ normalize all missing**
-   in the section heading queues every such run (newest first, one at a
-   time). Selecting a different configuration file while auto
+   in the section heading queues every such run (newest first). The
+   **parallel jobs** field next to it (default 4, up to 16) says how many
+   per-run normalizations may run side by side — for the queue and for the
+   automatic normalization alike: each one is its own NeuNorm python
+   process, a burst of new runs is throttled to that many, the rest wait
+   for a free slot (retried at every refresh). Selecting a different configuration file while auto
    normalization is ON re-registers it in `autoreduction.cfg` at once, so
    the autoreduction and this app agree on the open beams. Rows are listed
    newest first, right under the upcoming run. A **📈 Timeline** tab next to the
