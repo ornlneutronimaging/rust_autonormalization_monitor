@@ -115,7 +115,12 @@ Single view, top to bottom:
    data when auto normalization was turned on (older runs, typically the
    ones typed into the run list) are left alone: when their result is not
    found in that output folder they get a **▶ normalize** button that runs
-   the same per-run normalization on demand. A **📈 Timeline** tab next to the
+   the same per-run normalization on demand; **▶ normalize all missing**
+   in the section heading queues every such run (newest first, one at a
+   time). Selecting a different configuration file while auto
+   normalization is ON re-registers it in `autoreduction.cfg` at once, so
+   the autoreduction and this app agree on the open beams. Rows are listed
+   newest first, right under the upcoming run. A **📈 Timeline** tab next to the
    table shows when each run was acquired (start → end bar per run, run
    number and duration on hover, rejected runs grayed/struck) with the
    5/15/30 min window coverage bands on top, on a shared axis in minutes

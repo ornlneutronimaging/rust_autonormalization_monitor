@@ -247,6 +247,9 @@ struct MonitorApp {
     job_output: HashMap<norm::JobTarget, std::collections::VecDeque<String>>,
     /// The job whose output panel is open, if any.
     output_view: Option<norm::JobTarget>,
+    /// Runs queued by "▶ normalize all missing": started one at a time
+    /// (each NeuNorm run is heavy) as the previous one finishes.
+    run_queue: std::collections::VecDeque<u64>,
     /// Newest run whose corrected data already existed when auto
     /// normalization was seen active: only runs AFTER it get their own
     /// normalization automatically (the app must not chew through the
@@ -307,6 +310,7 @@ impl MonitorApp {
             table_runs: std::collections::BTreeSet::new(),
             job_output: HashMap::new(),
             output_view: None,
+            run_queue: std::collections::VecDeque::new(),
             run_jobs_from: None,
             norm_tx,
             norm_rx,
@@ -358,6 +362,7 @@ impl MonitorApp {
         self.table_runs.clear();
         self.job_output.clear();
         self.output_view = None;
+        self.run_queue.clear();
         for w in &mut self.windows {
             w.runs.clear();
             w.state = norm::JobState::Idle;
@@ -652,6 +657,30 @@ impl MonitorApp {
             self.run_jobs
                 .retain(|_, state| matches!(state, norm::JobState::Running { .. }));
             self.run_jobs_config = self.selected_config.clone();
+            // Auto normalization ON and a different file selected: the
+            // shared autoreduction.cfg must follow, or the autoreduction
+            // keeps normalizing with the previous configuration.
+            if let (Ok(cfg), Some(ipts), Some(selected)) =
+                (&self.cfg, self.ipts.clone(), self.selected_config.clone())
+            {
+                let registered = cfg.get("user_autoreduction_config_file").map(Path::new);
+                if cfg.activate && registered != Some(selected.as_path()) {
+                    let rolling = cfg.rolling_combine;
+                    match config::write_full(
+                        &self.cfg_path,
+                        &ipts,
+                        &selected.display().to_string(),
+                        true,
+                        rolling,
+                    ) {
+                        Ok(()) => {
+                            self.write_error = None;
+                            self.cfg = config::read(&self.cfg_path);
+                        }
+                        Err(e) => self.write_error = Some(e),
+                    }
+                }
+            }
             // Where the results go (footer) and which detector took the
             // data (viewer orientation): from the configuration, with the
             // IPTS layout as fallback.
@@ -763,14 +792,33 @@ impl MonitorApp {
         config: &Path,
         info: &h5::ConfigInfo,
     ) {
-        let corrected = self.run_files.iter().find(|rf| rf.run == run).and_then(|rf| {
-            match &rf.corrected {
-                files::FileStatus::Present(folder) => Some(folder.clone()),
-                _ => None,
+        let corrected = match self.run_files.iter().find(|rf| rf.run == run) {
+            Some(rf) => match &rf.corrected {
+                files::FileStatus::Present(folder) => Ok(folder.clone()),
+                files::FileStatus::Writing(folder) => Err(format!(
+                    "the corrected data of run {run} is still being written — \
+                     retried automatically once the folder is complete\n{}",
+                    folder.display()
+                )),
+                files::FileStatus::Missing(expected) => Err(format!(
+                    "no corrected data for run {run} yet (autoreduction) — expected \
+                     under {}",
+                    expected.display()
+                )),
+            },
+            None => Err(format!("run {run} is not listed in the table")),
+        };
+        let corrected = match corrected {
+            Ok(folder) => folder,
+            Err(message) => {
+                // Only a run someone asked for explicitly gets the message
+                // (the automatic pass simply retries next refresh).
+                if self.run_jobs_from.is_none_or(|from| run <= from) {
+                    self.run_jobs
+                        .insert(run, norm::JobState::Failed { message, log: None });
+                }
+                return;
             }
-        });
-        let Some(corrected) = corrected else {
-            return;
         };
         let state = match norm::prepare_run_job(run, &corrected, ipts_path, config, info) {
             Ok(spec) => {
@@ -2123,6 +2171,52 @@ impl MonitorApp {
                     self.runs_view = view;
                 }
             }
+            // Every listed run with complete corrected data and no result
+            // yet, normalized one after the other.
+            let missing: Vec<u64> = self
+                .run_files
+                .iter()
+                .filter(|rf| matches!(rf.corrected, files::FileStatus::Present(_)))
+                .filter(|rf| !self.rejected.contains(&rf.run))
+                .filter(|rf| {
+                    !matches!(
+                        self.run_jobs.get(&rf.run),
+                        Some(norm::JobState::Done { .. } | norm::JobState::Running { .. })
+                    )
+                })
+                .map(|rf| rf.run)
+                .rev()
+                .collect();
+            ui.add_space(theme::SPACE_MD);
+            if !self.run_queue.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("{} run(s) queued", self.run_queue.len()))
+                        .color(theme::INFO),
+                );
+                if ui.button("✖ clear queue").clicked() {
+                    self.run_queue.clear();
+                }
+            } else {
+                let enabled = !missing.is_empty() && self.selected_config.is_some();
+                let button = ui.add_enabled(
+                    enabled,
+                    egui::Button::new(format!("▶ normalize all missing ({})", missing.len())),
+                );
+                let button = if enabled {
+                    button.on_hover_text(
+                        "Normalize every listed run that has its corrected data and no \
+                         result yet — newest first, one at a time",
+                    )
+                } else {
+                    button.on_disabled_hover_text(
+                        "Nothing to do: every listed run is normalized, running, or \
+                         waiting for its corrected data (or no configuration is selected)",
+                    )
+                };
+                if button.clicked() {
+                    self.run_queue.extend(missing);
+                }
+            }
         });
         ui.add_space(theme::SPACE_XS);
         if self.runs_view == RunsView::Timeline {
@@ -2180,7 +2274,8 @@ impl MonitorApp {
                                 ui.label("");
                                 ui.end_row();
                             }
-                            for run in &self.run_files {
+                            // Newest first, right under the upcoming run.
+                            for run in self.run_files.iter().rev() {
                                 let rejected = self.rejected.contains(&run.run);
                                 let mut run_text =
                                     egui::RichText::new(run.run.to_string()).strong();
@@ -2731,6 +2826,17 @@ impl eframe::App for MonitorApp {
                         };
                     }
                 }
+            }
+        }
+
+        // Queued runs ("normalize all missing"): one at a time.
+        let queue_running = self
+            .run_jobs
+            .values()
+            .any(|s| matches!(s, norm::JobState::Running { .. }));
+        if !queue_running {
+            if let Some(run) = self.run_queue.pop_front() {
+                self.normalize_run_now(run);
             }
         }
 
