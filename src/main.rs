@@ -320,8 +320,10 @@ impl MonitorApp {
             refresh_secs: DEFAULT_REFRESH_SECS,
         };
         app.refresh();
-        // Convenience: pre-select the IPTS (and configuration file) the
-        // shared configuration currently points at.
+        // Convenience: pre-select the IPTS the shared configuration points
+        // at. The configuration file defaults to the newest one of the
+        // IPTS (select_ipts) — the file the notebook saved last is the one
+        // to use; the registered file only fills in when the IPTS has none.
         if let Ok(cfg) = &app.cfg {
             if let Some(ipts) = cfg.get("ipts") {
                 let ipts = ipts.to_owned();
@@ -329,9 +331,11 @@ impl MonitorApp {
                     .get("user_autoreduction_config_file")
                     .map(PathBuf::from);
                 app.select_ipts(ipts);
-                if let Some(file) = registered {
-                    app.selected_config = Some(file);
-                    app.keep_selected_config();
+                if app.selected_config.is_none() {
+                    if let Some(file) = registered {
+                        app.selected_config = Some(file);
+                        app.keep_selected_config();
+                    }
                 }
             }
         }
@@ -368,7 +372,18 @@ impl MonitorApp {
             w.state = norm::JobState::Idle;
         }
         self.rescan_configs();
+        self.select_newest_config();
         self.check_runs();
+    }
+
+    /// Default configuration: the most recent `.h5` of the IPTS (the list
+    /// is sorted newest first). Auto normalization ON re-registers it in
+    /// autoreduction.cfg when it differs from the registered file.
+    fn select_newest_config(&mut self) {
+        if let Some(newest) = self.configs.first() {
+            self.selected_config = Some(newest.path.clone());
+            self.preview_error = None;
+        }
     }
 
     /// Validate the manually typed IPTS ("36967" or "IPTS-36967") and select
