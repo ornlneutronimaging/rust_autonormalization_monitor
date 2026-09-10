@@ -78,9 +78,11 @@ Single view, top to bottom:
    workflow ("stage k/n", hover for the list of stages, ✔ for the done
    ones; the script announces its stages up front, and the fill of
    unmeasured pixels — silent inside NeuNorm — is reported as its own
-   stage), and once done a
-   **👁** icon opens the result in the rust_tiff_viewer and a **📂** icon
-   opens the folder in the file manager (**↻** retries a failed run).
+   stage), and once done the
+   cell reads **✔ normalization done** (hover: time and path) with a
+   **👁 view** button opening the result in the rust_tiff_viewer and a
+   **📂 folder** button jumping to the folder in the file manager
+   (**↻** retries a failed run).
    A **📋** button on any normalized row (running, done or failed) opens an
    output panel under the table with the job's output as it streams —
    the script's own messages, the NeuNorm log lines, the runner's steps.

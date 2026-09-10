@@ -2481,14 +2481,19 @@ impl MonitorApp {
             Some(norm::JobState::Done { output, finished, .. }) => {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("✔ {}", finished.format("%H:%M:%S")))
-                            .color(theme::SUCCESS),
+                        egui::RichText::new("✔ normalization done")
+                            .color(theme::SUCCESS)
+                            .strong(),
                     )
-                    .on_hover_text(output.display().to_string());
+                    .on_hover_text(format!(
+                        "finished {}\n{}",
+                        finished.format("%Y-%m-%d %H:%M:%S"),
+                        output.display()
+                    ));
                     if ui
-                        .button("👁")
+                        .button("👁 view")
                         .on_hover_text(format!(
-                            "Open the normalized data in the TIFF viewer\n{}",
+                            "Visualize the normalized data in the TIFF viewer\n{}",
                             output.display()
                         ))
                         .clicked()
@@ -2496,9 +2501,9 @@ impl MonitorApp {
                         *view_normalized = Some(output.clone());
                     }
                     if ui
-                        .button("📂")
+                        .button("📂 folder")
                         .on_hover_text(format!(
-                            "Open the normalized folder in the file manager\n{}",
+                            "Jump to the normalized folder in the file manager\n{}",
                             output.display()
                         ))
                         .clicked()
