@@ -2435,13 +2435,40 @@ impl MonitorApp {
                 None => "Output".to_owned(),
             },
         };
-        let running = matches!(
-            match target {
-                norm::JobTarget::Run(run) => self.run_jobs.get(&run),
-                norm::JobTarget::Window(i) => self.windows.get(i).map(|w| &w.state),
-            },
-            Some(norm::JobState::Running { .. })
-        );
+        let state = match target {
+            norm::JobTarget::Run(run) => self.run_jobs.get(&run),
+            norm::JobTarget::Window(i) => self.windows.get(i).map(|w| &w.state),
+        };
+        let running = matches!(state, Some(norm::JobState::Running { .. }));
+        // What to say when no line was streamed: a job refused before the
+        // script even started only has its failure message; a result found
+        // on disk was produced elsewhere.
+        let (empty_note, empty_color) = match state {
+            Some(norm::JobState::Running { .. }) => ("no output yet…".to_owned(), theme::INFO),
+            Some(norm::JobState::Failed { message, log: None }) => (
+                format!(
+                    "The normalization was refused before NeuNorm started — nothing to \
+                     stream. Reason:\n\n{message}"
+                ),
+                theme::DANGER,
+            ),
+            Some(norm::JobState::Failed { message, log: Some(log) }) => (
+                format!("{message}\n\nfull log: {}", log.display()),
+                theme::DANGER,
+            ),
+            Some(norm::JobState::Done { output, .. }) => (
+                format!(
+                    "Result found on disk — normalized in another session or by the \
+                     workflow runner, so there is no output to show here.\n{}",
+                    output.display()
+                ),
+                theme::text_emphasis(ui.visuals()),
+            ),
+            _ => (
+                "no output kept for this job".to_owned(),
+                theme::text_emphasis(ui.visuals()),
+            ),
+        };
         ui.add_space(theme::SPACE_XS);
         let mut close = false;
         theme::section_frame(ui, |ui| {
@@ -2473,13 +2500,11 @@ impl MonitorApp {
                             );
                         }
                         _ => {
-                            ui.label(
-                                egui::RichText::new(if running {
-                                    "no output yet…"
-                                } else {
-                                    "no output kept for this job (started in another session?)"
-                                })
-                                .color(theme::text_emphasis(ui.visuals())),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&empty_note).color(empty_color),
+                                )
+                                .wrap(),
                             );
                         }
                     }
