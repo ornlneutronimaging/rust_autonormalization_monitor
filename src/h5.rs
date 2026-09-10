@@ -116,6 +116,9 @@ pub struct ConfigInfo {
     /// the workflow runner writes `Run_<run>/normalization`. `None` when
     /// absent or empty.
     pub output_folder: Option<PathBuf>,
+    /// The detector the data came from (root attribute `detector`, e.g.
+    /// `tpx1`) — decides the display orientation in the TIFF viewer.
+    pub detector: Option<String>,
 }
 
 /// Read the open-beam entries, crop flag and output folder of a
@@ -134,17 +137,20 @@ pub fn read_config_info(path: &Path) -> Result<ConfigInfo, String> {
         .and_then(|a| read_f64s(&a))
         .filter(|v| v.len() == 4 && v.iter().all(|x| x.is_finite() && *x >= 0.0))
         .map(|v| (v[0] as usize, v[1] as usize, v[2] as usize, v[3] as usize));
-    let output_folder = file
-        .attr("output_folder")
-        .ok()
-        .and_then(|a| read_strings(&a)?.into_iter().next())
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+    let root_string = |name: &str| {
+        file.attr(name)
+            .ok()
+            .and_then(|a| read_strings(&a)?.into_iter().next())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    };
+    let output_folder = root_string("output_folder").map(PathBuf::from);
+    let detector = root_string("detector");
     Ok(ConfigInfo {
         ob_folders,
         crop_region,
         output_folder,
+        detector,
     })
 }
 
@@ -200,5 +206,6 @@ mod tests {
             info.output_folder,
             Some(PathBuf::from("/SNS/VENUS/IPTS-36967/shared/jean"))
         );
+        assert_eq!(info.detector.as_deref(), Some("tpx1"));
     }
 }

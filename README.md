@@ -87,7 +87,11 @@ Single view, top to bottom:
    stage), and once done the
    cell reads **✔ normalization done** (hover: time and path) with a
    **👁 view** button opening the result in the rust_tiff_viewer and a
-   **📂 folder** button jumping to the folder in the file manager
+   **📂 folder** button jumping to the folder in the file manager. The
+   viewer is launched with `--detector <name>` (the configuration's
+   `detector` attribute, e.g. `tpx1`, else the single detector folder of
+   `shared/autoreduce/images`), so Timepix stacks open transposed the right
+   way even from a `Run_<run>/normalization` path that names no detector
    (**↻** retries a failed run). Before launching, the sample and every
    open-beam folder must hold the same number of images (NeuNorm divides
    the stacks frame by frame — the notebook's Data Quality Check refuses

@@ -788,6 +788,7 @@ mod tests {
             ob_folders: vec![],
             crop_region: None,
             output_folder: Some(PathBuf::from("/SNS/VENUS/IPTS-1/shared/jean")),
+            detector: None,
         };
         assert_eq!(
             run_output_dir(Path::new("/SNS/VENUS/IPTS-1"), 23642, &with_folder),
@@ -797,6 +798,7 @@ mod tests {
             ob_folders: vec![],
             crop_region: None,
             output_folder: None,
+            detector: None,
         };
         assert_eq!(
             run_output_dir(Path::new("/SNS/VENUS/IPTS-1"), 23642, &without),

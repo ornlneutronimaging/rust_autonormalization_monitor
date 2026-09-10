@@ -233,6 +233,11 @@ struct MonitorApp {
     /// normalization`): the selected configuration's output folder, or the
     /// IPTS default. Shown in the footer.
     output_base: Option<PathBuf>,
+    /// Detector name handed to the TIFF viewer (`--detector`, e.g. `tpx1`)
+    /// so every stack opens in the right orientation — normalized folders
+    /// (`Run_<run>/normalization`) carry no detector in their path for the
+    /// viewer to guess from. From the configuration, else the IPTS layout.
+    detector: Option<String>,
     /// Live mode: every run the table has shown this session. Rows are
     /// never dropped when a new run lands (the windows slide, the table
     /// does not — a normalization in progress must stay visible).
@@ -298,6 +303,7 @@ impl MonitorApp {
             run_jobs: HashMap::new(),
             run_jobs_config: None,
             output_base: None,
+            detector: None,
             table_runs: std::collections::BTreeSet::new(),
             job_output: HashMap::new(),
             output_view: None,
@@ -347,6 +353,7 @@ impl MonitorApp {
         self.run_jobs.clear();
         self.run_jobs_config = None;
         self.output_base = None;
+        self.detector = None;
         self.run_jobs_from = None;
         self.table_runs.clear();
         self.job_output.clear();
@@ -645,14 +652,22 @@ impl MonitorApp {
             self.run_jobs
                 .retain(|_, state| matches!(state, norm::JobState::Running { .. }));
             self.run_jobs_config = self.selected_config.clone();
-            // Where the results go, for the footer: the configuration's
-            // output folder, else the IPTS default.
-            self.output_base = self.selected_config.as_ref().map(|config| {
-                h5::read_config_info(config)
-                    .ok()
-                    .and_then(|info| info.output_folder)
+            // Where the results go (footer) and which detector took the
+            // data (viewer orientation): from the configuration, with the
+            // IPTS layout as fallback.
+            let info = self
+                .selected_config
+                .as_ref()
+                .and_then(|config| h5::read_config_info(config).ok());
+            self.output_base = self.selected_config.as_ref().map(|_| {
+                info.as_ref()
+                    .and_then(|i| i.output_folder.clone())
                     .unwrap_or_else(|| ipts_path.join("shared/autoreduce/normalized"))
             });
+            self.detector = info
+                .as_ref()
+                .and_then(|i| i.detector.clone())
+                .or_else(|| Self::detector_from_layout(&ipts_path));
         }
         match self.cfg.as_ref().map(|c| c.activate) {
             Ok(true) => {
@@ -804,9 +819,29 @@ impl MonitorApp {
         };
     }
 
+    /// The detector folder of the IPTS reduction layout
+    /// (`shared/autoreduce/images/<detector>`, e.g. `tpx1`) when there is
+    /// exactly one — the fallback when the configuration names none.
+    fn detector_from_layout(ipts_path: &Path) -> Option<String> {
+        let dir = ipts_path.join("shared/autoreduce/images");
+        let names: Vec<String> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        match names.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    }
+
     /// Open normalized-data folders in ONE TIFF viewer session (detached):
     /// the first folder is the main stack, the others are `--compare`
     /// stacks shown side by side (shared colorscale, mirrored regions).
+    /// The detector is passed along so the frames come up in the right
+    /// orientation right away.
     fn open_in_viewer(&mut self, folders: &[PathBuf]) {
         let Some((first, rest)) = folders.split_first() else {
             return;
@@ -818,6 +853,9 @@ impl MonitorApp {
             cmd.arg(first);
             for folder in rest {
                 cmd.arg("--compare").arg(folder);
+            }
+            if let Some(detector) = &self.detector {
+                cmd.arg("--detector").arg(detector);
             }
             cmd.spawn()
                 .map(|_| ())
