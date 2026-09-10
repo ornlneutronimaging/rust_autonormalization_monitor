@@ -9,8 +9,8 @@ Single view, top to bottom:
 1. **Experiment (IPTS)** — dropdown of the accessible `/SNS/VENUS/IPTS-*`
    folders (with a type-to-filter box) plus a manual entry field. Everything
    below is disabled until an IPTS is selected.
-2. **Normalization configuration** — dropdown of the
-   `<IPTS>/shared/autoreduce/configs/*.h5` files (newest first; hover for
+2. **Normalization configuration** — dropdown of the `.h5` files in
+   `<IPTS>/shared/autoreduce` and its `configs/` subfolder (newest first; hover for
    the full path), a **📂 Browse…** button to pick a configuration file
    from anywhere (the native file dialog opens in `<IPTS>/shared`), and a
    **👁 Preview** button that opens the selected file in the

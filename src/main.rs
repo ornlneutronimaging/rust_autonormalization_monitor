@@ -4,7 +4,7 @@
 //! 1. Select the IPTS (dropdown of accessible IPTS-* folders, or manual
 //!    entry). Everything below is disabled until an IPTS is chosen.
 //! 2. Select the normalization configuration file
-//!    (`<IPTS>/shared/autoreduce/configs/*.h5`, created with the marimo
+//!    (`<IPTS>/shared/autoreduce/*.h5` or its `configs/` subfolder, created with the marimo
 //!    "Normalization TOF at VENUS" notebook — a button launches that
 //!    notebook directly in the selected IPTS).
 //! 3. Either turn auto-normalization ON (every upcoming run gets
@@ -395,32 +395,47 @@ impl MonitorApp {
         }
     }
 
-    /// List `<IPTS>/shared/autoreduce/configs/*.h5`, newest first.
+    /// List the configuration files of the IPTS (`shared/autoreduce/*.h5`
+    /// and `shared/autoreduce/configs/*.h5`), newest first.
     fn rescan_configs(&mut self) {
         self.configs.clear();
         self.configs_error = None;
         let Some(ipts_path) = self.ipts_path() else {
             return;
         };
-        let dir = ipts_path.join("shared/autoreduce/configs");
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                self.configs_error = Some(format!("cannot read {}: {e}", dir.display()));
-                return;
-            }
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("h5") {
+        // The notebook saves either straight into shared/autoreduce or into
+        // its configs/ subfolder, depending on the version: scan both.
+        let autoreduce = ipts_path.join("shared/autoreduce");
+        let dirs = [autoreduce.join("configs"), autoreduce.clone()];
+        let mut readable = false;
+        for dir in &dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
+            };
+            readable = true;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_h5 = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("h5"));
+                if !is_h5 || !path.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                self.configs.push(ConfigFile { path, name, mtime });
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let mtime = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            self.configs.push(ConfigFile { path, name, mtime });
+        }
+        if !readable {
+            self.configs_error = Some(format!(
+                "cannot read {} (nor its configs/ subfolder)",
+                autoreduce.display()
+            ));
+            return;
         }
         self.configs.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         self.keep_selected_config();
@@ -1253,7 +1268,7 @@ impl MonitorApp {
                 }
                 if ui
                     .button("⟳")
-                    .on_hover_text("Rescan the configs folder")
+                    .on_hover_text("Rescan shared/autoreduce (and its configs/ subfolder)")
                     .clicked()
                 {
                     self.rescan_configs();
