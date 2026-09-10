@@ -54,7 +54,7 @@ impl Window {
 }
 
 /// What a job normalizes: one rolling window (by index) or one run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JobTarget {
     Window(usize),
     Run(u64),
@@ -70,6 +70,9 @@ pub enum JobState {
         stage: String,
         /// Progress within the stage, 0..=1 when the total is known.
         fraction: Option<f32>,
+        /// The whole workflow, in order (from the script's STAGES line);
+        /// empty until announced.
+        stages: Vec<String>,
     },
     Done {
         output: PathBuf,
@@ -85,11 +88,21 @@ pub enum JobState {
 
 /// Messages a job thread sends while it runs and when it ends.
 pub enum JobMessage {
+    /// The script's STAGES line: the workflow's stages, in order.
+    Stages {
+        target: JobTarget,
+        stages: Vec<String>,
+    },
     /// A PROGRESS line of the normalization script.
     Progress {
         target: JobTarget,
         stage: String,
         fraction: Option<f32>,
+    },
+    /// Any other output line of the job (script output, runner steps).
+    Output {
+        target: JobTarget,
+        line: String,
     },
     Finished {
         target: JobTarget,
@@ -111,6 +124,32 @@ pub fn parse_progress(line: &str) -> Option<(String, Option<f32>)> {
         _ => None, // total "-" or unparsable: indeterminate
     };
     Some((label.trim().to_owned(), fraction))
+}
+
+/// Parse the script's `STAGES <label>|<label>|...` line.
+pub fn parse_stages(line: &str) -> Option<Vec<String>> {
+    let rest = line.strip_prefix("STAGES ")?;
+    let stages: Vec<String> = rest
+        .split('|')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!stages.is_empty()).then_some(stages)
+}
+
+/// Overall progress of a job: `(index of the current stage, count)` and the
+/// 0..=1 fraction of the whole workflow (stages weighted equally, the
+/// current one by its own fraction). `None` before the stages are known or
+/// for a stage outside the announced list.
+pub fn overall_progress(
+    stages: &[String],
+    stage: &str,
+    fraction: Option<f32>,
+) -> Option<((usize, usize), f32)> {
+    let n = stages.len();
+    let i = stages.iter().position(|s| s == stage)?;
+    let within = fraction.unwrap_or(0.0).clamp(0.0, 1.0);
+    Some(((i + 1, n), ((i as f32) + within) / (n as f32)))
 }
 
 /// Fill each window with the runs whose acquisition ended within its last
@@ -370,10 +409,17 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
             fraction,
         });
     };
+    let say = |msg: &str| {
+        log.line(msg);
+        let _ = tx.send(JobMessage::Output {
+            target: spec.target,
+            line: msg.to_owned(),
+        });
+    };
 
     // Never run twice: a complete result is reused as is.
     if output_is_done(&spec.output) {
-        log.line("normalization output already there — skipped (never run twice)");
+        say("normalization output already there — skipped (never run twice)");
         return Ok(spec.output.clone());
     }
 
@@ -382,7 +428,7 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
     let (mut samples, mut obs) = (spec.samples.clone(), spec.obs.clone());
     if let Some((region, parent)) = &spec.crop {
         let (x0, y0, x1, y1) = *region;
-        log.line(&format!(
+        say(&format!(
             "pre-crop (x0, y0, x1, y1) = ({x0}, {y0}, {x1}, {y1}) into {}",
             parent.display()
         ));
@@ -424,7 +470,7 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
     for (folder, nexus) in &obs {
         cmd.arg("--ob").arg(folder).arg("--ob-nexus").arg(nexus);
     }
-    log.line(&format!("running: {cmd:?}"));
+    say(&format!("running: {cmd:?}"));
 
     // Stream the script's output: both pipes drained concurrently (a full
     // one would block the child) into one channel; PROGRESS lines feed the
@@ -460,8 +506,19 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
             progress(stage, fraction);
             continue;
         }
+        if let Some(stages) = parse_stages(&line) {
+            let _ = tx.send(JobMessage::Stages {
+                target: spec.target,
+                stages,
+            });
+            continue;
+        }
         log.raw_line(&line);
         if !line.trim().is_empty() {
+            let _ = tx.send(JobMessage::Output {
+                target: spec.target,
+                line: line.clone(),
+            });
             tail.push(line);
             if tail.len() > 8 {
                 tail.remove(0);
@@ -479,7 +536,7 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
             "normalization script failed ({status})\n{}",
             tail.join("\n")
         );
-        log.line(&format!("ERROR: {message}"));
+        say(&format!("ERROR: {message}"));
         return Err(message);
     }
 
@@ -497,7 +554,7 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
         log.line(&format!("ERROR: {message}"));
         message
     })?;
-    log.line(&format!("normalized data written to {}", spec.output.display()));
+    say(&format!("normalized data written to {}", spec.output.display()));
     Ok(spec.output.clone())
 }
 
@@ -776,6 +833,23 @@ mod tests {
         // Second call: reused, never run twice.
         assert_eq!(run_job(&spec, &tx).unwrap(), output);
         assert!(std::fs::read_to_string(&spec.log).unwrap().contains("skipped"));
+    }
+
+    #[test]
+    fn parses_stages_and_overall_progress() {
+        let stages = parse_stages("STAGES loading sample|combining runs|normalizing|exporting")
+            .unwrap();
+        assert_eq!(stages.len(), 4);
+        assert_eq!(parse_stages("STAGES "), None);
+        assert_eq!(parse_stages("PROGRESS 1/2 x"), None);
+        let ((k, n), f) = overall_progress(&stages, "combining runs", Some(0.5)).unwrap();
+        assert_eq!((k, n), (2, 4));
+        assert!((f - 0.375).abs() < 1e-6);
+        let ((k, _), f) = overall_progress(&stages, "exporting", None).unwrap();
+        assert_eq!(k, 4);
+        assert!((f - 0.75).abs() < 1e-6);
+        assert!(overall_progress(&stages, "unknown", None).is_none());
+        assert!(overall_progress(&[], "exporting", None).is_none());
     }
 
     #[test]

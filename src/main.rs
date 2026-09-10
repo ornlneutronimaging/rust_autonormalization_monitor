@@ -58,6 +58,8 @@ const TIFF_VIEWER_CMD: &str =
     "/SNS/VENUS/shared/software/git/rust_tiff_viewer/launch_rust_tiff_viewer.sh";
 /// Default rolling time windows, in minutes of acquisition time.
 const DEFAULT_WINDOWS_MIN: [u32; 3] = [5, 15, 30];
+/// Output lines kept per normalization job for the output panel.
+const OUTPUT_LINES_KEPT: usize = 600;
 
 /// Sample-environment PVs that can be overlaid on the acquisition timeline:
 /// (dataset name under `/entry/DASlogs` of the NeXus files, annotation
@@ -227,6 +229,15 @@ struct MonitorApp {
     /// The configuration the Done-on-disk entries of `run_jobs` were
     /// looked up with — its output folder decides where results live.
     run_jobs_config: Option<PathBuf>,
+    /// Live mode: every run the table has shown this session. Rows are
+    /// never dropped when a new run lands (the windows slide, the table
+    /// does not — a normalization in progress must stay visible).
+    table_runs: std::collections::BTreeSet<u64>,
+    /// Output lines of each job (script output + runner steps), newest
+    /// last, capped — shown in the output panel.
+    job_output: HashMap<norm::JobTarget, std::collections::VecDeque<String>>,
+    /// The job whose output panel is open, if any.
+    output_view: Option<norm::JobTarget>,
     /// Latest NeXus run present when auto normalization was seen active:
     /// only runs landing AFTER it get their own normalization (the app
     /// must not chew through the whole IPTS on startup). `None` while
@@ -280,6 +291,9 @@ impl MonitorApp {
             last_live_anchor: None,
             run_jobs: HashMap::new(),
             run_jobs_config: None,
+            table_runs: std::collections::BTreeSet::new(),
+            job_output: HashMap::new(),
+            output_view: None,
             run_jobs_from: None,
             norm_tx,
             norm_rx,
@@ -326,6 +340,9 @@ impl MonitorApp {
         self.run_jobs.clear();
         self.run_jobs_config = None;
         self.run_jobs_from = None;
+        self.table_runs.clear();
+        self.job_output.clear();
+        self.output_view = None;
         for w in &mut self.windows {
             w.runs.clear();
             w.state = norm::JobState::Idle;
@@ -448,7 +465,10 @@ impl MonitorApp {
         let table_runs = if !self.runs.is_empty() {
             self.runs.clone()
         } else {
-            self.window_span.clone()
+            // The span only grows during the session: a run stays listed
+            // once shown, even after the windows slid past it.
+            self.table_runs.extend(self.window_span.iter().copied());
+            self.table_runs.iter().copied().collect()
         };
         self.run_files = match self.ipts_path() {
             Some(ipts_path) if !table_runs.is_empty() => {
@@ -588,7 +608,9 @@ impl MonitorApp {
                         runs: spec.runs.clone(),
                         stage: "starting…".to_owned(),
                         fraction: None,
+                        stages: Vec::new(),
                     };
+                    self.job_output.remove(&spec.target);
                     norm::launch(spec, self.norm_tx.clone());
                 }
                 Err(message) => self.windows[i].state = norm::JobState::Failed { message, log: None },
@@ -696,11 +718,13 @@ impl MonitorApp {
         };
         let state = match norm::prepare_run_job(run, &corrected, ipts_path, config, info) {
             Ok(spec) => {
+                self.job_output.remove(&spec.target);
                 norm::launch(spec, self.norm_tx.clone());
                 norm::JobState::Running {
                     runs: vec![run],
                     stage: "starting…".to_owned(),
                     fraction: None,
+                    stages: Vec::new(),
                 }
             }
             Err(message) => norm::JobState::Failed { message, log: None },
@@ -1372,6 +1396,7 @@ impl MonitorApp {
             let mut minutes_changed = false;
             let mut view_folder: Option<PathBuf> = None;
             let mut open_log: Option<PathBuf> = None;
+            let mut output_toggle: Option<norm::JobTarget> = None;
             egui::Grid::new("windows_grid")
                 .num_columns(4)
                 .spacing([theme::SPACE_LG * 2.0, theme::SPACE_SM])
@@ -1381,7 +1406,7 @@ impl MonitorApp {
                     ui.label(theme::section_heading("Status"));
                     ui.label(theme::section_heading("Result"));
                     ui.end_row();
-                    for w in &mut self.windows {
+                    for (i, w) in self.windows.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label("last");
                             if ui
@@ -1447,33 +1472,22 @@ impl MonitorApp {
                                 );
                                 ui.label("");
                             }
-                            norm::JobState::Running { runs, stage, fraction } => {
+                            norm::JobState::Running { runs, stage, fraction, stages } => {
                                 ui.horizontal(|ui| {
-                                    // NeuNorm's own stage progress: a filling
-                                    // bar when the total is known, a moving
-                                    // one while it is not.
-                                    let bar = match fraction {
-                                        Some(f) => egui::ProgressBar::new(*f)
-                                            .desired_width(140.0)
-                                            .desired_height(14.0)
-                                            .corner_radius(3.0)
-                                            .show_percentage(),
-                                        None => egui::ProgressBar::new(0.99)
-                                            .desired_width(140.0)
-                                            .desired_height(14.0)
-                                            .corner_radius(3.0)
-                                            .animate(true),
-                                    };
-                                    ui.add(bar).on_hover_text(format!(
-                                        "normalizing {} run(s)",
-                                        runs.len()
-                                    ));
-                                    ui.label(
-                                        egui::RichText::new(stage.as_str())
-                                            .color(theme::INFO),
+                                    Self::progress_cell(
+                                        ui,
+                                        &format!("normalizing {} run(s)", runs.len()),
+                                        stage,
+                                        *fraction,
+                                        stages,
+                                        140.0,
                                     );
                                 });
-                                ui.label("");
+                                Self::output_toggle(
+                                    ui,
+                                    norm::JobTarget::Window(i),
+                                    &mut output_toggle,
+                                );
                             }
                             norm::JobState::Done { output, finished, runs } => {
                                 ui.label(
@@ -1485,16 +1499,23 @@ impl MonitorApp {
                                     .color(theme::SUCCESS),
                                 )
                                 .on_hover_text(output.display().to_string());
-                                if ui
-                                    .button("👁 view")
-                                    .on_hover_text(format!(
-                                        "Open in the TIFF viewer\n{}",
-                                        output.display()
-                                    ))
-                                    .clicked()
-                                {
-                                    view_folder = Some(output.clone());
-                                }
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button("👁 view")
+                                        .on_hover_text(format!(
+                                            "Open in the TIFF viewer\n{}",
+                                            output.display()
+                                        ))
+                                        .clicked()
+                                    {
+                                        view_folder = Some(output.clone());
+                                    }
+                                    Self::output_toggle(
+                                        ui,
+                                        norm::JobTarget::Window(i),
+                                        &mut output_toggle,
+                                    );
+                                });
                             }
                             norm::JobState::Failed { message, log } => {
                                 ui.label(
@@ -1508,8 +1529,8 @@ impl MonitorApp {
                                     }
                                     None => message.clone(),
                                 });
-                                match log {
-                                    Some(log) => {
+                                ui.horizontal(|ui| {
+                                    if let Some(log) = log {
                                         if ui
                                             .button("📄 log")
                                             .on_hover_text(format!(
@@ -1521,10 +1542,12 @@ impl MonitorApp {
                                             open_log = Some(log.clone());
                                         }
                                     }
-                                    None => {
-                                        ui.label("");
-                                    }
-                                }
+                                    Self::output_toggle(
+                                        ui,
+                                        norm::JobTarget::Window(i),
+                                        &mut output_toggle,
+                                    );
+                                });
                             }
                         }
                         ui.end_row();
@@ -1540,6 +1563,12 @@ impl MonitorApp {
             if let Some(log) = open_log {
                 self.viewer_error = None;
                 self.open_folder(&log);
+            }
+            if let Some(target) = output_toggle {
+                self.toggle_output_view(target);
+            }
+            if matches!(self.output_view, Some(norm::JobTarget::Window(_))) {
+                self.output_panel(ui);
             }
 
             ui.add_space(theme::SPACE_SM);
@@ -2013,6 +2042,7 @@ impl MonitorApp {
         let mut view_normalized: Option<PathBuf> = None;
         let mut open_normalized: Option<PathBuf> = None;
         let mut retry_run: Option<u64> = None;
+        let mut output_toggle: Option<norm::JobTarget> = None;
         let active = self.is_active();
         let watching_from = self.run_jobs_from;
         let no_config = self.selected_config.is_none();
@@ -2112,6 +2142,7 @@ impl MonitorApp {
                                     &mut view_normalized,
                                     &mut open_normalized,
                                     &mut retry_run,
+                                    &mut output_toggle,
                                 );
                                 // Reject / restore toggle.
                                 let (text, hover) = if rejected {
@@ -2153,10 +2184,161 @@ impl MonitorApp {
         if let Some(run) = retry_run {
             self.normalize_run_now(run);
         }
+        if let Some(target) = output_toggle {
+            self.toggle_output_view(target);
+        }
         if let Some(err) = &self.viewer_error {
             ui.label(
                 egui::RichText::new(format!("Cannot open: {err}")).color(theme::DANGER),
             );
+        }
+        if matches!(self.output_view, Some(norm::JobTarget::Run(_))) {
+            self.output_panel(ui);
+        }
+    }
+
+    fn toggle_output_view(&mut self, target: norm::JobTarget) {
+        self.output_view = if self.output_view == Some(target) {
+            None
+        } else {
+            Some(target)
+        };
+    }
+
+    /// Overall progress of a job: the bar spans the whole workflow ("stage
+    /// k/n", stages weighted equally) once the script announced its stages,
+    /// the current stage alone before that. Hover: every stage, the done
+    /// ones ticked.
+    fn progress_cell(
+        ui: &mut egui::Ui,
+        what: &str,
+        stage: &str,
+        fraction: Option<f32>,
+        stages: &[String],
+        width: f32,
+    ) {
+        let overall = norm::overall_progress(stages, stage, fraction);
+        let bar = match (overall, fraction) {
+            (Some((_, f)), _) => egui::ProgressBar::new(f)
+                .desired_width(width)
+                .desired_height(14.0)
+                .corner_radius(3.0)
+                .show_percentage(),
+            (None, Some(f)) => egui::ProgressBar::new(f)
+                .desired_width(width)
+                .desired_height(14.0)
+                .corner_radius(3.0)
+                .show_percentage(),
+            (None, None) => egui::ProgressBar::new(0.99)
+                .desired_width(width)
+                .desired_height(14.0)
+                .corner_radius(3.0)
+                .animate(true),
+        };
+        let mut hover = what.to_owned();
+        if let Some(((k, n), _)) = overall {
+            hover.push_str(&format!("\nstage {k}/{n}"));
+            for (i, s) in stages.iter().enumerate() {
+                let mark = if i + 1 < k {
+                    "✔"
+                } else if i + 1 == k {
+                    "▶"
+                } else {
+                    "·"
+                };
+                hover.push_str(&format!("\n {mark} {s}"));
+            }
+        } else {
+            hover.push_str(&format!("\n{stage}"));
+        }
+        ui.add(bar).on_hover_text(hover);
+        let text = match overall {
+            Some(((k, n), _)) => format!("{k}/{n} {stage}"),
+            None => stage.to_owned(),
+        };
+        ui.label(egui::RichText::new(text).color(theme::INFO).small());
+    }
+
+    /// "📋" button toggling the output panel of one job.
+    fn output_toggle(
+        ui: &mut egui::Ui,
+        target: norm::JobTarget,
+        output_toggle: &mut Option<norm::JobTarget>,
+    ) {
+        if ui
+            .button("📋")
+            .on_hover_text("Show / hide the output of this normalization")
+            .clicked()
+        {
+            *output_toggle = Some(target);
+        }
+    }
+
+    /// The output of the job in `output_view`: its lines (script output and
+    /// runner steps), newest at the bottom, in a scrolling monospace box.
+    fn output_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(target) = self.output_view else {
+            return;
+        };
+        let title = match target {
+            norm::JobTarget::Run(run) => format!("Output — run {run}"),
+            norm::JobTarget::Window(i) => match self.windows.get(i) {
+                Some(w) => format!("Output — window last {} min", w.minutes),
+                None => "Output".to_owned(),
+            },
+        };
+        let running = matches!(
+            match target {
+                norm::JobTarget::Run(run) => self.run_jobs.get(&run),
+                norm::JobTarget::Window(i) => self.windows.get(i).map(|w| &w.state),
+            },
+            Some(norm::JobState::Running { .. })
+        );
+        ui.add_space(theme::SPACE_XS);
+        let mut close = false;
+        theme::section_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::section_heading(&title));
+                if running {
+                    ui.spinner();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✖ close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            let lines = self.job_output.get(&target);
+            egui::ScrollArea::vertical()
+                .id_salt(("job_output", format!("{target:?}")))
+                .max_height(220.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    match lines {
+                        Some(lines) if !lines.is_empty() => {
+                            let text: String =
+                                lines.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n");
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(text).monospace().small())
+                                    .wrap(),
+                            );
+                        }
+                        _ => {
+                            ui.label(
+                                egui::RichText::new(if running {
+                                    "no output yet…"
+                                } else {
+                                    "no output kept for this job (started in another session?)"
+                                })
+                                .color(theme::text_emphasis(ui.visuals())),
+                            );
+                        }
+                    }
+                });
+        });
+        if close {
+            self.output_view = None;
         }
     }
 
@@ -2174,7 +2356,9 @@ impl MonitorApp {
         view_normalized: &mut Option<PathBuf>,
         open_normalized: &mut Option<PathBuf>,
         retry_run: &mut Option<u64>,
+        output_toggle: &mut Option<norm::JobTarget>,
     ) {
+        let target = norm::JobTarget::Run(run.run);
         let dim = theme::text_emphasis(ui.visuals());
         match state {
             None | Some(norm::JobState::Idle) => {
@@ -2230,23 +2414,17 @@ impl MonitorApp {
                     }
                 }
             }
-            Some(norm::JobState::Running { stage, fraction, .. }) => {
+            Some(norm::JobState::Running { stage, fraction, stages, .. }) => {
                 ui.horizontal(|ui| {
-                    let bar = match fraction {
-                        Some(f) => egui::ProgressBar::new(*f)
-                            .desired_width(110.0)
-                            .desired_height(14.0)
-                            .corner_radius(3.0)
-                            .show_percentage(),
-                        None => egui::ProgressBar::new(0.99)
-                            .desired_width(110.0)
-                            .desired_height(14.0)
-                            .corner_radius(3.0)
-                            .animate(true),
-                    };
-                    ui.add(bar)
-                        .on_hover_text(format!("normalizing run {}\n{stage}", run.run));
-                    ui.label(egui::RichText::new(stage.as_str()).color(theme::INFO).small());
+                    Self::progress_cell(
+                        ui,
+                        &format!("normalizing run {}", run.run),
+                        stage,
+                        *fraction,
+                        stages,
+                        110.0,
+                    );
+                    Self::output_toggle(ui, target, output_toggle);
                 });
             }
             Some(norm::JobState::Done { output, finished, .. }) => {
@@ -2276,6 +2454,7 @@ impl MonitorApp {
                     {
                         *open_normalized = Some(output.clone());
                     }
+                    Self::output_toggle(ui, target, output_toggle);
                 });
             }
             Some(norm::JobState::Failed { message, log }) => {
@@ -2305,6 +2484,7 @@ impl MonitorApp {
                     {
                         *retry_run = Some(run.run);
                     }
+                    Self::output_toggle(ui, target, output_toggle);
                 });
             }
         }
@@ -2321,6 +2501,20 @@ impl eframe::App for MonitorApp {
         // Collect progress and outcomes of the normalization jobs.
         while let Ok(message) = self.norm_rx.try_recv() {
             match message {
+                norm::JobMessage::Stages { target, stages } => {
+                    if let Some(norm::JobState::Running { stages: s, .. }) =
+                        self.job_state_mut(target)
+                    {
+                        *s = stages;
+                    }
+                }
+                norm::JobMessage::Output { target, line } => {
+                    let lines = self.job_output.entry(target).or_default();
+                    lines.push_back(line);
+                    while lines.len() > OUTPUT_LINES_KEPT {
+                        lines.pop_front();
+                    }
+                }
                 norm::JobMessage::Progress { target, stage, fraction } => {
                     if let Some(norm::JobState::Running {
                         stage: s,

@@ -53,7 +53,9 @@ Single view, top to bottom:
      curve per stack — images only for now).
      Windows log into `rolling/anchor_<run>/logs/last_<N>min.log`.
 5. **Runs in use table** — lists the runs the windows use (the manual
-   list, or the widest window in live mode). When auto normalization is
+   list, or — in live mode — every run the widest window has covered since
+   the session started: a new run slides the windows, never drops a row,
+   so a normalization in progress stays visible). When auto normalization is
    ON, the first row is the **upcoming run** (highest run in
    `<IPTS>/nexus` + 1, refreshed automatically) that will be normalized
    next. Each row has a **👁 Preview** button opening the run's corrected
@@ -70,9 +72,16 @@ Single view, top to bottom:
    until the run's corrected folder exists (the Corrected column turns
    green), then NeuNorm runs with the selected configuration file whose
    sample is replaced by that run (open beams and settings unchanged) —
-   a progress bar fills in the Normalized column, and once done a
+   a progress bar fills in the Normalized column, spanning the WHOLE
+   workflow ("stage k/n", hover for the list of stages, ✔ for the done
+   ones; the script announces its stages up front, and the fill of
+   unmeasured pixels — silent inside NeuNorm — is reported as its own
+   stage), and once done a
    **👁** icon opens the result in the rust_tiff_viewer and a **📂** icon
    opens the folder in the file manager (**↻** retries a failed run).
+   A **📋** button on any normalized row (running, done or failed) opens an
+   output panel under the table with the job's output as it streams —
+   the script's own messages, the NeuNorm log lines, the runner's steps.
    The job runs exactly like the workflow runner's: a result already
    there is never redone, the inputs are pre-cropped on disk when the
    configuration has a crop region, and the script's output is streamed
