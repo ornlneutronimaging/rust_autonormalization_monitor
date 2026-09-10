@@ -69,8 +69,10 @@ Single view, top to bottom:
    the next run.
    With auto normalization ON, every run that lands from then on is
    normalized **on its own** by this app: the row shows **⏳ waiting**
-   until the run's corrected folder exists (the Corrected column turns
-   green), then NeuNorm runs with the selected configuration file whose
+   until the run's corrected folder is complete (the Corrected column
+   turns green — a folder the reduction is still filling shows an amber
+   ⏳: the images land first, the `*_Spectra.txt` / `summary.json`
+   sidecars last, and only then is the data used), then NeuNorm runs with the selected configuration file whose
    sample is replaced by that run (open beams and settings unchanged) —
    a progress bar fills in the Normalized column, spanning the WHOLE
    workflow ("stage k/n", hover for the list of stages, ✔ for the done

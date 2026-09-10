@@ -137,10 +137,36 @@ pub fn latest_nexus_run(ipts_path: &Path) -> Option<u64> {
 /// Presence of one of a run's files/folders on disk.
 #[derive(Clone, Debug)]
 pub enum FileStatus {
-    /// The file/folder exists at this path.
+    /// The file exists / the folder is complete at this path.
     Present(PathBuf),
+    /// The folder exists but is still being written: no image yet, or the
+    /// end-of-run sidecars (`summary.json` / `*_Spectra.txt`, written last)
+    /// are not there yet. Not usable as an input.
+    Writing(PathBuf),
     /// Not found; the path is where it was expected / searched for.
     Missing(PathBuf),
+}
+
+/// Is a run folder complete? The reduction (and the DAQ) create the folder
+/// first, write the TIFF images, then the sidecars — `*_Spectra.txt`,
+/// `summary.json` last. Complete = at least one TIFF and one of those.
+pub fn folder_complete(folder: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return false;
+    };
+    let (mut tiff, mut sidecar) = (false, false);
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name.ends_with(".tif") || name.ends_with(".tiff") {
+            tiff = true;
+        } else if name == "summary.json" || name.ends_with("_spectra.txt") {
+            sidecar = true;
+        }
+        if tiff && sidecar {
+            return true;
+        }
+    }
+    false
 }
 
 /// Status of every tracked file of one run.
@@ -179,7 +205,8 @@ pub fn check_runs(ipts_path: &Path, runs: &[u64]) -> Vec<RunFiles> {
 
 fn dir_status(found: &HashMap<u64, PathBuf>, run: u64, root: &Path) -> FileStatus {
     match found.get(&run) {
-        Some(path) => FileStatus::Present(path.clone()),
+        Some(path) if folder_complete(path) => FileStatus::Present(path.clone()),
+        Some(path) => FileStatus::Writing(path.clone()),
         None => FileStatus::Missing(root.join(format!("**/*Run_{run}*"))),
     }
 }
@@ -255,12 +282,16 @@ mod tests {
         let _ = fs::remove_dir_all(&ipts);
         fs::create_dir_all(ipts.join("nexus")).unwrap();
         fs::write(ipts.join("nexus/VENUS_11.nxs.h5"), "x").unwrap();
-        fs::create_dir_all(ipts.join("images/tpx1/raw/radiography/t/20260101_Run_11_t_0"))
-            .unwrap();
-        fs::create_dir_all(
-            ipts.join("shared/autoreduce/images/tpx1/raw/radiography/t/20260101_Run_12_t_0"),
-        )
-        .unwrap();
+        let raw11 = ipts.join("images/tpx1/raw/radiography/t/20260101_Run_11_t_0");
+        fs::create_dir_all(&raw11).unwrap();
+        // Complete folder: images + the end-of-run sidecar.
+        fs::write(raw11.join("20260101_Run_11_t_0_00000.tif"), "x").unwrap();
+        fs::write(raw11.join("20260101_Run_11_t_0_Spectra.txt"), "x").unwrap();
+        let corr12 =
+            ipts.join("shared/autoreduce/images/tpx1/raw/radiography/t/20260101_Run_12_t_0");
+        fs::create_dir_all(&corr12).unwrap();
+        // Still being written: images only, no sidecar yet.
+        fs::write(corr12.join("20260101_Run_12_t_0_00000.tif"), "x").unwrap();
 
         let status = check_runs(&ipts, &[11, 12]);
         assert_eq!(status.len(), 2);
@@ -269,6 +300,14 @@ mod tests {
         assert!(matches!(status[0].corrected, FileStatus::Missing(_)));
         assert!(matches!(status[1].nexus, FileStatus::Missing(_)));
         assert!(matches!(status[1].raw, FileStatus::Missing(_)));
-        assert!(matches!(status[1].corrected, FileStatus::Present(_)));
+        assert!(matches!(status[1].corrected, FileStatus::Writing(_)));
+        // The reduction finishes: summary.json lands last.
+        fs::write(corr12.join("summary.json"), "{}").unwrap();
+        let status = check_runs(&ipts, &[12]);
+        assert!(matches!(status[0].corrected, FileStatus::Present(_)));
+        // An empty folder is being written too, not complete.
+        let empty = ipts.join("shared/autoreduce/images/tpx1/raw/radiography/t/20260101_Run_13_t_0");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(!folder_complete(&empty));
     }
 }

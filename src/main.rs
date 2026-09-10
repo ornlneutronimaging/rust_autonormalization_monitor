@@ -1673,6 +1673,18 @@ impl MonitorApp {
                 )
                 .on_hover_text(path.display().to_string());
             }
+            files::FileStatus::Writing(path) => {
+                ui.label(
+                    egui::RichText::new("⏳")
+                        .color(theme::WARNING)
+                        .size(16.0),
+                )
+                .on_hover_text(format!(
+                    "being written — the folder is there but not complete yet \
+                     (images + Spectra.txt / summary.json)\n{}",
+                    path.display()
+                ));
+            }
             files::FileStatus::Missing(path) => {
                 ui.label(
                     egui::RichText::new("✘")
@@ -2402,6 +2414,12 @@ impl MonitorApp {
                             "Corrected data found — launching NeuNorm",
                             theme::INFO,
                         ),
+                        files::FileStatus::Writing(_) => (
+                            "⏳ waiting",
+                            "The corrected data is still being written — normalizing \
+                             this run as soon as the folder is complete",
+                            theme::INFO,
+                        ),
                         files::FileStatus::Missing(_) => (
                             "⏳ waiting",
                             "Waiting for the corrected data (autoreduction) before \
@@ -2433,6 +2451,12 @@ impl MonitorApp {
                             {
                                 *retry_run = Some(run.run);
                             }
+                        }
+                        files::FileStatus::Writing(_) => {
+                            ui.label(egui::RichText::new("—").color(dim)).on_hover_text(
+                                "Corrected data still being written — nothing to \
+                                 normalize yet",
+                            );
                         }
                         files::FileStatus::Missing(_) => {
                             ui.label(egui::RichText::new("—").color(dim))
