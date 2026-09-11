@@ -216,6 +216,12 @@ struct MonitorApp {
             chrono::DateTime<chrono::FixedOffset>,
         ),
     >,
+    /// Where the DAQ filed each run's images (its NeXus
+    /// `BL10:Exp:IM:ImageFilePath` log, read once): a path under an
+    /// `alignment` folder marks an alignment run — never corrected by the
+    /// autoreduction, no normalization needed. Such a run stays listed
+    /// but is neither waited for nor put in the windows.
+    image_path_cache: HashMap<u64, String>,
     /// Which view of section 5 is open: the table or the acquisition
     /// timeline plot.
     runs_view: RunsView,
@@ -310,6 +316,7 @@ impl MonitorApp {
                 .map(|&m| norm::Window::new(m))
                 .collect(),
             time_cache: HashMap::new(),
+            image_path_cache: HashMap::new(),
             runs_view: RunsView::Table,
             timeline_pv: None,
             pv_cache: HashMap::new(),
@@ -367,6 +374,7 @@ impl MonitorApp {
         self.viewer_error = None;
         self.selected_config = None;
         self.time_cache.clear();
+        self.image_path_cache.clear();
         self.pv_cache.clear();
         self.rejected.clear();
         self.last_live_anchor = None;
@@ -538,6 +546,19 @@ impl MonitorApp {
             }
             _ => Vec::new(),
         };
+        // Once a run's NeXus is there, find out what kind of run it is: an
+        // alignment run is shown as such and never waited for.
+        if let Some(ipts_path) = self.ipts_path() {
+            let present: Vec<u64> = self
+                .run_files
+                .iter()
+                .filter(|rf| matches!(rf.nexus, files::FileStatus::Present(_)))
+                .map(|rf| rf.run)
+                .collect();
+            for run in present {
+                self.classify_run(&ipts_path, run);
+            }
+        }
         self.launch_run_jobs();
         // The next NeXus that will land in the IPTS (latest one + 1): what
         // auto-normalization will process next.
@@ -586,6 +607,7 @@ impl MonitorApp {
                     times.1
                 }
             };
+            self.classify_run(&ipts_path, run);
             // The anchor is the newest run, rejected or not: rejecting the
             // latest run(s) must not slide the span back onto older runs —
             // the table just keeps waiting for the next run to show up.
@@ -604,11 +626,13 @@ impl MonitorApp {
         }
         // Rejected runs never enter the windows (the windows anchor on the
         // newest kept run inside the span), but stay in the table span so
-        // they can be restored. When every run of the span is rejected the
-        // windows are simply empty until a new run lands.
+        // they can be restored; alignment runs likewise (nothing to
+        // normalize, and no corrected data would ever come). When every
+        // run of the span is out the windows are simply empty until a new
+        // run lands.
         let kept: Vec<(u64, chrono::DateTime<chrono::FixedOffset>)> = end_times
             .iter()
-            .filter(|(run, _)| !self.rejected.contains(run))
+            .filter(|(run, _)| !self.rejected.contains(run) && !self.is_alignment(*run))
             .copied()
             .collect();
         norm::assign_windows(&mut self.windows, &kept);
@@ -760,11 +784,12 @@ impl MonitorApp {
         let Some(config) = self.selected_config.clone() else {
             return; // nothing to look up or normalize with — retried next refresh
         };
+        // Alignment runs are left alone: nothing to look up or normalize.
         let pending: Vec<u64> = self
             .run_files
             .iter()
             .map(|rf| rf.run)
-            .filter(|run| !self.run_jobs.contains_key(run))
+            .filter(|run| !self.run_jobs.contains_key(run) && !self.is_alignment(*run))
             .collect();
         if pending.is_empty() {
             return;
@@ -1016,6 +1041,27 @@ impl MonitorApp {
     /// Is auto-normalization currently active (per the shared config file)?
     fn is_active(&self) -> bool {
         self.cfg.as_ref().map(|c| c.activate).unwrap_or(false)
+    }
+
+    /// Is a run an alignment run, per the image folder its NeXus records?
+    /// A run whose NeXus could not be read yet counts as a regular run
+    /// (classified on a later refresh).
+    fn is_alignment(&self, run: u64) -> bool {
+        self.image_path_cache
+            .get(&run)
+            .is_some_and(|path| h5::image_path_is_alignment(path))
+    }
+
+    /// Read (once) where the DAQ filed a run's images, from its NeXus —
+    /// nothing is stored when the file is missing or still being written,
+    /// so the next refresh retries.
+    fn classify_run(&mut self, ipts_path: &Path, run: u64) {
+        if self.image_path_cache.contains_key(&run) {
+            return;
+        }
+        if let Some(path) = h5::nexus_image_path(&files::nexus_path(ipts_path, run)) {
+            self.image_path_cache.insert(run, path);
+        }
     }
 
     /// Did the user opt the rolling combine & compare windows into the
@@ -1872,13 +1918,21 @@ impl MonitorApp {
     fn runs_timeline(&mut self, ui: &mut egui::Ui) {
         use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text, VLine};
         theme::section_frame(ui, |ui| {
-            // (run, start, end, rejected) in table order (ascending runs).
+            // (run, start, end, out) in table order (ascending runs); `out`
+            // names why a run is not in the windows (rejected, alignment).
             let bars_data: Vec<_> = self
                 .run_files
                 .iter()
                 .filter_map(|rf| {
                     self.time_cache.get(&rf.run).map(|(start, end)| {
-                        (rf.run, *start, *end, self.rejected.contains(&rf.run))
+                        let out = if self.rejected.contains(&rf.run) {
+                            Some("rejected")
+                        } else if self.is_alignment(rf.run) {
+                            Some("alignment")
+                        } else {
+                            None
+                        };
+                        (rf.run, *start, *end, out)
                     })
                 })
                 .collect();
@@ -1916,7 +1970,7 @@ impl MonitorApp {
             // Same anchor as the windows: newest end among non-rejected runs.
             let anchor = bars_data
                 .iter()
-                .filter(|(_, _, _, rejected)| !rejected)
+                .filter(|(_, _, _, out)| out.is_none())
                 .map(|(_, _, end, _)| *end)
                 .max()
                 .unwrap_or_else(|| {
@@ -1937,7 +1991,7 @@ impl MonitorApp {
                 .map(|(_, start, _, _)| to_min(start))
                 .fold(0.0_f64, f64::min)
                 .min(-f64::from(self.windows.iter().map(|w| w.minutes).max().unwrap_or(0)));
-            for (i, (run, start, end, rejected)) in bars_data.iter().enumerate() {
+            for (i, (run, start, end, out)) in bars_data.iter().enumerate() {
                 let (s, e) = (to_min(start), to_min(end));
                 // A visible sliver even for very short acquisitions.
                 let value = (e - s).max(-span_min * 0.004);
@@ -1945,7 +1999,7 @@ impl MonitorApp {
                     Bar::new(i as f64, value)
                         .base_offset(s)
                         .width(0.6)
-                        .fill(if *rejected {
+                        .fill(if out.is_some() {
                             egui::Color32::from_gray(if dark { 110 } else { 150 })
                         } else {
                             theme::PRIMARY
@@ -1954,14 +2008,14 @@ impl MonitorApp {
                             // En dash, not "→": the arrow glyph is missing
                             // from egui's default font (renders as a box).
                             "run {run}{}\n{} – {}  ({:.1} min)",
-                            if *rejected { " (rejected)" } else { "" },
+                            out.map(|why| format!(" ({why})")).unwrap_or_default(),
                             start.format("%H:%M:%S"),
                             end.format("%H:%M:%S"),
                             e - s
                         )),
                 );
                 let mut label = egui::RichText::new(run.to_string()).size(11.0);
-                if *rejected {
+                if *out == Some("rejected") {
                     label = label.strikethrough();
                 }
                 texts.push(
@@ -2234,7 +2288,7 @@ impl MonitorApp {
                 .run_files
                 .iter()
                 .filter(|rf| matches!(rf.corrected, files::FileStatus::Present(_)))
-                .filter(|rf| !self.rejected.contains(&rf.run))
+                .filter(|rf| !self.rejected.contains(&rf.run) && !self.is_alignment(rf.run))
                 .filter(|rf| {
                     !matches!(
                         self.run_jobs.get(&rf.run),
@@ -2352,22 +2406,38 @@ impl MonitorApp {
                             // Newest first, right under the upcoming run.
                             for run in self.run_files.iter().rev() {
                                 let rejected = self.rejected.contains(&run.run);
+                                let alignment = self.is_alignment(run.run);
+                                let dim = theme::text_emphasis(ui.visuals());
                                 let mut run_text =
                                     egui::RichText::new(run.run.to_string()).strong();
                                 if rejected {
-                                    run_text = run_text
-                                        .strikethrough()
-                                        .color(theme::text_emphasis(ui.visuals()));
+                                    run_text = run_text.strikethrough().color(dim);
                                 }
                                 let label = ui.label(run_text);
                                 if rejected {
                                     label.on_hover_text(
                                         "Rejected — excluded from the windows",
                                     );
+                                } else if alignment {
+                                    label.on_hover_text(
+                                        "Alignment run — no normalization needed",
+                                    );
                                 }
                                 Self::status_cell(ui, &run.nexus);
                                 Self::status_cell(ui, &run.raw);
-                                Self::status_cell(ui, &run.corrected);
+                                // Corrected: an alignment run is never
+                                // corrected by the autoreduction — not
+                                // checked (unless a folder is there anyway).
+                                if alignment
+                                    && !matches!(run.corrected, files::FileStatus::Present(_))
+                                {
+                                    ui.label(egui::RichText::new("—").color(dim)).on_hover_text(
+                                        "Alignment run — the autoreduction does not correct \
+                                         alignment runs: nothing to wait for",
+                                    );
+                                } else {
+                                    Self::status_cell(ui, &run.corrected);
+                                }
                                 // Preview: the corrected data in the viewer.
                                 match &run.corrected {
                                     files::FileStatus::Present(folder) => {
@@ -2384,12 +2454,12 @@ impl MonitorApp {
                                         }
                                     }
                                     _ => {
-                                        ui.label(
-                                            egui::RichText::new("—").color(
-                                                theme::text_emphasis(ui.visuals()),
-                                            ),
-                                        )
-                                        .on_hover_text("No corrected data yet");
+                                        ui.label(egui::RichText::new("—").color(dim))
+                                            .on_hover_text(if alignment {
+                                                "Alignment run — no corrected data to preview"
+                                            } else {
+                                                "No corrected data yet"
+                                            });
                                     }
                                 }
                                 // Normalized: this run's own normalization.
@@ -2399,6 +2469,7 @@ impl MonitorApp {
                                     ui,
                                     run,
                                     self.run_jobs.get(&run.run),
+                                    self.image_path_cache.get(&run.run).filter(|_| alignment),
                                     watched && !rejected,
                                     no_config,
                                     &mut view_normalized,
@@ -2406,7 +2477,15 @@ impl MonitorApp {
                                     &mut retry_run,
                                     &mut output_toggle,
                                 );
-                                // Reject / restore toggle.
+                                // Reject / restore toggle — moot for an
+                                // alignment run, never in the windows.
+                                if alignment {
+                                    ui.label(egui::RichText::new("—").color(dim)).on_hover_text(
+                                        "Alignment run — never part of the windows",
+                                    );
+                                    ui.end_row();
+                                    continue;
+                                }
                                 let (text, hover) = if rejected {
                                     ("↩ restore", "Put this run back in the windows")
                                 } else {
@@ -2694,6 +2773,7 @@ impl MonitorApp {
         ui: &mut egui::Ui,
         run: &files::RunFiles,
         state: Option<&norm::JobState>,
+        alignment_folder: Option<&String>,
         watched: bool,
         no_config: bool,
         view_normalized: &mut Option<PathBuf>,
@@ -2703,6 +2783,21 @@ impl MonitorApp {
     ) {
         let target = norm::JobTarget::Run(run.run);
         let dim = theme::text_emphasis(ui.visuals());
+        // An alignment run (its NeXus files it under images/…/alignment):
+        // nothing to normalize — said once its NeXus is read, unless a
+        // result exists anyway (then the result is shown as usual).
+        if let (Some(folder), None | Some(norm::JobState::Idle)) = (alignment_folder, state) {
+            ui.label(
+                egui::RichText::new("alignment run — no normalization needed").color(dim),
+            )
+            .on_hover_text(format!(
+                "The NeXus records this run's images under an alignment folder \
+                 (BL10:Exp:IM:ImageFilePath log): an alignment run is not corrected \
+                 by the autoreduction and is not normalized — nothing to check or \
+                 wait for\n{folder}"
+            ));
+            return;
+        }
         match state {
             None | Some(norm::JobState::Idle) => {
                 if watched {

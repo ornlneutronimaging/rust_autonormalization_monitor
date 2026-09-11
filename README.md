@@ -98,6 +98,15 @@ Single view, top to bottom:
    open-beam folder must hold the same number of images (NeuNorm divides
    the stacks frame by frame — the notebook's Data Quality Check refuses
    the same way); otherwise the row fails at once with the counts.
+   **Alignment runs** are recognized as soon as their NeXus is there: the
+   DAQ files them under `images/<detector>/alignment/…` and records that
+   folder in the NeXus (`BL10:Exp:IM:ImageFilePath` log, last value); the
+   autoreduction never corrects them. Such a row reads **alignment run —
+   no normalization needed** (hover: the recorded folder), its Corrected
+   cell is not checked, it gets no ▶ normalize button, is skipped by
+   "normalize all missing" and never enters the windows (nor the timeline
+   anchor — the bar is greyed and tagged "(alignment)" like a rejected
+   run's).
    A **📋** button on any normalized row (running, done or failed) opens an
    output panel under the table with the job's output as it streams —
    the script's own messages, the NeuNorm log lines, the runner's steps.

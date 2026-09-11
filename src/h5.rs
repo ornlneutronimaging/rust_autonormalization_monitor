@@ -1,5 +1,6 @@
-//! Minimal HDF5 reading: acquisition times from a VENUS NeXus file and the
-//! open-beam entries of a normalization session configuration. The tolerant
+//! Minimal HDF5 reading: acquisition times and the alignment flag of a
+//! VENUS NeXus file, and the open-beam entries of a normalization session
+//! configuration. The tolerant
 //! string reading follows `rust_nexus_viewer`'s `h5io` module (the proven
 //! way to read h5py-written files with `hdf5-metno`).
 
@@ -61,6 +62,39 @@ pub fn nexus_times(path: &Path) -> Option<(DateTime<FixedOffset>, DateTime<Fixed
         DateTime::parse_from_rfc3339(start.trim()).ok()?,
         DateTime::parse_from_rfc3339(end.trim()).ok()?,
     ))
+}
+
+/// DASlogs entry recording where the DAQ wrote the run's images,
+/// relative to the IPTS folder (e.g. `images/tpx1/raw/radiography/<title>/
+/// <run folder>`, or `images/tpx1/alignment/…` for an alignment run).
+const IMAGE_FILE_PATH_LOG: &str = "entry/DASlogs/BL10:Exp:IM:ImageFilePath/value";
+
+/// Where the DAQ wrote the run's images, relative to the IPTS folder,
+/// from the `BL10:Exp:IM:ImageFilePath` log of its NeXus file. The log
+/// is a time series: its first value is usually the PREVIOUS run's folder
+/// (the value at the start of the run, before the DAQ set the new one), so
+/// the last value is the run's own. Trailing padding of the fixed-length
+/// string removed. `None` when the file is missing, still being written,
+/// or has no such log.
+pub fn nexus_image_path(path: &Path) -> Option<String> {
+    let file = h5::File::open(path).ok()?;
+    dataset_strings(&file, IMAGE_FILE_PATH_LOG)?
+        .into_iter()
+        .rev()
+        .map(|s| s.trim().to_owned())
+        .find(|s| !s.is_empty())
+}
+
+/// Is the image folder recorded by [`nexus_image_path`] that of an
+/// alignment run? The DAQ files alignment runs under an `alignment` folder
+/// of the IPTS `images` tree (instead of `raw/…` or `ob/…`). Alignment
+/// runs are never corrected by the autoreduction and need no
+/// normalization. An `alignment` path component (any case) anywhere in
+/// the path tells.
+pub fn image_path_is_alignment(image_path: &str) -> bool {
+    image_path
+        .split(['/', '\\'])
+        .any(|part| part.trim().eq_ignore_ascii_case("alignment"))
 }
 
 /// Numeric dataset read as f64 whatever its stored numeric flavor (the
@@ -172,6 +206,42 @@ mod tests {
         assert!(start <= end);
         // Missing file → None, no panic.
         assert!(nexus_times(Path::new("/nonexistent.nxs.h5")).is_none());
+    }
+
+    #[test]
+    fn classifies_image_paths() {
+        assert!(image_path_is_alignment(
+            "images/tpx1/alignment/20260910_x_10_000s/20260910_Run_29949_x_10_000s"
+        ));
+        assert!(image_path_is_alignment("images/tpx1/ALIGNMENT/foo   "));
+        assert!(!image_path_is_alignment(
+            "images/tpx1/raw/radiography/20260910_t/20260910_Run_29955_t_0"
+        ));
+        assert!(!image_path_is_alignment("images/tpx1/ob/20260910_ob/20260910_Run_29962_ob_0"));
+        // A title mentioning alignment is not an alignment folder.
+        assert!(!image_path_is_alignment("images/tpx1/raw/radiography/alignment_test/Run_1"));
+        assert!(!image_path_is_alignment(""));
+    }
+
+    #[test]
+    fn detects_alignment_runs_of_a_real_ipts() {
+        let ipts = Path::new("/SNS/VENUS/IPTS-37705/nexus");
+        if !ipts.is_dir() {
+            return;
+        }
+        // 29949 was filed under images/tpx1/alignment, 29955 under raw/
+        // (the log's first value is the previous run's folder — the last
+        // one must be used).
+        let alignment = |run: u64| {
+            nexus_image_path(&ipts.join(format!("VENUS_{run}.nxs.h5")))
+                .map(|p| image_path_is_alignment(&p))
+        };
+        assert_eq!(alignment(29949), Some(true));
+        assert_eq!(alignment(29955), Some(false));
+        assert!(nexus_image_path(&ipts.join("VENUS_29955.nxs.h5"))
+            .is_some_and(|p| p.ends_with("Run_29955_Fe_powder_11mm_1_190C_1_000AngsMin_0")));
+        // Missing file → None, no panic.
+        assert_eq!(nexus_image_path(Path::new("/nonexistent.nxs.h5")), None);
     }
 
     #[test]
