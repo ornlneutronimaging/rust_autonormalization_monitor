@@ -18,6 +18,12 @@
 //!    the row shows the progress, then view / open-folder icons. Older
 //!    runs show the same icons when their result already sits in the
 //!    configuration's output folder, or a button to normalize them now.
+//!    Each row also names the open beam(s) its normalization uses. An
+//!    open-beam run (filed under `images/…/ob` by the DAQ) is never
+//!    normalized; once its corrected data is there, a banner offers to
+//!    make it (them, when several landed) the open beam(s) of the runs to
+//!    come — a copy of the configuration with the new open beams is
+//!    written next to it and selected.
 
 mod config;
 mod files;
@@ -160,6 +166,72 @@ struct ConfigFile {
     mtime: std::time::SystemTime,
 }
 
+/// What one run's normalization was launched with (recorded when the job
+/// starts here; read back from the job log for a result found on disk).
+#[derive(Clone, Debug, Default)]
+struct RunMeta {
+    /// The open-beam folders it divides by.
+    obs: Vec<PathBuf>,
+    /// The configuration file (settings) it runs with.
+    config: Option<PathBuf>,
+    /// Its result folder (`…/Run_<run>/normalization`).
+    output: Option<PathBuf>,
+}
+
+/// The user's per-run settings (✏ in the table): what replaces the
+/// configuration's open beams / output folder for that run only.
+#[derive(Clone, Debug, Default)]
+struct RunOverride {
+    obs: Option<Vec<PathBuf>>,
+    /// Output base folder: the result goes to `<here>/Run_<run>/normalization`.
+    output: Option<PathBuf>,
+}
+
+/// One selectable open beam in the run editor: a corrected open-beam
+/// folder of the IPTS (or one the configuration names elsewhere).
+struct ObChoice {
+    run: Option<u64>,
+    folder: PathBuf,
+    /// Complete corrected folder (usable as input)?
+    complete: bool,
+    frames: usize,
+}
+
+/// Which per-run setting a [`RunEditor`] window edits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditorMode {
+    /// "⇄ replace by…": the open beams the run divides by.
+    OpenBeams,
+    /// "✏" next to the Output column: the run's output folder.
+    Output,
+}
+
+/// The per-run settings window (open beams, or output folder) being
+/// edited.
+struct RunEditor {
+    run: u64,
+    mode: EditorMode,
+    /// Frames of the run's corrected data (open beams must match).
+    frames: usize,
+    choices: Vec<ObChoice>,
+    /// The open-beam folders currently ticked.
+    selected: Vec<PathBuf>,
+    output_text: String,
+}
+
+/// What the run editor's buttons ask for.
+enum EditorAction {
+    /// Keep the setting for this run (normalized later, by the automatic
+    /// pass or ▶ normalize).
+    Apply,
+    /// Keep the setting and normalize the run now (re-run when done).
+    ApplyAndRun,
+    /// Open beams: this run now, and every upcoming run (the ticked open
+    /// beams become the configuration's — new file).
+    ApplyUpcomingAndRun,
+    Cancel,
+}
+
 struct MonitorApp {
     logo: Option<Logo>,
     logo_loaded: bool,
@@ -219,9 +291,27 @@ struct MonitorApp {
     /// Where the DAQ filed each run's images (its NeXus
     /// `BL10:Exp:IM:ImageFilePath` log, read once): a path under an
     /// `alignment` folder marks an alignment run — never corrected by the
-    /// autoreduction, no normalization needed. Such a run stays listed
-    /// but is neither waited for nor put in the windows.
+    /// autoreduction, no normalization needed; a path under an `ob`
+    /// folder marks an open-beam run — corrected, but a normalization
+    /// input, never normalized. Such runs stay listed but are neither
+    /// waited for nor put in the windows.
     image_path_cache: HashMap<u64, String>,
+    /// The open-beam folders of the selected configuration file (read
+    /// when the selection changes): what every upcoming normalization
+    /// divides by, shown in the "Open beam" column of the table.
+    config_obs: Vec<PathBuf>,
+    /// What each run's normalization was launched with (open beams,
+    /// configuration, output) — recorded when a job is launched here,
+    /// read back from the job log for a result found on disk.
+    run_meta: HashMap<u64, RunMeta>,
+    /// Per-run overrides of the open beams / output folder (✏ in the
+    /// table), kept for the session.
+    run_overrides: HashMap<u64, RunOverride>,
+    /// The per-run settings window, when open.
+    run_editor: Option<RunEditor>,
+    /// Error from the last "use as open beam" attempt (writing the
+    /// derived configuration), shown until the next successful one.
+    ob_error: Option<String>,
     /// Which view of section 5 is open: the table or the acquisition
     /// timeline plot.
     runs_view: RunsView,
@@ -317,6 +407,11 @@ impl MonitorApp {
                 .collect(),
             time_cache: HashMap::new(),
             image_path_cache: HashMap::new(),
+            config_obs: Vec::new(),
+            run_meta: HashMap::new(),
+            run_overrides: HashMap::new(),
+            run_editor: None,
+            ob_error: None,
             runs_view: RunsView::Table,
             timeline_pv: None,
             pv_cache: HashMap::new(),
@@ -380,6 +475,11 @@ impl MonitorApp {
         self.last_live_anchor = None;
         self.run_jobs.clear();
         self.run_jobs_config = None;
+        self.config_obs.clear();
+        self.run_meta.clear();
+        self.run_overrides.clear();
+        self.run_editor = None;
+        self.ob_error = None;
         self.output_base = None;
         self.detector = None;
         self.run_jobs_from = None;
@@ -626,13 +726,14 @@ impl MonitorApp {
         }
         // Rejected runs never enter the windows (the windows anchor on the
         // newest kept run inside the span), but stay in the table span so
-        // they can be restored; alignment runs likewise (nothing to
-        // normalize, and no corrected data would ever come). When every
-        // run of the span is out the windows are simply empty until a new
-        // run lands.
+        // they can be restored; alignment and open-beam runs likewise
+        // (nothing to normalize: no corrected data would ever come for an
+        // alignment run, and an open beam is an input). When every run of
+        // the span is out the windows are simply empty until a new run
+        // lands.
         let kept: Vec<(u64, chrono::DateTime<chrono::FixedOffset>)> = end_times
             .iter()
-            .filter(|(run, _)| !self.rejected.contains(run) && !self.is_alignment(*run))
+            .filter(|(run, _)| !self.rejected.contains(run) && !self.skips_normalization(*run))
             .copied()
             .collect();
         norm::assign_windows(&mut self.windows, &kept);
@@ -722,6 +823,8 @@ impl MonitorApp {
         if self.run_jobs_config != self.selected_config {
             self.run_jobs
                 .retain(|_, state| matches!(state, norm::JobState::Running { .. }));
+            let running: Vec<u64> = self.run_jobs.keys().copied().collect();
+            self.run_meta.retain(|run, _| running.contains(run));
             self.run_jobs_config = self.selected_config.clone();
             // Auto normalization ON and a different file selected: the
             // shared autoreduction.cfg must follow, or the autoreduction
@@ -763,6 +866,7 @@ impl MonitorApp {
                 .as_ref()
                 .and_then(|i| i.detector.clone())
                 .or_else(|| Self::detector_from_layout(&ipts_path));
+            self.config_obs = info.map(|i| i.ob_folders).unwrap_or_default();
         }
         match self.cfg.as_ref().map(|c| c.activate) {
             Ok(true) => {
@@ -784,12 +888,13 @@ impl MonitorApp {
         let Some(config) = self.selected_config.clone() else {
             return; // nothing to look up or normalize with — retried next refresh
         };
-        // Alignment runs are left alone: nothing to look up or normalize.
+        // Alignment and open-beam runs are left alone: nothing to look up
+        // or normalize.
         let pending: Vec<u64> = self
             .run_files
             .iter()
             .map(|rf| rf.run)
-            .filter(|run| !self.run_jobs.contains_key(run) && !self.is_alignment(*run))
+            .filter(|run| !self.run_jobs.contains_key(run) && !self.skips_normalization(*run))
             .collect();
         if pending.is_empty() {
             return;
@@ -806,12 +911,27 @@ impl MonitorApp {
             }
         };
         for run in pending {
-            let output = norm::run_output_dir(&ipts_path, run, &info);
+            // The row's own settings (✏) decide where its result lives.
+            let output = norm::run_output_dir(&ipts_path, run, &self.effective_info(run, &info));
             if norm::output_is_done(&output) {
                 let finished = std::fs::metadata(&output)
                     .and_then(|m| m.modified())
                     .map(chrono::DateTime::<chrono::Local>::from)
                     .unwrap_or_else(|_| chrono::Local::now());
+                // What that result was launched with: its job log says
+                // (this tool's and the workflow runner's alike).
+                let log = output
+                    .parent()
+                    .map(|row| row.join("logs").join("normalization.log"));
+                let launch = log.and_then(|log| norm::launch_from_log(&log));
+                self.run_meta.insert(
+                    run,
+                    RunMeta {
+                        obs: launch.as_ref().map(|l| l.obs.clone()).unwrap_or_default(),
+                        config: launch.and_then(|l| l.config),
+                        output: Some(output.clone()),
+                    },
+                );
                 self.run_jobs.insert(
                     run,
                     norm::JobState::Done {
@@ -902,9 +1022,20 @@ impl MonitorApp {
                 return;
             }
         };
-        let state = match norm::prepare_run_job(run, &corrected, ipts_path, config, info) {
+        // The row's own settings (✏) replace the configuration's open
+        // beams / output folder for this run.
+        let info = self.effective_info(run, info);
+        let state = match norm::prepare_run_job(run, &corrected, ipts_path, config, &info) {
             Ok(spec) => {
                 self.job_output.remove(&spec.target);
+                self.run_meta.insert(
+                    run,
+                    RunMeta {
+                        obs: spec.ob_folders(),
+                        config: Some(spec.config().to_path_buf()),
+                        output: Some(spec.output().to_path_buf()),
+                    },
+                );
                 norm::launch(spec, self.norm_tx.clone());
                 norm::JobState::Running {
                     runs: vec![run],
@@ -913,7 +1044,10 @@ impl MonitorApp {
                     stages: Vec::new(),
                 }
             }
-            Err(message) => norm::JobState::Failed { message, log: None },
+            Err(message) => {
+                self.run_meta.remove(&run);
+                norm::JobState::Failed { message, log: None }
+            }
         };
         self.run_jobs.insert(run, state);
     }
@@ -932,6 +1066,519 @@ impl MonitorApp {
                 self.run_jobs.insert(run, norm::JobState::Failed { message, log: None });
             }
         }
+    }
+
+    /// The configuration as it applies to one run: the file's values with
+    /// the row's overrides (✏) — open beams and/or output folder — on top.
+    fn effective_info(&self, run: u64, base: &h5::ConfigInfo) -> h5::ConfigInfo {
+        let mut info = base.clone();
+        if let Some(over) = self.run_overrides.get(&run) {
+            if let Some(obs) = &over.obs {
+                info.ob_folders = obs.clone();
+            }
+            if let Some(output) = &over.output {
+                info.output_folder = Some(output.clone());
+            }
+        }
+        info
+    }
+
+    /// Where a run's result goes with the current settings (configuration
+    /// + the row's overrides), if a configuration is selected.
+    fn planned_output(&self, run: u64) -> Option<PathBuf> {
+        let ipts_path = self.ipts_path()?;
+        let config = self.selected_config.as_ref()?;
+        let info = h5::read_config_info(config).ok()?;
+        Some(norm::run_output_dir(&ipts_path, run, &self.effective_info(run, &info)))
+    }
+
+    /// "↻ re-run" on a normalized row (or "Apply & re-run" in the run
+    /// editor): normalize the run again with the row's current settings.
+    /// A result sitting where the new one will go is moved aside first as
+    /// `normalization.previous` (an older `.previous` is replaced) — the
+    /// job never runs twice into the same folder. The job log keeps the
+    /// history (append-only).
+    fn rerun_run(&mut self, run: u64) {
+        if let Some(norm::JobState::Done { output, .. }) = self.run_jobs.get(&run) {
+            let output = output.clone();
+            if self.planned_output(run).as_ref() == Some(&output) {
+                let previous = output.with_extension("previous");
+                let _ = std::fs::remove_dir_all(&previous);
+                if let Err(e) = std::fs::rename(&output, &previous) {
+                    self.run_jobs.insert(
+                        run,
+                        norm::JobState::Failed {
+                            message: format!(
+                                "cannot move the previous result aside ({} → {}): {e}",
+                                output.display(),
+                                previous.display()
+                            ),
+                            log: None,
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+        self.normalize_run_now(run);
+    }
+
+    /// The corrected open-beam folders of the IPTS
+    /// (`shared/autoreduce/images/<detector>/ob/…`, run folders up to two
+    /// levels below `ob`), plus `extra` folders (the configuration's, which
+    /// may live in another IPTS), newest run first — the choices of the
+    /// run editor, each with its frame count and whether it is complete.
+    fn scan_ob_choices(ipts_path: &Path, extra: &[PathBuf]) -> Vec<ObChoice> {
+        fn collect(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if files::run_number_in_name(&name).is_some() {
+                    found.push(entry.path());
+                } else if depth < 2 {
+                    collect(&entry.path(), depth + 1, found);
+                }
+            }
+        }
+        let mut found: Vec<PathBuf> = Vec::new();
+        if let Ok(detectors) = std::fs::read_dir(ipts_path.join("shared/autoreduce/images")) {
+            for detector in detectors.flatten() {
+                collect(&detector.path().join("ob"), 0, &mut found);
+            }
+        }
+        for folder in extra {
+            if !found.contains(folder) {
+                found.push(folder.clone());
+            }
+        }
+        let mut choices: Vec<ObChoice> = found
+            .into_iter()
+            .map(|folder| {
+                let name = folder
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                ObChoice {
+                    run: files::run_number_in_name(&name),
+                    complete: files::folder_complete(&folder, files::FolderKind::Corrected),
+                    frames: files::tiff_count(&folder),
+                    folder,
+                }
+            })
+            .collect();
+        choices.sort_by(|a, b| b.run.cmp(&a.run).then_with(|| a.folder.cmp(&b.folder)));
+        choices
+    }
+
+    /// "⇄ replace by…" / "✏" in the table: open the settings window of
+    /// one run — its open beams (every corrected open-beam folder of the
+    /// IPTS listed, the ones the run currently uses ticked) or its output
+    /// folder (pre-filled with what the run currently uses).
+    fn open_run_editor(&mut self, run: u64, mode: EditorMode) {
+        let Some(ipts_path) = self.ipts_path() else { return };
+        let over = self.run_overrides.get(&run).cloned().unwrap_or_default();
+        let selected = over.obs.clone().unwrap_or_else(|| self.config_obs.clone());
+        let output = over.output.clone().or_else(|| self.output_base.clone());
+        let frames = self
+            .run_files
+            .iter()
+            .find(|rf| rf.run == run)
+            .and_then(|rf| match &rf.corrected {
+                files::FileStatus::Present(folder) => Some(files::tiff_count(folder)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let choices = if mode == EditorMode::OpenBeams {
+            let mut extra = self.config_obs.clone();
+            extra.extend(selected.iter().cloned());
+            Self::scan_ob_choices(&ipts_path, &extra)
+        } else {
+            Vec::new()
+        };
+        self.run_editor = Some(RunEditor {
+            run,
+            mode,
+            frames,
+            choices,
+            selected,
+            output_text: output.map(|p| p.display().to_string()).unwrap_or_default(),
+        });
+    }
+
+    /// Apply the run editor: store the row's override of the edited
+    /// setting (nothing stored when it equals the configuration's; the
+    /// other setting's override is kept), for the open beams optionally
+    /// make them the configuration's for the upcoming runs, then either
+    /// normalize the run now (`run_now` — moving a previous result aside;
+    /// only once its corrected data is complete) or let the automatic
+    /// pass / the ▶ normalize button use the new settings. A result found
+    /// on disk with the old settings is looked up again.
+    fn apply_run_editor(&mut self, editor: RunEditor, run_now: bool, upcoming: bool) {
+        let run = editor.run;
+        let mut over = self.run_overrides.get(&run).cloned().unwrap_or_default();
+        let mut selected = editor.selected;
+        match editor.mode {
+            EditorMode::OpenBeams => {
+                selected.sort_by_key(|f| {
+                    f.file_name()
+                        .and_then(|n| files::run_number_in_name(&n.to_string_lossy()))
+                        .unwrap_or(u64::MAX)
+                });
+                let same_obs = {
+                    let mut a = selected.clone();
+                    let mut b = self.config_obs.clone();
+                    a.sort();
+                    b.sort();
+                    a == b
+                };
+                over.obs = (!selected.is_empty() && !same_obs).then(|| selected.clone());
+            }
+            EditorMode::Output => {
+                let output_text = editor.output_text.trim();
+                over.output = (!output_text.is_empty()
+                    && self.output_base.as_deref() != Some(Path::new(output_text)))
+                .then(|| PathBuf::from(output_text));
+            }
+        }
+        if over.obs.is_none() && over.output.is_none() {
+            self.run_overrides.remove(&run);
+        } else {
+            self.run_overrides.insert(run, over);
+        }
+        if upcoming && !selected.is_empty() {
+            self.use_as_open_beams(selected.clone());
+            // The configuration now names them: no override needed for
+            // this run either.
+            if let Some(over) = self.run_overrides.get_mut(&run) {
+                if over.obs.as_ref().is_some_and(|obs| {
+                    let mut a = obs.clone();
+                    let mut b = self.config_obs.clone();
+                    a.sort();
+                    b.sort();
+                    a == b
+                }) {
+                    over.obs = None;
+                }
+            }
+            self.run_overrides
+                .retain(|_, over| over.obs.is_some() || over.output.is_some());
+        }
+        if matches!(self.run_jobs.get(&run), Some(norm::JobState::Running { .. })) {
+            return; // the settings apply to the next run of this row
+        }
+        let corrected_ready = self
+            .run_files
+            .iter()
+            .find(|rf| rf.run == run)
+            .is_some_and(|rf| matches!(rf.corrected, files::FileStatus::Present(_)));
+        if run_now && corrected_ready {
+            self.rerun_run(run);
+        } else {
+            self.run_jobs.remove(&run);
+            self.run_meta.remove(&run);
+            self.check_runs();
+        }
+    }
+
+    /// The run editor window (open beams, or output folder, of one run),
+    /// drawn while `run_editor` is set.
+    fn run_editor_window(&mut self, ui: &mut egui::Ui) {
+        let Some(mut editor) = self.run_editor.take() else { return };
+        let run = editor.run;
+        let config_obs = self.config_obs.clone();
+        let output_base = self.output_base.clone();
+        let state = self.run_jobs.get(&run);
+        let done = matches!(state, Some(norm::JobState::Done { .. }));
+        let running = matches!(state, Some(norm::JobState::Running { .. }));
+        let corrected_ready = self
+            .run_files
+            .iter()
+            .find(|rf| rf.run == run)
+            .is_some_and(|rf| matches!(rf.corrected, files::FileStatus::Present(_)));
+        let has_config = self.selected_config.is_some();
+        let mut action: Option<EditorAction> = None;
+        let mut open = true;
+        let title = match editor.mode {
+            EditorMode::OpenBeams => format!("Run {run} — replace the open beams by…"),
+            EditorMode::Output => format!("Run {run} — output folder"),
+        };
+        egui::Window::new(title)
+            .id(egui::Id::new("run_editor"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(560.0);
+                let dim = theme::text_emphasis(ui.visuals());
+                match editor.mode {
+                    EditorMode::OpenBeams => {
+                        Self::open_beams_editor(ui, &mut editor, &config_obs, dim);
+                    }
+                    EditorMode::Output => {
+                        Self::output_editor(ui, &mut editor, output_base.as_deref(), dim);
+                    }
+                }
+                ui.add_space(theme::SPACE_SM);
+                ui.horizontal(|ui| {
+                    let now = if done { "re-run now" } else { "normalize now" };
+                    let run_hover = |what: &str| {
+                        if running {
+                            "This run is being normalized — the setting applies to its \
+                             next normalization"
+                                .to_owned()
+                        } else if !corrected_ready {
+                            format!(
+                                "{what} — normalized as soon as the corrected data of run \
+                                 {run} is complete (automatically when auto normalization \
+                                 covers it, else with ▶ normalize)"
+                            )
+                        } else if done {
+                            format!(
+                                "{what} and normalize run {run} again at once — the \
+                                 result already in the target folder is kept as \
+                                 normalization.previous"
+                            )
+                        } else {
+                            format!("{what} and normalize run {run} at once")
+                        }
+                    };
+                    match editor.mode {
+                        EditorMode::OpenBeams => {
+                            let none = editor.selected.is_empty();
+                            let button = ui.add_enabled(
+                                !none && !running,
+                                theme::primary_button(&format!("Replace for this run & {now}")),
+                            );
+                            let button = if none {
+                                button.on_disabled_hover_text("Tick at least one open beam")
+                            } else {
+                                button.on_hover_text(run_hover(
+                                    "Use the ticked open beams for this run only",
+                                ))
+                            };
+                            if button.clicked() {
+                                action = Some(EditorAction::ApplyAndRun);
+                            }
+                            let button = ui.add_enabled(
+                                !none && !running && has_config,
+                                egui::Button::new(format!(
+                                    "Replace for this run and every upcoming run & {now}"
+                                )),
+                            );
+                            let button = if none {
+                                button.on_disabled_hover_text("Tick at least one open beam")
+                            } else if !has_config {
+                                button.on_disabled_hover_text(
+                                    "Select a configuration file first (section 2)",
+                                )
+                            } else {
+                                button.on_hover_text(format!(
+                                    "{}\nA copy of the selected configuration with the \
+                                     ticked open beams is written next to it and selected: \
+                                     every run normalized from now on divides by them (with \
+                                     auto normalization ON the new file is registered in \
+                                     the shared autoreduction.cfg at once). Runs already \
+                                     normalized are not redone.",
+                                    run_hover("Use the ticked open beams for this run")
+                                ))
+                            };
+                            if button.clicked() {
+                                action = Some(EditorAction::ApplyUpcomingAndRun);
+                            }
+                        }
+                        EditorMode::Output => {
+                            if ui
+                                .add(theme::primary_button("Apply"))
+                                .on_hover_text(
+                                    "Keep this output folder for this run: used by the \
+                                     automatic normalization / the ▶ normalize button. A \
+                                     result already there is looked up in the new folder.",
+                                )
+                                .clicked()
+                            {
+                                action = Some(EditorAction::Apply);
+                            }
+                            let button = ui.add_enabled(
+                                !running,
+                                egui::Button::new(format!("Apply & {now}")),
+                            );
+                            if button.on_hover_text(run_hover("Keep this output folder")).clicked() {
+                                action = Some(EditorAction::ApplyAndRun);
+                            }
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(EditorAction::Cancel);
+                    }
+                    if running {
+                        ui.label(
+                            egui::RichText::new("normalization running").color(theme::INFO),
+                        );
+                    }
+                });
+            });
+        if !open {
+            action = Some(EditorAction::Cancel);
+        }
+        match action {
+            None => self.run_editor = Some(editor),
+            Some(EditorAction::Cancel) => {}
+            Some(EditorAction::Apply) => self.apply_run_editor(editor, false, false),
+            Some(EditorAction::ApplyAndRun) => self.apply_run_editor(editor, true, false),
+            Some(EditorAction::ApplyUpcomingAndRun) => self.apply_run_editor(editor, true, true),
+        }
+    }
+
+    /// Body of the open-beams editor: every corrected open-beam folder of
+    /// the IPTS as a checkbox (newest first, frame count, flags), the
+    /// ticked ones summarized.
+    fn open_beams_editor(
+        ui: &mut egui::Ui,
+        editor: &mut RunEditor,
+        config_obs: &[PathBuf],
+        dim: egui::Color32,
+    ) {
+        let run = editor.run;
+        ui.label(
+            egui::RichText::new(if editor.frames > 0 {
+                format!(
+                    "The corrected data of run {run} has {} frames — tick open beams \
+                     with the same number of frames (1 or more).",
+                    editor.frames
+                )
+            } else {
+                format!(
+                    "Run {run} has no complete corrected data yet — tick the open beams \
+                     (1 or more) it will divide by."
+                )
+            })
+            .color(dim),
+        );
+        ui.add_space(theme::SPACE_XS);
+        let mut toggled: Vec<(PathBuf, bool)> = Vec::new();
+        egui::ScrollArea::vertical()
+            .id_salt("ob_choices")
+            .max_height(260.0)
+            .show(ui, |ui| {
+                for choice in &editor.choices {
+                    let mut checked = editor.selected.contains(&choice.folder);
+                    let name = choice
+                        .folder
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let mut label = match choice.run {
+                        Some(r) => format!("run {r} — {} frames", choice.frames),
+                        None => format!("{name} — {} frames", choice.frames),
+                    };
+                    if !choice.complete {
+                        label.push_str("  (⏳ corrected data not complete)");
+                    } else if editor.frames > 0 && choice.frames != editor.frames {
+                        label.push_str("  (⚠ frame count differs)");
+                    }
+                    if config_obs.contains(&choice.folder) {
+                        label.push_str("  [configuration's]");
+                    }
+                    let response = ui
+                        .add_enabled(choice.complete, egui::Checkbox::new(&mut checked, label))
+                        .on_hover_text(choice.folder.display().to_string());
+                    if response.changed() {
+                        toggled.push((choice.folder.clone(), checked));
+                    }
+                }
+                if editor.choices.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "No corrected open-beam folder found in this IPTS \
+                             (shared/autoreduce/images/<detector>/ob)",
+                        )
+                        .color(dim),
+                    );
+                }
+            });
+        for (folder, checked) in toggled {
+            if checked {
+                if !editor.selected.contains(&folder) {
+                    editor.selected.push(folder);
+                }
+            } else {
+                editor.selected.retain(|f| f != &folder);
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .button("↺ configuration's")
+                .on_hover_text("Tick the configuration file's open beams again")
+                .clicked()
+            {
+                editor.selected = config_obs.to_vec();
+            }
+            if ui.button("none").clicked() {
+                editor.selected.clear();
+            }
+            ui.label(
+                egui::RichText::new(if editor.selected.is_empty() {
+                    "none ticked".to_owned()
+                } else {
+                    format!("ticked: {}", Self::ob_runs_text(&editor.selected))
+                })
+                .color(dim),
+            );
+        });
+    }
+
+    /// Body of the output-folder editor: the folder (typed or browsed)
+    /// the run's result goes to.
+    fn output_editor(
+        ui: &mut egui::Ui,
+        editor: &mut RunEditor,
+        output_base: Option<&Path>,
+        dim: egui::Color32,
+    ) {
+        let run = editor.run;
+        ui.label(egui::RichText::new("Output folder for this run").strong());
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.output_text)
+                    .desired_width(400.0)
+                    .hint_text("the configuration's output folder"),
+            );
+            if ui.button("📂 Browse…").clicked() {
+                let mut dialog = rfd::FileDialog::new().set_title(format!(
+                    "Output folder for run {run} (the result goes to \
+                     Run_{run}/normalization inside it)"
+                ));
+                let start = Path::new(editor.output_text.trim());
+                if start.is_dir() {
+                    dialog = dialog.set_directory(start);
+                } else if let Some(base) = output_base.filter(|b| b.is_dir()) {
+                    dialog = dialog.set_directory(base);
+                }
+                if let Some(folder) = dialog.pick_folder() {
+                    editor.output_text = folder.display().to_string();
+                }
+            }
+            if ui
+                .button("↺ configuration's")
+                .on_hover_text("Back to the configuration file's output folder")
+                .clicked()
+            {
+                editor.output_text = output_base
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!("The result goes to <folder>/Run_{run}/normalization"))
+                .color(dim)
+                .small(),
+        );
     }
 
     /// Open a folder in the desktop file manager, or a file (e.g. a job
@@ -1043,13 +1690,166 @@ impl MonitorApp {
         self.cfg.as_ref().map(|c| c.activate).unwrap_or(false)
     }
 
-    /// Is a run an alignment run, per the image folder its NeXus records?
-    /// A run whose NeXus could not be read yet counts as a regular run
-    /// (classified on a later refresh).
-    fn is_alignment(&self, run: u64) -> bool {
+    /// What a run is (sample, open beam, alignment), per the image folder
+    /// its NeXus records. A run whose NeXus could not be read yet counts
+    /// as a sample run (classified on a later refresh).
+    fn run_kind(&self, run: u64) -> h5::RunKind {
         self.image_path_cache
             .get(&run)
-            .is_some_and(|path| h5::image_path_is_alignment(path))
+            .map(|path| h5::image_path_kind(path))
+            .unwrap_or(h5::RunKind::Sample)
+    }
+
+    /// Is a run an open-beam run?
+    fn is_open_beam(&self, run: u64) -> bool {
+        self.run_kind(run) == h5::RunKind::OpenBeam
+    }
+
+    /// Is a run never normalized (alignment or open beam)? Such a run is
+    /// neither waited for nor put in the windows.
+    fn skips_normalization(&self, run: u64) -> bool {
+        self.run_kind(run) != h5::RunKind::Sample
+    }
+
+    /// Why a run is out of the windows and the normalizations, for the
+    /// timeline / hovers: "alignment" or "open beam".
+    fn kind_label(&self, run: u64) -> Option<&'static str> {
+        match self.run_kind(run) {
+            h5::RunKind::Sample => None,
+            h5::RunKind::OpenBeam => Some("open beam"),
+            h5::RunKind::Alignment => Some("alignment"),
+        }
+    }
+
+    /// The run numbers of open-beam folders (from the `Run_<n>` token of
+    /// each folder name), in order; a folder without one is skipped.
+    fn ob_run_numbers(folders: &[PathBuf]) -> Vec<u64> {
+        folders
+            .iter()
+            .filter_map(|f| f.file_name())
+            .filter_map(|n| files::run_number_in_name(&n.to_string_lossy()))
+            .collect()
+    }
+
+    /// `29905, 29906, 29907` — the open beams as a short run list.
+    fn ob_runs_text(folders: &[PathBuf]) -> String {
+        let runs = Self::ob_run_numbers(folders);
+        if runs.is_empty() {
+            return folders
+                .iter()
+                .filter_map(|f| f.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+        }
+        runs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+    }
+
+    /// The folders of a list of open beams, one per line (for hovers).
+    fn ob_folders_text(folders: &[PathBuf]) -> String {
+        folders
+            .iter()
+            .map(|f| f.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Is a listed open-beam run one of the configuration's open beams
+    /// (by run number — the configuration names corrected folders, the
+    /// same the table finds)?
+    fn ob_in_use(&self, run: u64) -> bool {
+        Self::ob_run_numbers(&self.config_obs).contains(&run)
+    }
+
+    /// The open-beam runs of the table that landed AFTER the
+    /// configuration's open beams (newest run number among them; every
+    /// open-beam run when the configuration names none) and are not
+    /// rejected — candidates to replace the configuration's. Ascending,
+    /// with the corrected folder of each (complete or not).
+    fn new_open_beams(&self) -> Vec<(u64, files::FileStatus)> {
+        let newest_in_use = Self::ob_run_numbers(&self.config_obs)
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        self.run_files
+            .iter()
+            .filter(|rf| rf.run > newest_in_use)
+            .filter(|rf| self.is_open_beam(rf.run) && !self.rejected.contains(&rf.run))
+            .map(|rf| (rf.run, rf.corrected.clone()))
+            .collect()
+    }
+
+    /// Make `folders` (complete corrected open-beam folders) the open
+    /// beams of every normalization to come: a copy of the selected
+    /// configuration with those folders as its open beams is written next
+    /// to it (`<name>_ob_<run>_<run>.h5`, everything else kept) and
+    /// selected — auto normalization ON re-registers it in the shared
+    /// autoreduction.cfg on the next pass, so the autoreduction follows
+    /// too. Results already there are never redone.
+    fn use_as_open_beams(&mut self, folders: Vec<PathBuf>) {
+        let Some(config) = self.selected_config.clone() else {
+            self.ob_error = Some("no configuration file selected (section 2)".to_owned());
+            return;
+        };
+        if folders.is_empty() {
+            self.ob_error = Some("no open-beam run to use".to_owned());
+            return;
+        }
+        for folder in &folders {
+            if !files::folder_complete(folder, files::FolderKind::Corrected) {
+                self.ob_error = Some(format!(
+                    "the corrected open-beam folder is not complete: {}",
+                    folder.display()
+                ));
+                return;
+            }
+        }
+        let runs = Self::ob_run_numbers(&folders);
+        if runs.is_empty() {
+            self.ob_error = Some("no run number in the open-beam folder names".to_owned());
+            return;
+        }
+        let run_spec = runs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+        // `<stem>_ob_<runs>.h5` next to the selected file; a previous
+        // `_ob_…` suffix (the selected file being itself derived) is
+        // dropped rather than chained.
+        let stem = config
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "normalization_config".to_owned());
+        let base = Self::strip_ob_suffix(&stem);
+        let suffix = runs.iter().map(u64::to_string).collect::<Vec<_>>().join("_");
+        let dst = config.with_file_name(format!("{base}_ob_{suffix}.h5"));
+        match h5::write_config_with_obs(&config, &dst, &folders, &run_spec) {
+            Ok(()) => {
+                self.ob_error = None;
+                self.rescan_configs();
+                self.selected_config = Some(dst);
+                self.keep_selected_config();
+                self.preview_error = None;
+                // The new selection takes effect at once (open beams read,
+                // registration when ON, table refreshed).
+                self.check_runs();
+            }
+            Err(e) => self.ob_error = Some(e),
+        }
+    }
+
+    /// `name_ob_29962_29963` → `name`: drop a trailing `_ob_<run>[_<run>…]`.
+    fn strip_ob_suffix(stem: &str) -> String {
+        let mut base = stem;
+        let mut numbers = 0;
+        while let Some((head, tail)) = base.rsplit_once('_') {
+            if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+                base = head;
+                numbers += 1;
+            } else if tail == "ob" && numbers > 0 {
+                return head.to_owned();
+            } else {
+                break;
+            }
+        }
+        stem.to_owned()
     }
 
     /// Read (once) where the DAQ filed a run's images, from its NeXus —
@@ -1864,7 +2664,7 @@ impl MonitorApp {
         });
     }
 
-    /// One ✔/✘ cell of the runs table, with the full path on hover.
+    /// One ✔/✖ cell of the runs table, with the full path on hover.
     fn status_cell(ui: &mut egui::Ui, status: &files::FileStatus) {
         match status {
             files::FileStatus::Present(path) => {
@@ -1891,7 +2691,7 @@ impl MonitorApp {
             }
             files::FileStatus::Missing(path) => {
                 ui.label(
-                    egui::RichText::new("✘")
+                    egui::RichText::new("✖")
                         .color(theme::text_emphasis(ui.visuals()))
                         .size(16.0),
                 )
@@ -1919,7 +2719,8 @@ impl MonitorApp {
         use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text, VLine};
         theme::section_frame(ui, |ui| {
             // (run, start, end, out) in table order (ascending runs); `out`
-            // names why a run is not in the windows (rejected, alignment).
+            // names why a run is not in the windows (rejected, alignment,
+            // open beam).
             let bars_data: Vec<_> = self
                 .run_files
                 .iter()
@@ -1927,10 +2728,8 @@ impl MonitorApp {
                     self.time_cache.get(&rf.run).map(|(start, end)| {
                         let out = if self.rejected.contains(&rf.run) {
                             Some("rejected")
-                        } else if self.is_alignment(rf.run) {
-                            Some("alignment")
                         } else {
-                            None
+                            self.kind_label(rf.run)
                         };
                         (rf.run, *start, *end, out)
                     })
@@ -2288,7 +3087,7 @@ impl MonitorApp {
                 .run_files
                 .iter()
                 .filter(|rf| matches!(rf.corrected, files::FileStatus::Present(_)))
-                .filter(|rf| !self.rejected.contains(&rf.run) && !self.is_alignment(rf.run))
+                .filter(|rf| !self.rejected.contains(&rf.run) && !self.skips_normalization(rf.run))
                 .filter(|rf| {
                     !matches!(
                         self.run_jobs.get(&rf.run),
@@ -2348,6 +3147,7 @@ impl MonitorApp {
             });
         });
         ui.add_space(theme::SPACE_XS);
+        self.new_open_beams_banner(ui);
         if self.runs_view == RunsView::Timeline {
             self.runs_timeline(ui);
             return;
@@ -2357,16 +3157,18 @@ impl MonitorApp {
         let mut view_normalized: Option<PathBuf> = None;
         let mut open_normalized: Option<PathBuf> = None;
         let mut retry_run: Option<u64> = None;
+        let mut rerun: Option<u64> = None;
+        let mut edit_run: Option<(u64, EditorMode)> = None;
         let mut output_toggle: Option<norm::JobTarget> = None;
         let active = self.is_active();
         let watching_from = self.run_jobs_from;
         let no_config = self.selected_config.is_none();
         theme::section_frame(ui, |ui| {
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .id_salt("runs_table")
                 .show(ui, |ui| {
                     egui::Grid::new("runs_grid")
-                        .num_columns(7)
+                        .num_columns(11)
                         .striped(true)
                         .spacing([theme::SPACE_LG * 2.5, theme::SPACE_XS])
                         .show(ui, |ui| {
@@ -2381,7 +3183,30 @@ impl MonitorApp {
                                      its own (configuration's sample replaced by the run) \
                                      once its corrected data is there",
                                 );
-                            ui.label(theme::section_heading("Use"));
+                            ui.label(theme::section_heading("Open beam")).on_hover_text(
+                                "The open-beam run(s) each normalization divides by: \
+                                 what the result used (from its job log) for a normalized \
+                                 run, the configuration's open beams (dimmed) for a run \
+                                 still to come. An open-beam run reads \"in use\" when it \
+                                 is one of the configuration's, \"new\" when it landed \
+                                 after them. ⇄ replace by… (next column) switches to \
+                                 other open beams, for that run or for every upcoming run",
+                            );
+                            ui.label("");
+                            ui.label(theme::section_heading("Config")).on_hover_text(
+                                "The configuration file (settings) each normalization \
+                                 runs with: what the result used (from its job log) for \
+                                 a normalized run, the selected file (dimmed) for a run \
+                                 still to come",
+                            );
+                            ui.label(theme::section_heading("Output")).on_hover_text(
+                                "The output folder each result lands in \
+                                 (<folder>/Run_<run>/normalization): the result's own \
+                                 for a normalized run, the configuration's (dimmed) for \
+                                 a run still to come. ✏ overrides it for one run",
+                            );
+                            ui.label(theme::section_heading("Use"))
+                                .on_hover_text("✖ reject / ↩ restore for the windows");
                             ui.end_row();
                             // Upcoming run first: not acquired yet, its
                             // NeXus is what auto-normalization waits for.
@@ -2400,13 +3225,19 @@ impl MonitorApp {
                                 Self::status_cell(ui, &next.corrected);
                                 ui.label("");
                                 ui.label("");
+                                self.planned_obs_cell(ui);
+                                ui.label("");
+                                self.planned_config_cell(ui);
+                                self.planned_output_cell(ui, None);
                                 ui.label("");
                                 ui.end_row();
                             }
                             // Newest first, right under the upcoming run.
                             for run in self.run_files.iter().rev() {
                                 let rejected = self.rejected.contains(&run.run);
-                                let alignment = self.is_alignment(run.run);
+                                let kind = self.run_kind(run.run);
+                                let alignment = kind == h5::RunKind::Alignment;
+                                let open_beam = kind == h5::RunKind::OpenBeam;
                                 let dim = theme::text_emphasis(ui.visuals());
                                 let mut run_text =
                                     egui::RichText::new(run.run.to_string()).strong();
@@ -2421,6 +3252,11 @@ impl MonitorApp {
                                 } else if alignment {
                                     label.on_hover_text(
                                         "Alignment run — no normalization needed",
+                                    );
+                                } else if open_beam {
+                                    label.on_hover_text(
+                                        "Open-beam run — a normalization input, not \
+                                         normalized itself",
                                     );
                                 }
                                 Self::status_cell(ui, &run.nexus);
@@ -2469,20 +3305,99 @@ impl MonitorApp {
                                     ui,
                                     run,
                                     self.run_jobs.get(&run.run),
-                                    self.image_path_cache.get(&run.run).filter(|_| alignment),
+                                    self.image_path_cache
+                                        .get(&run.run)
+                                        .filter(|_| alignment || open_beam)
+                                        .map(|folder| (kind, folder)),
                                     watched && !rejected,
                                     no_config,
                                     &mut view_normalized,
                                     &mut open_normalized,
                                     &mut retry_run,
+                                    &mut rerun,
                                     &mut output_toggle,
                                 );
+                                // Open beam / Config / Output: what this
+                                // run's normalization uses (or will), or
+                                // the status of an open-beam run itself.
+                                self.obs_cell(ui, run.run, kind);
+                                if kind == h5::RunKind::Sample {
+                                    let overridden = self
+                                        .run_overrides
+                                        .get(&run.run)
+                                        .is_some_and(|o| o.obs.is_some());
+                                    let text = if overridden {
+                                        egui::RichText::new("⇄ replace by…").color(theme::INFO)
+                                    } else {
+                                        egui::RichText::new("⇄ replace by…")
+                                    };
+                                    if ui
+                                        .button(text)
+                                        .on_hover_text(
+                                            "Replace the open beams of this run's \
+                                             normalization by other open-beam run(s) of the \
+                                             IPTS (1 or more) — for this run only, or for \
+                                             this run and every upcoming run",
+                                        )
+                                        .clicked()
+                                    {
+                                        edit_run = Some((run.run, EditorMode::OpenBeams));
+                                    }
+                                } else {
+                                    ui.label("");
+                                }
+                                self.config_cell(ui, run.run, kind);
+                                ui.horizontal(|ui| {
+                                    self.output_cell(ui, run.run, kind);
+                                    if kind == h5::RunKind::Sample {
+                                        let overridden = self
+                                            .run_overrides
+                                            .get(&run.run)
+                                            .is_some_and(|o| o.output.is_some());
+                                        let pencil = if overridden {
+                                            egui::RichText::new("✏").color(theme::INFO).strong()
+                                        } else {
+                                            egui::RichText::new("✏")
+                                        };
+                                        if ui
+                                            .button(pencil)
+                                            .on_hover_text(if overridden {
+                                                "This run has its own output folder — edit it"
+                                            } else {
+                                                "Choose another output folder for this run's \
+                                                 result (instead of the configuration's)"
+                                            })
+                                            .clicked()
+                                        {
+                                            edit_run = Some((run.run, EditorMode::Output));
+                                        }
+                                    }
+                                });
                                 // Reject / restore toggle — moot for an
-                                // alignment run, never in the windows.
+                                // alignment run, never in the windows. An
+                                // open-beam run is never in the windows
+                                // either, but rejecting it keeps it out
+                                // of the "new open beams" banner.
                                 if alignment {
                                     ui.label(egui::RichText::new("—").color(dim)).on_hover_text(
                                         "Alignment run — never part of the windows",
                                     );
+                                    ui.end_row();
+                                    continue;
+                                }
+                                if open_beam {
+                                    let (text, hover) = if rejected {
+                                        ("↩ restore", "Offer this open beam again")
+                                    } else {
+                                        (
+                                            "✖ reject",
+                                            "Never offer this open-beam run as a \
+                                             replacement open beam",
+                                        )
+                                    };
+                                    if ui.button(text).on_hover_text(hover).clicked() {
+                                        toggle_run = Some(run.run);
+                                    }
                                     ui.end_row();
                                     continue;
                                 }
@@ -2525,9 +3440,16 @@ impl MonitorApp {
         if let Some(run) = retry_run {
             self.normalize_run_now(run);
         }
+        if let Some(run) = rerun {
+            self.rerun_run(run);
+        }
+        if let Some((run, mode)) = edit_run {
+            self.open_run_editor(run, mode);
+        }
         if let Some(target) = output_toggle {
             self.toggle_output_view(target);
         }
+        self.run_editor_window(ui);
         if let Some(err) = &self.viewer_error {
             ui.label(
                 egui::RichText::new(format!("Cannot open: {err}")).color(theme::DANGER),
@@ -2535,6 +3457,272 @@ impl MonitorApp {
         }
         if matches!(self.output_view, Some(norm::JobTarget::Run(_))) {
             self.output_panel(ui);
+        }
+    }
+
+    /// Banner above the table when open-beam run(s) landed after the
+    /// configuration's open beams: names them and offers to make them the
+    /// open beam(s) of every normalization to come (the ones whose
+    /// corrected data is complete; the others are named as waiting).
+    fn new_open_beams_banner(&mut self, ui: &mut egui::Ui) {
+        let candidates = self.new_open_beams();
+        if candidates.is_empty() && self.ob_error.is_none() {
+            return;
+        }
+        let list = |runs: &[u64]| runs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+        if !candidates.is_empty() {
+            let ready: Vec<u64> = candidates
+                .iter()
+                .filter(|(_, status)| matches!(status, files::FileStatus::Present(_)))
+                .map(|(run, _)| *run)
+                .collect();
+            let waiting: Vec<u64> = candidates
+                .iter()
+                .filter(|(_, status)| !matches!(status, files::FileStatus::Present(_)))
+                .map(|(run, _)| *run)
+                .collect();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "🔆 New open beam run{}: {}",
+                        if candidates.len() > 1 { "s" } else { "" },
+                        list(&candidates.iter().map(|(r, _)| *r).collect::<Vec<_>>())
+                    ))
+                    .color(theme::WARNING)
+                    .strong(),
+                )
+                .on_hover_text(format!(
+                    "Open-beam run(s) acquired after the configuration's open beams \
+                     ({}). The normalizations keep using the configuration's until \
+                     you switch.",
+                    if self.config_obs.is_empty() {
+                        "the configuration names none".to_owned()
+                    } else {
+                        Self::ob_runs_text(&self.config_obs)
+                    }
+                ));
+                ui.label(
+                    egui::RichText::new(if ready.is_empty() {
+                        format!(
+                            "— ⏳ waiting for the corrected data of {} (autoreduction)",
+                            list(&waiting)
+                        )
+                    } else if waiting.is_empty() {
+                        "— ⇄ replace by… on a row switches to them, for that run or for \
+                         every upcoming run"
+                            .to_owned()
+                    } else {
+                        format!(
+                            "— ⇄ replace by… on a row switches to them, for that run or for \
+                             every upcoming run (⏳ {} still waiting for corrected data)",
+                            list(&waiting)
+                        )
+                    })
+                    .color(theme::text_emphasis(ui.visuals())),
+                );
+            });
+        }
+        if let Some(err) = &self.ob_error {
+            ui.label(
+                egui::RichText::new(format!("Cannot switch the open beams: {err}"))
+                    .color(theme::DANGER),
+            );
+        }
+        ui.add_space(theme::SPACE_XS);
+    }
+
+    /// "Open beam" cell of the upcoming run: the configuration's open
+    /// beams, dimmed (what the run will divide by).
+    fn planned_obs_cell(&self, ui: &mut egui::Ui) {
+        let dim = theme::text_emphasis(ui.visuals());
+        if self.config_obs.is_empty() {
+            ui.label(egui::RichText::new("—").color(dim)).on_hover_text(
+                "The configuration names no open beam (or none is selected)",
+            );
+        } else {
+            ui.label(egui::RichText::new(Self::ob_runs_text(&self.config_obs)).color(dim))
+                .on_hover_text(format!(
+                    "Will divide by the configuration's open beam(s)\n{}",
+                    Self::ob_folders_text(&self.config_obs)
+                ));
+        }
+    }
+
+    /// "Open beam" cell of one row. Sample run: the open beams its
+    /// normalization used (recorded at launch, or read from the job log
+    /// of a result found on disk), else the configuration's, dimmed, as
+    /// what it will use. Open-beam run: whether it is in use, new (landed
+    /// after the configuration's open beams) or older. Alignment run: —.
+    fn obs_cell(&self, ui: &mut egui::Ui, run: u64, kind: h5::RunKind) {
+        let dim = theme::text_emphasis(ui.visuals());
+        match kind {
+            h5::RunKind::Alignment => {
+                ui.label(egui::RichText::new("—").color(dim))
+                    .on_hover_text("Alignment run — not normalized, no open beam involved");
+            }
+            h5::RunKind::OpenBeam => {
+                if self.ob_in_use(run) {
+                    ui.label(egui::RichText::new("✔ in use").color(theme::SUCCESS))
+                        .on_hover_text(
+                            "One of the configuration's open beams — every upcoming \
+                             normalization divides by it",
+                        );
+                } else if self.rejected.contains(&run) {
+                    ui.label(egui::RichText::new("rejected").color(dim))
+                        .on_hover_text("Never offered as a replacement open beam (↩ restore to offer it again)");
+                } else if self.new_open_beams().iter().any(|(r, _)| *r == run) {
+                    ui.label(egui::RichText::new("new").color(theme::WARNING).strong())
+                        .on_hover_text(
+                            "Landed after the configuration's open beams — the banner \
+                             above offers to switch to it",
+                        );
+                } else {
+                    ui.label(egui::RichText::new("not in use").color(dim)).on_hover_text(
+                        "An older open beam the configuration does not name",
+                    );
+                }
+            }
+            h5::RunKind::Sample => match self.run_meta.get(&run).map(|m| &m.obs) {
+                Some(obs) if !obs.is_empty() => {
+                    ui.label(Self::ob_runs_text(obs)).on_hover_text(format!(
+                        "Open beam(s) this run's normalization divides by\n{}",
+                        Self::ob_folders_text(obs)
+                    ));
+                }
+                _ => {
+                    let done = matches!(self.run_jobs.get(&run), Some(norm::JobState::Done { .. }));
+                    if done {
+                        ui.label(egui::RichText::new("?").color(dim)).on_hover_text(
+                            "Normalized, but its job log names no open beam (result \
+                             produced by another tool, or log missing)",
+                        );
+                    } else if let Some(obs) = self.run_overrides.get(&run).and_then(|o| o.obs.as_ref())
+                    {
+                        ui.label(egui::RichText::new(Self::ob_runs_text(obs)).color(theme::INFO))
+                            .on_hover_text(format!(
+                                "Will divide by the open beam(s) chosen for this run (⇄)\n{}",
+                                Self::ob_folders_text(obs)
+                            ));
+                    } else {
+                        self.planned_obs_cell(ui);
+                    }
+                }
+            },
+        }
+    }
+
+    /// The file name of a path (the whole path when it has none).
+    fn short_name(path: &Path) -> String {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    /// "Config" cell of the upcoming run: the selected configuration,
+    /// dimmed (what the run will run with).
+    fn planned_config_cell(&self, ui: &mut egui::Ui) {
+        let dim = theme::text_emphasis(ui.visuals());
+        match &self.selected_config {
+            Some(config) => {
+                ui.label(egui::RichText::new(Self::short_name(config)).color(dim))
+                    .on_hover_text(format!(
+                        "Will run with the selected configuration\n{}",
+                        config.display()
+                    ));
+            }
+            None => {
+                ui.label(egui::RichText::new("—").color(dim))
+                    .on_hover_text("No configuration file selected (section 2)");
+            }
+        }
+    }
+
+    /// "Output" cell of a run still to come: the base folder its result
+    /// will land in — the row's own (✏, highlighted) or the
+    /// configuration's (dimmed).
+    fn planned_output_cell(&self, ui: &mut egui::Ui, run: Option<u64>) {
+        let dim = theme::text_emphasis(ui.visuals());
+        let over = run
+            .and_then(|run| self.run_overrides.get(&run))
+            .and_then(|o| o.output.clone());
+        match (over, &self.output_base) {
+            (Some(folder), _) => {
+                ui.label(egui::RichText::new(Self::short_name(&folder)).color(theme::INFO))
+                    .on_hover_text(format!(
+                        "Output folder chosen for this run (✏) — the result goes to \
+                         Run_<run>/normalization in there\n{}",
+                        folder.display()
+                    ));
+            }
+            (None, Some(base)) => {
+                ui.label(egui::RichText::new(Self::short_name(base)).color(dim))
+                    .on_hover_text(format!(
+                        "The configuration's output folder — the result goes to \
+                         Run_<run>/normalization in there\n{}",
+                        base.display()
+                    ));
+            }
+            (None, None) => {
+                ui.label(egui::RichText::new("—").color(dim))
+                    .on_hover_text("Select a configuration file (section 2)");
+            }
+        }
+    }
+
+    /// "Config" cell of one row: the configuration file the run's
+    /// normalization ran with (recorded at launch, or read from the job
+    /// log of a result found on disk), else the selected one, dimmed.
+    fn config_cell(&self, ui: &mut egui::Ui, run: u64, kind: h5::RunKind) {
+        let dim = theme::text_emphasis(ui.visuals());
+        if kind != h5::RunKind::Sample {
+            ui.label(egui::RichText::new("—").color(dim));
+            return;
+        }
+        match self.run_meta.get(&run) {
+            Some(RunMeta { config: Some(config), .. }) => {
+                ui.label(Self::short_name(config)).on_hover_text(format!(
+                    "Configuration this run's normalization ran with\n{}",
+                    config.display()
+                ));
+            }
+            Some(_) => {
+                ui.label(egui::RichText::new("?").color(dim)).on_hover_text(
+                    "Normalized, but its job log names no configuration file (result \
+                     produced by another tool, or log missing)",
+                );
+            }
+            None => self.planned_config_cell(ui),
+        }
+    }
+
+    /// "Output" cell of one row: the base folder the run's result sits
+    /// in (`<here>/Run_<run>/normalization`), else where it will go.
+    fn output_cell(&self, ui: &mut egui::Ui, run: u64, kind: h5::RunKind) {
+        let dim = theme::text_emphasis(ui.visuals());
+        if kind != h5::RunKind::Sample {
+            ui.label(egui::RichText::new("—").color(dim));
+            return;
+        }
+        match self.run_meta.get(&run).and_then(|m| m.output.as_ref()) {
+            Some(output) => {
+                // `<base>/Run_<run>/normalization` → show `<base>`.
+                let base = output
+                    .parent()
+                    .and_then(|row| row.parent())
+                    .unwrap_or(output);
+                let overridden = self
+                    .run_overrides
+                    .get(&run)
+                    .is_some_and(|o| o.output.is_some());
+                let text = egui::RichText::new(Self::short_name(base));
+                let text = if overridden { text.color(theme::INFO) } else { text };
+                ui.label(text).on_hover_text(format!(
+                    "Result folder of this run's normalization{}\n{}",
+                    if overridden { " (output folder chosen for this run, ✏)" } else { "" },
+                    output.display()
+                ));
+            }
+            None => self.planned_output_cell(ui, Some(run)),
         }
     }
 
@@ -2768,34 +3956,47 @@ impl MonitorApp {
     /// "▶ normalize" button for runs auto normalization does not cover),
     /// progress bar while NeuNorm runs, view/open icons when done, error +
     /// retry when failed. `watched` = auto normalization will (or did)
-    /// pick this run.
+    /// pick this run. `special` = the kind and recorded image folder of a
+    /// run that is never normalized (alignment, open beam).
     fn normalized_cell(
         ui: &mut egui::Ui,
         run: &files::RunFiles,
         state: Option<&norm::JobState>,
-        alignment_folder: Option<&String>,
+        special: Option<(h5::RunKind, &String)>,
         watched: bool,
         no_config: bool,
         view_normalized: &mut Option<PathBuf>,
         open_normalized: &mut Option<PathBuf>,
         retry_run: &mut Option<u64>,
+        rerun: &mut Option<u64>,
         output_toggle: &mut Option<norm::JobTarget>,
     ) {
         let target = norm::JobTarget::Run(run.run);
         let dim = theme::text_emphasis(ui.visuals());
-        // An alignment run (its NeXus files it under images/…/alignment):
-        // nothing to normalize — said once its NeXus is read, unless a
-        // result exists anyway (then the result is shown as usual).
-        if let (Some(folder), None | Some(norm::JobState::Idle)) = (alignment_folder, state) {
-            ui.label(
-                egui::RichText::new("alignment run — no normalization needed").color(dim),
-            )
-            .on_hover_text(format!(
-                "The NeXus records this run's images under an alignment folder \
-                 (BL10:Exp:IM:ImageFilePath log): an alignment run is not corrected \
-                 by the autoreduction and is not normalized — nothing to check or \
-                 wait for\n{folder}"
-            ));
+        // An alignment run (its NeXus files it under images/…/alignment)
+        // or an open-beam run (images/…/ob): nothing to normalize — said
+        // once its NeXus is read, unless a result exists anyway (then the
+        // result is shown as usual).
+        if let (Some((kind, folder)), None | Some(norm::JobState::Idle)) = (special, state) {
+            let (text, hover) = match kind {
+                h5::RunKind::OpenBeam => (
+                    "open beam — no normalization needed",
+                    "The NeXus records this run's images under an ob folder \
+                     (BL10:Exp:IM:ImageFilePath log): an open-beam run is a \
+                     normalization input, not something to normalize. Once its \
+                     corrected data is complete, the banner above the table offers \
+                     to make it the open beam of the upcoming runs",
+                ),
+                _ => (
+                    "alignment run — no normalization needed",
+                    "The NeXus records this run's images under an alignment folder \
+                     (BL10:Exp:IM:ImageFilePath log): an alignment run is not corrected \
+                     by the autoreduction and is not normalized — nothing to check or \
+                     wait for",
+                ),
+            };
+            ui.label(egui::RichText::new(text).color(dim))
+                .on_hover_text(format!("{hover}\n{folder}"));
             return;
         }
         match state {
@@ -2908,6 +4109,17 @@ impl MonitorApp {
                         .clicked()
                     {
                         *open_normalized = Some(output.clone());
+                    }
+                    if ui
+                        .button("↻")
+                        .on_hover_text(
+                            "Re-run this normalization with the row's current settings \
+                             (open beams: ⇄ replace by…; output folder: ✏). The \
+                             previous result is kept as normalization.previous",
+                        )
+                        .clicked()
+                    {
+                        *rerun = Some(run.run);
                     }
                     Self::output_toggle(ui, target, output_toggle);
                 });
@@ -3090,6 +4302,7 @@ fn main() -> eframe::Result<()> {
         APP_TITLE,
         native_options,
         Box::new(|cc| {
+            install_fonts(&cc.egui_ctx);
             // Saved light/dark preference, shared by all the VENUS rust
             // tools (dark when none is saved); the controls bar has a toggle.
             cc.egui_ctx.set_theme(theme::load());
@@ -3098,4 +4311,76 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(MonitorApp::new()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ob_suffix_is_stripped_not_chained() {
+        let strip = MonitorApp::strip_ob_suffix;
+        assert_eq!(strip("normalization_config_20260910_102311_last"), "normalization_config_20260910_102311_last");
+        assert_eq!(strip("normalization_config_20260910_102311_last_ob_29962"), "normalization_config_20260910_102311_last");
+        assert_eq!(strip("normalization_config_20260910_102311_ob_29962_29963"), "normalization_config_20260910_102311");
+        // A trailing number that is not an _ob_ suffix stays.
+        assert_eq!(strip("normalization_config_20260910_102311"), "normalization_config_20260910_102311");
+        assert_eq!(strip("my_ob"), "my_ob");
+        assert_eq!(strip("config_ob_"), "config_ob_");
+    }
+
+    #[test]
+    fn scans_the_corrected_open_beams_of_a_real_ipts() {
+        let ipts = Path::new("/SNS/VENUS/IPTS-37705");
+        if !ipts.join("shared/autoreduce/images/tpx1/ob").is_dir() {
+            return;
+        }
+        let extra = vec![PathBuf::from("/SNS/VENUS/IPTS-1/shared/autoreduce/images/tpx1/ob/x/Run_5_ob_0")];
+        let choices = MonitorApp::scan_ob_choices(ipts, &extra);
+        // Newest first; 30051 is one of the open beams of that IPTS.
+        let runs: Vec<Option<u64>> = choices.iter().map(|c| c.run).collect();
+        assert!(runs.contains(&Some(30051)), "{runs:?}");
+        assert!(runs.windows(2).all(|w| w[0] >= w[1]), "{runs:?}");
+        let ob = choices.iter().find(|c| c.run == Some(30051)).unwrap();
+        assert!(ob.complete);
+        assert!(ob.frames > 0);
+        assert!(ob.folder.starts_with("/SNS/VENUS/IPTS-37705/shared/autoreduce/images/tpx1/ob"));
+        // A folder the configuration names elsewhere is offered too
+        // (incomplete: it does not exist), and never twice.
+        let missing = choices.iter().filter(|c| c.folder == extra[0]).count();
+        assert_eq!(missing, 1);
+        assert!(!choices.iter().find(|c| c.folder == extra[0]).unwrap().complete);
+        // The previous-result folder name used by re-run.
+        assert_eq!(
+            Path::new("/x/Run_1/normalization").with_extension("previous"),
+            PathBuf::from("/x/Run_1/normalization.previous")
+        );
+    }
+
+    #[test]
+    fn ob_run_numbers_come_from_the_folder_names() {
+        let folders = vec![
+            PathBuf::from("/x/ob/20260909_Run_29905_virgin_c_ob_1_185C_1_000AngsMin_ob_0"),
+            PathBuf::from("/x/ob/20260909_Run_29906_virgin_c_ob_1_185C_1_000AngsMin_ob_1"),
+            PathBuf::from("/x/ob/no_run_here"),
+        ];
+        assert_eq!(MonitorApp::ob_run_numbers(&folders), vec![29905, 29906]);
+        assert_eq!(MonitorApp::ob_runs_text(&folders), "29905, 29906");
+        assert_eq!(MonitorApp::ob_runs_text(&folders[2..]), "no_run_here");
+        assert_eq!(MonitorApp::ob_runs_text(&[]), "");
+    }
+}
+
+/// egui's proportional family (Ubuntu-Light + the emoji fonts) has no glyph
+/// for the arrows (→ ← ↑ ↓), bullets and similar symbols used in the labels,
+/// which then show up as squares; the bundled monospace font Hack has them,
+/// so it is appended as the last fallback of the proportional family.
+fn install_fonts(ctx: &eframe::egui::Context) {
+    let mut fonts = eframe::egui::FontDefinitions::default();
+    if let Some(family) = fonts.families.get_mut(&eframe::egui::FontFamily::Proportional) {
+        if !family.iter().any(|f| f == "Hack") {
+            family.push("Hack".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
 }

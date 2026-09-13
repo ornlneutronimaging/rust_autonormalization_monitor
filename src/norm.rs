@@ -226,6 +226,89 @@ pub struct JobSpec {
     crop: Option<((usize, usize, usize, usize), PathBuf)>,
 }
 
+impl JobSpec {
+    /// The open-beam folders the job normalizes with.
+    pub fn ob_folders(&self) -> Vec<PathBuf> {
+        self.obs.iter().map(|(folder, _)| folder.clone()).collect()
+    }
+
+    /// The configuration file the job normalizes with.
+    pub fn config(&self) -> &Path {
+        &self.config
+    }
+
+    /// The final result folder of the job.
+    pub fn output(&self) -> &Path {
+        &self.output
+    }
+}
+
+/// What a finished normalization was launched with, read back from its
+/// job log (`<row>/logs/normalization.log`, written by this tool and by
+/// the workflow runner alike): the `running: "python" "script" "--config"
+/// "<file>" … "--ob" "<folder>" …` line — its last occurrence, the one of
+/// the launch that produced the result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchInfo {
+    /// The `--config` file, when the line names one.
+    pub config: Option<PathBuf>,
+    /// The `--ob` folders, in order.
+    pub obs: Vec<PathBuf>,
+}
+
+/// The launch a job log records (see [`LaunchInfo`]). `None` when the log
+/// is missing or has no `running:` line naming an open beam or a
+/// configuration.
+pub fn launch_from_log(log: &Path) -> Option<LaunchInfo> {
+    let text = std::fs::read_to_string(log).ok()?;
+    text.lines()
+        .rev()
+        .filter(|line| line.contains("running:"))
+        .filter_map(|line| {
+            let info = launch_from_command_line(line);
+            (!info.obs.is_empty() || info.config.is_some()).then_some(info)
+        })
+        .next()
+}
+
+/// The `--config` / `--ob` arguments of a `running: {cmd:?}` log line:
+/// the Debug form of a `Command` quotes every argument (`"--ob"
+/// "/path/x"`), so the tokens are the quoted strings in order, and a
+/// value is the token after its flag.
+fn launch_from_command_line(line: &str) -> LaunchInfo {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (in_quotes, c) {
+            (false, '"') => in_quotes = true,
+            (true, '"') => {
+                in_quotes = false;
+                tokens.push(std::mem::take(&mut current));
+            }
+            (true, '\\') => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
+            (true, c) => current.push(c),
+            _ => {}
+        }
+    }
+    LaunchInfo {
+        config: tokens
+            .windows(2)
+            .find(|pair| pair[0] == "--config")
+            .map(|pair| PathBuf::from(&pair[1])),
+        obs: tokens
+            .windows(2)
+            .filter(|pair| pair[0] == "--ob")
+            .map(|pair| PathBuf::from(&pair[1]))
+            .collect(),
+    }
+}
+
 /// The workflow runner's crop-copy parent folder for a region.
 fn crop_parent(base: &Path, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> PathBuf {
     base.join(format!("cropped_x0{x0}_y0{y0}_x1{x1}_y1{y1}"))
@@ -923,6 +1006,56 @@ mod tests {
         assert!(err.contains("run 29902: 2 images"), "{err}");
         std::fs::write(ob.join("o_2.tif"), "x").unwrap();
         assert!(check_frame_counts(&samples, &obs).is_ok());
+    }
+
+    #[test]
+    fn open_beams_are_read_back_from_a_job_log() {
+        let dir = std::env::temp_dir().join("anm_test_obs_from_log");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("normalization.log");
+        // Two launches: the first with one OB, the second (the one that
+        // produced the result) with two — the last one counts.
+        std::fs::write(
+            &log,
+            "[2026-09-10T18:06:22Z] running: \"/py\" \"/s.py\" \"--config\" \"/c.h5\" \
+             \"--sample\" \"/x/Run_1_s\" \"--sample-nexus\" \"/n/1.h5\" \"--ob\" \"/ob/Run_5_ob_0\" \
+             \"--ob-nexus\" \"/n/5.h5\"\n  | some output\n\
+             [2026-09-10T18:09:00Z] running: \"/py\" \"/s.py\" \"--ob\" \"/ob/Run_7_ob_0\" \
+             \"--ob-nexus\" \"/n/7.h5\" \"--ob\" \"/ob/with space/Run_8_ob_1\" \"--ob-nexus\" \"/n/8.h5\"\n\
+             [2026-09-10T18:10:00Z] done\n",
+        )
+        .unwrap();
+        assert_eq!(
+            launch_from_log(&log),
+            Some(LaunchInfo {
+                config: None,
+                obs: vec![
+                    PathBuf::from("/ob/Run_7_ob_0"),
+                    PathBuf::from("/ob/with space/Run_8_ob_1"),
+                ],
+            })
+        );
+        // No running line / missing file → None.
+        std::fs::write(&log, "[t] nothing here\n").unwrap();
+        assert_eq!(launch_from_log(&log), None);
+        assert_eq!(launch_from_log(&dir.join("missing.log")), None);
+    }
+
+    #[test]
+    fn open_beams_of_a_real_job_log() {
+        let log = Path::new(
+            "/SNS/VENUS/IPTS-37705/shared/first_ct_attempt_v2/Run_29908/logs/normalization.log",
+        );
+        if !log.is_file() {
+            return;
+        }
+        let info = launch_from_log(log).expect("the log names open beams");
+        assert_eq!(info.obs.len(), 3);
+        assert!(info.obs[0].ends_with("20260909_Run_29905_virgin_c_ob_1_185C_1_000AngsMin_ob_0"));
+        assert!(info
+            .config
+            .is_some_and(|c| c.ends_with("normalization_config_20260910_102311_last.h5")));
     }
 
     #[test]

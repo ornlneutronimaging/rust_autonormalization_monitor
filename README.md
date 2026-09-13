@@ -12,7 +12,8 @@ Single view, top to bottom:
 2. **Normalization configuration** — dropdown of the `.h5` files in
    `<IPTS>/shared/autoreduce` and its `configs/` subfolder (newest first,
    the newest selected by default — at startup too, so the file the
-   notebook saved last is the one in use; hover for
+   notebook saved last, or the `_ob_<run>` copy this app wrote last when
+   switching open beams, is the one in use; hover for
    the full path), a **📂 Browse…** button to pick a configuration file
    from anywhere (the native file dialog opens in `<IPTS>/shared`), and a
    **👁 Preview** button that opens the selected file in the
@@ -88,8 +89,9 @@ Single view, top to bottom:
    unmeasured pixels — silent inside NeuNorm — is reported as its own
    stage), and once done the
    cell reads **✔ normalization done** (hover: time and path) with a
-   **👁 view** button opening the result in the rust_tiff_viewer and a
-   **📂 folder** button jumping to the folder in the file manager. The
+   **👁 view** button opening the result in the rust_tiff_viewer, a
+   **📂 folder** button jumping to the folder in the file manager and a
+   **↻** re-run button (below). The
    viewer is launched with `--detector <name>` (the configuration's
    `detector` attribute, e.g. `tpx1`, else the single detector folder of
    `shared/autoreduce/images`), so Timepix stacks open transposed the right
@@ -107,6 +109,62 @@ Single view, top to bottom:
    "normalize all missing" and never enters the windows (nor the timeline
    anchor — the bar is greyed and tagged "(alignment)" like a rejected
    run's).
+   **Open-beam runs** are recognized the same way (filed under
+   `images/<detector>/ob/…`): the autoreduction corrects them like any
+   run, but they are normalization *inputs* — the row reads **open beam —
+   no normalization needed**, is skipped by the automatic pass and by
+   "normalize all missing", and never enters the windows (timeline tag
+   "(open beam)"). Its ✖ reject only keeps it out of the banner below.
+   An **Open beam** column names, for every row, the open-beam run(s) the
+   normalization divides by: what the result actually used for a
+   normalized run (recorded when the job is launched here, read back from
+   the `--ob` arguments of `Run_<run>/logs/normalization.log` for a result
+   found on disk — this tool and the workflow runner write the same log),
+   the configuration's open beams, dimmed, for a run still to come (and
+   for the "(next)" row). An open-beam row shows **✔ in use** when it is
+   one of the configuration's open beams, **new** when it landed after
+   them. When such new open beam(s) exist, a notice above the table —
+   **🔆 New open beam run(s): 29962, 29963** — says so (and which are
+   still waiting for their corrected data); it disappears once the
+   configuration names them, an even newer open beam brings it back.
+   **⇄ replace by…**, right after the Open beam cell of every sample row,
+   is how the open beams get switched: it opens a window listing every
+   corrected open-beam folder of the IPTS
+   (`shared/autoreduce/images/<detector>/ob`, newest first, frame count
+   of each, the run's own frame count recalled at the top and a mismatch
+   flagged, a folder still being written cannot be ticked, the
+   configuration's marked and the ones the run currently uses ticked) —
+   tick any (1 or more), then either **Replace for this run** (that run
+   only: it is normalized at once when its corrected data is complete —
+   re-run when it already was, the previous result kept as
+   `normalization.previous` — otherwise as soon as it is), or **Replace
+   for this run and every upcoming run**: a copy of the selected
+   configuration file with those folders as its `ob/folders` (everything
+   else kept: sample, masks, settings, output folder; `ob/run_spec` and a
+   `derived_from` root attribute say where it comes from) is written next
+   to it as `<name>_ob_<run>_<run>.h5` and selected, so every run
+   normalized from then on — per-run and windows alike — divides by the
+   new open beams; with auto normalization ON the new file is registered
+   in `autoreduction.cfg` at once. Runs already normalized are not redone.
+   **Config** and **Output** columns name, for every row, the
+   configuration file the normalization ran with and the base folder its
+   result sits in (`<base>/Run_<run>/normalization`; hover for the full
+   paths) — from the job log for a result found on disk, the selected
+   configuration and its output folder, dimmed, for a run still to come.
+   **✎ next to the Output cell** opens a window to type or browse another
+   output folder for that run only: **Apply** keeps it (the automatic
+   normalization and the ▶ normalize button use it; a result already
+   there is looked up in the new folder), **Apply & normalize now / re-run
+   now** runs it at once. The Open beam / Output cells of a run with its
+   own open beams / output folder read in blue and the ⇄ / ✎ buttons are
+   highlighted; these per-run choices are kept for the session.
+   **↻ re-run** on every normalized row runs the normalization again with
+   the row's current settings (in case a setting, an open beam or the
+   configuration changed after all): the result already sitting where the
+   new one goes is moved aside as `normalization.previous` (replacing an
+   older one — the job never runs twice into the same folder, and the
+   append-only job log keeps the history); a result elsewhere (other
+   output folder) is left alone.
    A **📋** button on any normalized row (running, done or failed) opens an
    output panel under the table with the job's output as it streams —
    the script's own messages, the NeuNorm log lines, the runner's steps.
