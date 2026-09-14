@@ -1,6 +1,7 @@
-//! Minimal HDF5 reading: acquisition times and the alignment flag of a
-//! VENUS NeXus file, and the open-beam entries of a normalization session
-//! configuration. The tolerant
+//! Minimal HDF5 reading: acquisition times and the kind (sample, open
+//! beam, alignment) of a VENUS NeXus file, and the open-beam entries of a
+//! normalization session configuration — plus the one write this tool
+//! does: a copy of a configuration with its open beams replaced. The tolerant
 //! string reading follows `rust_nexus_viewer`'s `h5io` module (the proven
 //! way to read h5py-written files with `hdf5-metno`).
 
@@ -85,16 +86,38 @@ pub fn nexus_image_path(path: &Path) -> Option<String> {
         .find(|s| !s.is_empty())
 }
 
-/// Is the image folder recorded by [`nexus_image_path`] that of an
-/// alignment run? The DAQ files alignment runs under an `alignment` folder
-/// of the IPTS `images` tree (instead of `raw/…` or `ob/…`). Alignment
-/// runs are never corrected by the autoreduction and need no
-/// normalization. An `alignment` path component (any case) anywhere in
-/// the path tells.
-pub fn image_path_is_alignment(image_path: &str) -> bool {
-    image_path
-        .split(['/', '\\'])
-        .any(|part| part.trim().eq_ignore_ascii_case("alignment"))
+/// What a run is, per the image folder its NeXus records. The DAQ files
+/// alignment runs under an `alignment` folder of the IPTS `images` tree
+/// and open beams under an `ob` folder (samples under `raw/…`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunKind {
+    /// A regular (sample) run — the only kind that gets normalized.
+    Sample,
+    /// An open-beam run: the DAQ files it under an `ob` folder of the
+    /// IPTS `images` tree. It is corrected by the autoreduction like any
+    /// run, but never normalized: it is a normalization INPUT.
+    OpenBeam,
+    /// An alignment run (`alignment` folder): never corrected, never
+    /// normalized.
+    Alignment,
+}
+
+/// Classify the image folder recorded by [`nexus_image_path`]: an
+/// `alignment` or `ob` path component (any case) anywhere in the path
+/// tells; anything else is a sample run. Alignment runs are never
+/// corrected by the autoreduction and need no normalization; open beams
+/// are corrected but are normalization inputs, never normalized.
+pub fn image_path_kind(image_path: &str) -> RunKind {
+    for part in image_path.split(['/', '\\']) {
+        let part = part.trim();
+        if part.eq_ignore_ascii_case("alignment") {
+            return RunKind::Alignment;
+        }
+        if part.eq_ignore_ascii_case("ob") {
+            return RunKind::OpenBeam;
+        }
+    }
+    RunKind::Sample
 }
 
 /// Numeric dataset read as f64 whatever its stored numeric flavor (the
@@ -139,6 +162,7 @@ pub fn daslog(path: &Path, name: &str) -> Option<Vec<(DateTime<FixedOffset>, f64
 
 /// What the auto-normalization launcher needs out of a normalization
 /// session configuration file (schema of the marimo notebook, version 1).
+#[derive(Clone, Debug)]
 pub struct ConfigInfo {
     /// Detector-corrected open-beam folders (NeuNorm `--ob` inputs).
     pub ob_folders: Vec<PathBuf>,
@@ -188,6 +212,81 @@ pub fn read_config_info(path: &Path) -> Result<ConfigInfo, String> {
     })
 }
 
+/// Write a copy of the configuration `src` at `dst` with its open beams
+/// replaced by `ob_folders` (the `ob/folders` dataset, variable-length
+/// UTF-8 strings as the notebook writes them, and the `ob/run_spec`
+/// attribute set to `run_spec`, e.g. `29962, 29963`). Everything else —
+/// sample, masks, normalization settings, output folder — is kept
+/// byte-for-byte (the file is copied first). The root gets a
+/// `derived_from` attribute naming `src` and a fresh `created` time so the
+/// notebook and the viewers can tell where the file comes from. `dst` is
+/// overwritten if it exists.
+pub fn write_config_with_obs(
+    src: &Path,
+    dst: &Path,
+    ob_folders: &[PathBuf],
+    run_spec: &str,
+) -> Result<(), String> {
+    use hdf5_metno::types::VarLenUnicode;
+    if ob_folders.is_empty() {
+        return Err("no open-beam folder to write".to_owned());
+    }
+    let folders: Vec<VarLenUnicode> = ob_folders
+        .iter()
+        .map(|f| {
+            f.to_string_lossy()
+                .parse::<VarLenUnicode>()
+                .map_err(|e| format!("open-beam path is not valid UTF-8: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    std::fs::copy(src, dst).map_err(|e| {
+        format!("cannot copy {} to {}: {e}", src.display(), dst.display())
+    })?;
+    let result = (|| -> Result<(), String> {
+        let file = h5::File::open_rw(dst)
+            .map_err(|e| format!("cannot open {} for writing: {e}", dst.display()))?;
+        let ob = match file.group("ob") {
+            Ok(group) => group,
+            Err(_) => file
+                .create_group("ob")
+                .map_err(|e| format!("cannot create the ob group: {e}"))?,
+        };
+        if ob.link_exists("folders") {
+            ob.unlink("folders")
+                .map_err(|e| format!("cannot replace ob/folders: {e}"))?;
+        }
+        ob.new_dataset_builder()
+            .with_data(&folders)
+            .create("folders")
+            .map_err(|e| format!("cannot write ob/folders: {e}"))?;
+        let set_string_attr = |loc: &h5::Location, name: &str, value: &str| {
+            let value = value
+                .parse::<VarLenUnicode>()
+                .map_err(|e| format!("attribute {name} is not valid UTF-8: {e}"))?;
+            if loc.attr_names().map(|names| names.iter().any(|n| n == name)).unwrap_or(false) {
+                loc.delete_attr(name)
+                    .map_err(|e| format!("cannot replace attribute {name}: {e}"))?;
+            }
+            loc.new_attr::<VarLenUnicode>()
+                .create(name)
+                .and_then(|a| a.write_scalar(&value))
+                .map_err(|e| format!("cannot write attribute {name}: {e}"))
+        };
+        set_string_attr(&ob, "run_spec", run_spec)?;
+        set_string_attr(&file, "derived_from", &src.display().to_string())?;
+        set_string_attr(
+            &file,
+            "created",
+            &chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(dst);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,17 +309,80 @@ mod tests {
 
     #[test]
     fn classifies_image_paths() {
-        assert!(image_path_is_alignment(
+        let alignment = |p: &str| image_path_kind(p) == RunKind::Alignment;
+        assert!(alignment(
             "images/tpx1/alignment/20260910_x_10_000s/20260910_Run_29949_x_10_000s"
         ));
-        assert!(image_path_is_alignment("images/tpx1/ALIGNMENT/foo   "));
-        assert!(!image_path_is_alignment(
-            "images/tpx1/raw/radiography/20260910_t/20260910_Run_29955_t_0"
-        ));
-        assert!(!image_path_is_alignment("images/tpx1/ob/20260910_ob/20260910_Run_29962_ob_0"));
+        assert!(alignment("images/tpx1/ALIGNMENT/foo   "));
+        assert!(!alignment("images/tpx1/raw/radiography/20260910_t/20260910_Run_29955_t_0"));
+        assert!(!alignment("images/tpx1/ob/20260910_ob/20260910_Run_29962_ob_0"));
         // A title mentioning alignment is not an alignment folder.
-        assert!(!image_path_is_alignment("images/tpx1/raw/radiography/alignment_test/Run_1"));
-        assert!(!image_path_is_alignment(""));
+        assert!(!alignment("images/tpx1/raw/radiography/alignment_test/Run_1"));
+        assert!(!alignment(""));
+        // Open beams: the `ob` folder of the images tree, whatever the
+        // case; a title mentioning ob is still a sample.
+        assert_eq!(
+            image_path_kind("images/tpx1/ob/20260910_ob/20260910_Run_29962_ob_0"),
+            RunKind::OpenBeam
+        );
+        assert_eq!(image_path_kind("images/tpx1/OB/x/Run_1_ob_0"), RunKind::OpenBeam);
+        assert_eq!(
+            image_path_kind("images/tpx1/raw/radiography/20260910_t/20260910_Run_29955_t_0"),
+            RunKind::Sample
+        );
+        assert_eq!(
+            image_path_kind("images/tpx1/raw/ct/virgin_c_ob_1_185C/Run_29909_ob_0"),
+            RunKind::Sample
+        );
+        assert_eq!(image_path_kind("images/tpx1/alignment/x/Run_1"), RunKind::Alignment);
+        assert_eq!(image_path_kind(""), RunKind::Sample);
+    }
+
+    #[test]
+    fn derives_a_config_with_other_open_beams() {
+        let src = Path::new(
+            "/SNS/VENUS/IPTS-37705/shared/autoreduce/normalization_config_20260910_102311_last.h5",
+        );
+        if !src.is_file() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("anm_test_derive_config");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("derived.h5");
+        let obs = vec![
+            PathBuf::from("/SNS/VENUS/IPTS-37705/shared/autoreduce/images/tpx1/ob/a/Run_29962_ob_0"),
+            PathBuf::from("/SNS/VENUS/IPTS-37705/shared/autoreduce/images/tpx1/ob/a/Run_29963_ob_1"),
+        ];
+        write_config_with_obs(src, &dst, &obs, "29962, 29963").unwrap();
+        let before = read_config_info(src).unwrap();
+        let after = read_config_info(&dst).unwrap();
+        assert_eq!(after.ob_folders, obs);
+        assert_ne!(before.ob_folders, after.ob_folders);
+        // Everything else is carried over.
+        assert_eq!(after.output_folder, before.output_folder);
+        assert_eq!(after.detector, before.detector);
+        assert_eq!(after.crop_region, before.crop_region);
+        let file = h5::File::open(&dst).unwrap();
+        assert_eq!(
+            dataset_strings(&file, "sample/folders"),
+            dataset_strings(&h5::File::open(src).unwrap(), "sample/folders")
+        );
+        let attr = |loc: &h5::Location, name: &str| {
+            loc.attr(name).ok().and_then(|a| read_strings(&a)?.into_iter().next())
+        };
+        assert_eq!(attr(&file.group("ob").unwrap(), "run_spec").as_deref(), Some("29962, 29963"));
+        assert_eq!(attr(&file, "derived_from").as_deref(), Some(src.to_str().unwrap()));
+        assert!(attr(&file, "notebook").is_some());
+        // Writing again over the same file works (it is overwritten) —
+        // once nobody holds it open (the HDF5 library refuses otherwise).
+        drop(file);
+        write_config_with_obs(src, &dst, &obs[..1], "29962").unwrap();
+        assert_eq!(read_config_info(&dst).unwrap().ob_folders, obs[..1]);
+        // No open beam → error, nothing left behind.
+        let bad = dir.join("bad.h5");
+        assert!(write_config_with_obs(src, &bad, &[], "").is_err());
+        assert!(!bad.exists());
     }
 
     #[test]
@@ -232,12 +394,14 @@ mod tests {
         // 29949 was filed under images/tpx1/alignment, 29955 under raw/
         // (the log's first value is the previous run's folder — the last
         // one must be used).
-        let alignment = |run: u64| {
+        let kind = |run: u64| {
             nexus_image_path(&ipts.join(format!("VENUS_{run}.nxs.h5")))
-                .map(|p| image_path_is_alignment(&p))
+                .map(|p| image_path_kind(&p))
         };
-        assert_eq!(alignment(29949), Some(true));
-        assert_eq!(alignment(29955), Some(false));
+        assert_eq!(kind(29949), Some(RunKind::Alignment));
+        assert_eq!(kind(29955), Some(RunKind::Sample));
+        // 29905 is one of the open beams of the IPTS configuration.
+        assert_eq!(kind(29905), Some(RunKind::OpenBeam));
         assert!(nexus_image_path(&ipts.join("VENUS_29955.nxs.h5"))
             .is_some_and(|p| p.ends_with("Run_29955_Fe_powder_11mm_1_190C_1_000AngsMin_0")));
         // Missing file → None, no panic.
