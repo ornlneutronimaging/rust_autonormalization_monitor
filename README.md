@@ -146,11 +146,22 @@ Single view, top to bottom:
    normalized from then on — per-run and windows alike — divides by the
    new open beams; with auto normalization ON the new file is registered
    in `autoreduction.cfg` at once. Runs already normalized are not redone.
-   **Config** and **Output** columns name, for every row, the
-   configuration file the normalization ran with and the base folder its
-   result sits in (`<base>/Run_<run>/normalization`; hover for the full
-   paths) — from the job log for a result found on disk, the selected
-   configuration and its output folder, dimmed, for a run still to come.
+   The **Config** column is a drop-down on every sample row (the
+   upcoming "(next)" row included — a pick there applies once the run
+   lands) listing the configuration files of the IPTS, the same list as
+   section 2; its first entry follows the section 2 selection. Picking
+   another file normalizes that run with it — its open beams, settings
+   and output folder (the ⇄ / ✏ choices of the row still win) — and
+   looks its existing result up in that file's output folder; the cell
+   reads in blue, and the ⇄ / ✏ editors of the row start from that
+   file's open beams and output folder. Hovering the cell also names the
+   file a normalized run actually ran with (from its job log for a
+   result found on disk) when it is not the one shown — ↻ re-run
+   normalizes again with the file shown. The **Output** column names,
+   for every row, the base folder the result sits in
+   (`<base>/Run_<run>/normalization`; hover for the full path) — from
+   the job log for a result found on disk, the configuration's output
+   folder, dimmed, for a run still to come.
    **✎ next to the Output cell** opens a window to type or browse another
    output folder for that run only: **Apply** keeps it (the automatic
    normalization and the ▶ normalize button use it; a result already

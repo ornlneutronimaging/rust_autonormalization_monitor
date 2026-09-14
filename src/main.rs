@@ -18,6 +18,8 @@
 //!    the row shows the progress, then view / open-folder icons. Older
 //!    runs show the same icons when their result already sits in the
 //!    configuration's output folder, or a button to normalize them now.
+//!    A Config drop-down on every row lets a run be normalized with
+//!    another configuration file than the section 2 selection.
 //!    Each row also names the open beam(s) its normalization uses. An
 //!    open-beam run (filed under `images/…/ob` by the DAQ) is never
 //!    normalized; once its corrected data is there, a banner offers to
@@ -185,6 +187,18 @@ struct RunOverride {
     obs: Option<Vec<PathBuf>>,
     /// Output base folder: the result goes to `<here>/Run_<run>/normalization`.
     output: Option<PathBuf>,
+    /// Configuration file (the Config drop-down): this run is normalized
+    /// with it instead of the section 2 selection — its open beams,
+    /// settings and output folder, unless the two overrides above say
+    /// otherwise.
+    config: Option<PathBuf>,
+}
+
+impl RunOverride {
+    /// Nothing overridden — the entry can be dropped.
+    fn is_empty(&self) -> bool {
+        self.obs.is_none() && self.output.is_none() && self.config.is_none()
+    }
 }
 
 /// One selectable open beam in the run editor: a corrected open-beam
@@ -307,6 +321,10 @@ struct MonitorApp {
     /// Per-run overrides of the open beams / output folder (✏ in the
     /// table), kept for the session.
     run_overrides: HashMap<u64, RunOverride>,
+    /// What the configuration files picked in the Config column contain
+    /// (read when picked, refreshed at every pass): the open beams and
+    /// output folder the rows using them show and start from.
+    config_infos: HashMap<PathBuf, h5::ConfigInfo>,
     /// The per-run settings window, when open.
     run_editor: Option<RunEditor>,
     /// Error from the last "use as open beam" attempt (writing the
@@ -410,6 +428,7 @@ impl MonitorApp {
             config_obs: Vec::new(),
             run_meta: HashMap::new(),
             run_overrides: HashMap::new(),
+            config_infos: HashMap::new(),
             run_editor: None,
             ob_error: None,
             runs_view: RunsView::Table,
@@ -478,6 +497,7 @@ impl MonitorApp {
         self.config_obs.clear();
         self.run_meta.clear();
         self.run_overrides.clear();
+        self.config_infos.clear();
         self.run_editor = None;
         self.ob_error = None;
         self.output_base = None;
@@ -885,32 +905,41 @@ impl MonitorApp {
             // the runs that landed meanwhile.
             Err(_) => {}
         }
-        let Some(config) = self.selected_config.clone() else {
-            return; // nothing to look up or normalize with — retried next refresh
-        };
         // Alignment and open-beam runs are left alone: nothing to look up
-        // or normalize.
-        let pending: Vec<u64> = self
+        // or normalize. A run without any configuration (none selected in
+        // section 2, none picked in its Config drop-down) has nothing to
+        // look up or normalize with — retried next refresh.
+        let pending: Vec<(u64, PathBuf)> = self
             .run_files
             .iter()
             .map(|rf| rf.run)
             .filter(|run| !self.run_jobs.contains_key(run) && !self.skips_normalization(*run))
+            .filter_map(|run| self.config_for_run(run).map(|config| (run, config)))
             .collect();
         if pending.is_empty() {
             return;
         }
-        let info = match h5::read_config_info(&config) {
-            Ok(info) => info,
-            Err(e) => {
-                // Surface the problem on the runs that would need it.
-                for run in pending {
+        // Each distinct configuration file is read once per pass (most
+        // runs share the section 2 file; the Config column may point a
+        // few of them elsewhere — those readings also refresh what their
+        // rows show).
+        let mut infos: HashMap<PathBuf, Result<h5::ConfigInfo, String>> = HashMap::new();
+        for (run, config) in pending {
+            let info = infos
+                .entry(config.clone())
+                .or_insert_with(|| h5::read_config_info(&config));
+            let info = match info {
+                Ok(info) => info.clone(),
+                Err(e) => {
+                    // Surface the problem on the run that needs it.
                     self.run_jobs
                         .insert(run, norm::JobState::Failed { message: e.clone(), log: None });
+                    continue;
                 }
-                return;
+            };
+            if Some(&config) != self.selected_config.as_ref() {
+                self.config_infos.insert(config.clone(), info.clone());
             }
-        };
-        for run in pending {
             // The row's own settings (✏) decide where its result lives.
             let output = norm::run_output_dir(&ipts_path, run, &self.effective_info(run, &info));
             if norm::output_is_done(&output) {
@@ -1052,10 +1081,96 @@ impl MonitorApp {
         self.run_jobs.insert(run, state);
     }
 
+    /// The configuration file a run is normalized with: the one picked in
+    /// its Config drop-down, else the section 2 selection.
+    fn config_for_run(&self, run: u64) -> Option<PathBuf> {
+        self.run_overrides
+            .get(&run)
+            .and_then(|o| o.config.clone())
+            .or_else(|| self.selected_config.clone())
+    }
+
+    /// The contents of the configuration picked for a run in its Config
+    /// drop-down (`None` when the run follows the section 2 selection, or
+    /// the file could not be read).
+    fn own_config_info(&self, run: u64) -> Option<&h5::ConfigInfo> {
+        self.run_overrides
+            .get(&run)
+            .and_then(|o| o.config.as_ref())
+            .and_then(|config| self.config_infos.get(config))
+    }
+
+    /// The open beams a run's configuration names (its own file, else the
+    /// section 2 selection's) — what the run divides by unless ⇄ says
+    /// otherwise.
+    fn config_obs_for_run(&self, run: u64) -> Vec<PathBuf> {
+        match self.own_config_info(run) {
+            Some(info) => info.ob_folders.clone(),
+            None => self.config_obs.clone(),
+        }
+    }
+
+    /// The output base folder of a run's configuration (its own file,
+    /// else the section 2 selection's) — where its result goes unless ✏
+    /// says otherwise.
+    fn output_base_for_run(&self, run: u64) -> Option<PathBuf> {
+        match self.own_config_info(run) {
+            Some(info) => Some(
+                info.output_folder
+                    .clone()
+                    .unwrap_or_else(|| self.ipts_path().unwrap_or_default().join("shared/autoreduce/normalized")),
+            ),
+            None => self.output_base.clone(),
+        }
+    }
+
+    /// Read a configuration file picked in the Config column into
+    /// `config_infos` (once; an unreadable file is simply not cached —
+    /// the pass reports the error on the row).
+    fn cache_config_info(&mut self, config: &Path) {
+        if self.config_infos.contains_key(config) {
+            return;
+        }
+        if let Ok(info) = h5::read_config_info(config) {
+            self.config_infos.insert(config.to_path_buf(), info);
+        }
+    }
+
+    /// The Config drop-down of a row: normalize that run with `config`
+    /// (`None` = back to the section 2 selection). A result found on disk
+    /// with the previous file is looked up again — another configuration
+    /// may keep its results elsewhere — and the automatic pass / the
+    /// ▶ normalize button use the new file; a normalization already
+    /// running on the run is left alone (the new file applies to its
+    /// next run).
+    fn set_run_config(&mut self, run: u64, config: Option<PathBuf>) {
+        let before = self.config_for_run(run);
+        let config = config.filter(|c| Some(c) != self.selected_config.as_ref());
+        if let Some(config) = &config {
+            self.cache_config_info(config);
+        }
+        let mut over = self.run_overrides.get(&run).cloned().unwrap_or_default();
+        over.config = config;
+        if over.is_empty() {
+            self.run_overrides.remove(&run);
+        } else {
+            self.run_overrides.insert(run, over);
+        }
+        if self.config_for_run(run) == before {
+            return;
+        }
+        if matches!(self.run_jobs.get(&run), Some(norm::JobState::Running { .. })) {
+            return;
+        }
+        self.run_jobs.remove(&run);
+        self.run_meta.remove(&run);
+        self.launch_run_jobs();
+    }
+
     /// "▶ normalize" / "↻" in the table: normalize one run now, whatever
     /// its age.
     fn normalize_run_now(&mut self, run: u64) {
-        let (Some(ipts_path), Some(config)) = (self.ipts_path(), self.selected_config.clone())
+        let (Some(ipts_path), Some(config)) = (self.ipts_path(), self.config_for_run(run))
         else {
             return;
         };
@@ -1087,8 +1202,8 @@ impl MonitorApp {
     /// + the row's overrides), if a configuration is selected.
     fn planned_output(&self, run: u64) -> Option<PathBuf> {
         let ipts_path = self.ipts_path()?;
-        let config = self.selected_config.as_ref()?;
-        let info = h5::read_config_info(config).ok()?;
+        let config = self.config_for_run(run)?;
+        let info = h5::read_config_info(&config).ok()?;
         Some(norm::run_output_dir(&ipts_path, run, &self.effective_info(run, &info)))
     }
 
@@ -1183,8 +1298,8 @@ impl MonitorApp {
     fn open_run_editor(&mut self, run: u64, mode: EditorMode) {
         let Some(ipts_path) = self.ipts_path() else { return };
         let over = self.run_overrides.get(&run).cloned().unwrap_or_default();
-        let selected = over.obs.clone().unwrap_or_else(|| self.config_obs.clone());
-        let output = over.output.clone().or_else(|| self.output_base.clone());
+        let selected = over.obs.clone().unwrap_or_else(|| self.config_obs_for_run(run));
+        let output = over.output.clone().or_else(|| self.output_base_for_run(run));
         let frames = self
             .run_files
             .iter()
@@ -1195,7 +1310,7 @@ impl MonitorApp {
             })
             .unwrap_or(0);
         let choices = if mode == EditorMode::OpenBeams {
-            let mut extra = self.config_obs.clone();
+            let mut extra = self.config_obs_for_run(run);
             extra.extend(selected.iter().cloned());
             Self::scan_ob_choices(&ipts_path, &extra)
         } else {
@@ -1232,7 +1347,7 @@ impl MonitorApp {
                 });
                 let same_obs = {
                     let mut a = selected.clone();
-                    let mut b = self.config_obs.clone();
+                    let mut b = self.config_obs_for_run(run);
                     a.sort();
                     b.sort();
                     a == b
@@ -1242,11 +1357,11 @@ impl MonitorApp {
             EditorMode::Output => {
                 let output_text = editor.output_text.trim();
                 over.output = (!output_text.is_empty()
-                    && self.output_base.as_deref() != Some(Path::new(output_text)))
+                    && self.output_base_for_run(run).as_deref() != Some(Path::new(output_text)))
                 .then(|| PathBuf::from(output_text));
             }
         }
-        if over.obs.is_none() && over.output.is_none() {
+        if over.is_empty() {
             self.run_overrides.remove(&run);
         } else {
             self.run_overrides.insert(run, over);
@@ -1266,8 +1381,7 @@ impl MonitorApp {
                     over.obs = None;
                 }
             }
-            self.run_overrides
-                .retain(|_, over| over.obs.is_some() || over.output.is_some());
+            self.run_overrides.retain(|_, over| !over.is_empty());
         }
         if matches!(self.run_jobs.get(&run), Some(norm::JobState::Running { .. })) {
             return; // the settings apply to the next run of this row
@@ -1291,8 +1405,8 @@ impl MonitorApp {
     fn run_editor_window(&mut self, ui: &mut egui::Ui) {
         let Some(mut editor) = self.run_editor.take() else { return };
         let run = editor.run;
-        let config_obs = self.config_obs.clone();
-        let output_base = self.output_base.clone();
+        let config_obs = self.config_obs_for_run(run);
+        let output_base = self.output_base_for_run(run);
         let state = self.run_jobs.get(&run);
         let done = matches!(state, Some(norm::JobState::Done { .. }));
         let running = matches!(state, Some(norm::JobState::Running { .. }));
@@ -1301,7 +1415,7 @@ impl MonitorApp {
             .iter()
             .find(|rf| rf.run == run)
             .is_some_and(|rf| matches!(rf.corrected, files::FileStatus::Present(_)));
-        let has_config = self.selected_config.is_some();
+        let has_config = self.config_for_run(run).is_some();
         let mut action: Option<EditorAction> = None;
         let mut open = true;
         let title = match editor.mode {
@@ -3107,7 +3221,9 @@ impl MonitorApp {
                     self.run_queue.clear();
                 }
             } else {
-                let enabled = !missing.is_empty() && self.selected_config.is_some();
+                let enabled = missing
+                    .iter()
+                    .any(|run| self.config_for_run(*run).is_some());
                 let button = ui.add_enabled(
                     enabled,
                     egui::Button::new(format!("▶ normalize all missing ({})", missing.len())),
@@ -3162,7 +3278,8 @@ impl MonitorApp {
         let mut output_toggle: Option<norm::JobTarget> = None;
         let active = self.is_active();
         let watching_from = self.run_jobs_from;
-        let no_config = self.selected_config.is_none();
+        // (run, file picked in its Config drop-down — None = section 2's)
+        let mut change_config: Option<(u64, Option<PathBuf>)> = None;
         theme::section_frame(ui, |ui| {
             egui::ScrollArea::both()
                 .id_salt("runs_table")
@@ -3194,10 +3311,12 @@ impl MonitorApp {
                             );
                             ui.label("");
                             ui.label(theme::section_heading("Config")).on_hover_text(
-                                "The configuration file (settings) each normalization \
-                                 runs with: what the result used (from its job log) for \
-                                 a normalized run, the selected file (dimmed) for a run \
-                                 still to come",
+                                "The configuration file (open beams, settings, output \
+                                 folder) each run is normalized with: the section 2 \
+                                 selection unless another file of the IPTS is picked in \
+                                 the row's drop-down (blue) — the run is then normalized, \
+                                 and its result looked up, with that file. Hover a cell \
+                                 for the file a normalized run actually ran with",
                             );
                             ui.label(theme::section_heading("Output")).on_hover_text(
                                 "The output folder each result lands in \
@@ -3225,10 +3344,11 @@ impl MonitorApp {
                                 Self::status_cell(ui, &next.corrected);
                                 ui.label("");
                                 ui.label("");
-                                self.planned_obs_cell(ui);
+                                self.planned_obs_cell(ui, Some(next.run));
                                 ui.label("");
-                                self.planned_config_cell(ui);
-                                self.planned_output_cell(ui, None);
+                                // A file picked here applies once the run lands.
+                                self.run_config_cell(ui, next.run, &mut change_config);
+                                self.planned_output_cell(ui, Some(next.run));
                                 ui.label("");
                                 ui.end_row();
                             }
@@ -3301,6 +3421,7 @@ impl MonitorApp {
                                 // Normalized: this run's own normalization.
                                 let watched = active
                                     && watching_from.is_some_and(|from| run.run > from);
+                                let no_config = self.config_for_run(run.run).is_none();
                                 Self::normalized_cell(
                                     ui,
                                     run,
@@ -3346,7 +3467,11 @@ impl MonitorApp {
                                 } else {
                                     ui.label("");
                                 }
-                                self.config_cell(ui, run.run, kind);
+                                if kind == h5::RunKind::Sample {
+                                    self.run_config_cell(ui, run.run, &mut change_config);
+                                } else {
+                                    ui.label(egui::RichText::new("—").color(dim));
+                                }
                                 ui.horizontal(|ui| {
                                     self.output_cell(ui, run.run, kind);
                                     if kind == h5::RunKind::Sample {
@@ -3443,6 +3568,9 @@ impl MonitorApp {
         if let Some(run) = rerun {
             self.rerun_run(run);
         }
+        if let Some((run, config)) = change_config {
+            self.set_run_config(run, config);
+        }
         if let Some((run, mode)) = edit_run {
             self.open_run_editor(run, mode);
         }
@@ -3533,17 +3661,21 @@ impl MonitorApp {
 
     /// "Open beam" cell of the upcoming run: the configuration's open
     /// beams, dimmed (what the run will divide by).
-    fn planned_obs_cell(&self, ui: &mut egui::Ui) {
+    fn planned_obs_cell(&self, ui: &mut egui::Ui, run: Option<u64>) {
         let dim = theme::text_emphasis(ui.visuals());
-        if self.config_obs.is_empty() {
+        let obs = match run {
+            Some(run) => self.config_obs_for_run(run),
+            None => self.config_obs.clone(),
+        };
+        if obs.is_empty() {
             ui.label(egui::RichText::new("—").color(dim)).on_hover_text(
                 "The configuration names no open beam (or none is selected)",
             );
         } else {
-            ui.label(egui::RichText::new(Self::ob_runs_text(&self.config_obs)).color(dim))
+            ui.label(egui::RichText::new(Self::ob_runs_text(&obs)).color(dim))
                 .on_hover_text(format!(
                     "Will divide by the configuration's open beam(s)\n{}",
-                    Self::ob_folders_text(&self.config_obs)
+                    Self::ob_folders_text(&obs)
                 ));
         }
     }
@@ -3604,7 +3736,7 @@ impl MonitorApp {
                                 Self::ob_folders_text(obs)
                             ));
                     } else {
-                        self.planned_obs_cell(ui);
+                        self.planned_obs_cell(ui, Some(run));
                     }
                 }
             },
@@ -3618,25 +3750,6 @@ impl MonitorApp {
             .unwrap_or_else(|| path.display().to_string())
     }
 
-    /// "Config" cell of the upcoming run: the selected configuration,
-    /// dimmed (what the run will run with).
-    fn planned_config_cell(&self, ui: &mut egui::Ui) {
-        let dim = theme::text_emphasis(ui.visuals());
-        match &self.selected_config {
-            Some(config) => {
-                ui.label(egui::RichText::new(Self::short_name(config)).color(dim))
-                    .on_hover_text(format!(
-                        "Will run with the selected configuration\n{}",
-                        config.display()
-                    ));
-            }
-            None => {
-                ui.label(egui::RichText::new("—").color(dim))
-                    .on_hover_text("No configuration file selected (section 2)");
-            }
-        }
-    }
-
     /// "Output" cell of a run still to come: the base folder its result
     /// will land in — the row's own (✏, highlighted) or the
     /// configuration's (dimmed).
@@ -3645,7 +3758,11 @@ impl MonitorApp {
         let over = run
             .and_then(|run| self.run_overrides.get(&run))
             .and_then(|o| o.output.clone());
-        match (over, &self.output_base) {
+        let base = match run {
+            Some(run) => self.output_base_for_run(run),
+            None => self.output_base.clone(),
+        };
+        match (over, &base) {
             (Some(folder), _) => {
                 ui.label(egui::RichText::new(Self::short_name(&folder)).color(theme::INFO))
                     .on_hover_text(format!(
@@ -3669,30 +3786,96 @@ impl MonitorApp {
         }
     }
 
-    /// "Config" cell of one row: the configuration file the run's
-    /// normalization ran with (recorded at launch, or read from the job
-    /// log of a result found on disk), else the selected one, dimmed.
-    fn config_cell(&self, ui: &mut egui::Ui, run: u64, kind: h5::RunKind) {
-        let dim = theme::text_emphasis(ui.visuals());
-        if kind != h5::RunKind::Sample {
-            ui.label(egui::RichText::new("—").color(dim));
-            return;
+    /// "Config" cell of one sample row (and of the upcoming run): a
+    /// drop-down of the configuration files of the IPTS (section 2's
+    /// list), whose first entry follows the section 2 selection. The
+    /// run's normalization runs with the file shown — a pick lands in
+    /// `change_config` (applied once the table is drawn). A file picked
+    /// for the row reads in blue; the hover also names the file a
+    /// normalized run actually ran with (recorded at launch, or read from
+    /// the job log of a result found on disk) when it differs.
+    fn run_config_cell(
+        &self,
+        ui: &mut egui::Ui,
+        run: u64,
+        change_config: &mut Option<(u64, Option<PathBuf>)>,
+    ) {
+        let own = self.run_overrides.get(&run).and_then(|o| o.config.as_ref());
+        let effective = self.config_for_run(run);
+        let ran_with = self.run_meta.get(&run).and_then(|m| m.config.as_ref());
+        let mut text = egui::RichText::new(match &effective {
+            Some(path) => Self::short_name(path),
+            None => "— none —".to_owned(),
+        });
+        if own.is_some() {
+            text = text.color(theme::INFO);
+        } else if effective.is_none() {
+            text = text.color(theme::WARNING);
+        } else if ran_with.is_none() {
+            text = text.color(theme::text_emphasis(ui.visuals()));
         }
-        match self.run_meta.get(&run) {
-            Some(RunMeta { config: Some(config), .. }) => {
-                ui.label(Self::short_name(config)).on_hover_text(format!(
-                    "Configuration this run's normalization ran with\n{}",
-                    config.display()
+        let combo = egui::ComboBox::from_id_salt(("run_config", run))
+            .selected_text(text)
+            .width(280.0);
+        let response = combo.show_ui(ui, |ui| {
+            let default_name = match &self.selected_config {
+                Some(path) => format!("(section 2) {}", Self::short_name(path)),
+                None => "(section 2) — none selected —".to_owned(),
+            };
+            if ui
+                .selectable_label(own.is_none(), default_name)
+                .on_hover_text("Follow the configuration selected in section 2")
+                .clicked()
+            {
+                *change_config = Some((run, None));
+            }
+            ui.separator();
+            for cfg_file in &self.configs {
+                let active = own == Some(&cfg_file.path);
+                let when: chrono::DateTime<chrono::Local> = cfg_file.mtime.into();
+                if ui
+                    .selectable_label(active, &cfg_file.name)
+                    .on_hover_text(format!(
+                        "{}\nmodified {}",
+                        cfg_file.path.display(),
+                        when.format("%Y-%m-%d %H:%M:%S")
+                    ))
+                    .clicked()
+                {
+                    *change_config = Some((run, Some(cfg_file.path.clone())));
+                }
+            }
+        });
+        let mut hover = match (&own, &effective) {
+            (Some(path), _) => format!(
+                "Configuration picked for this run instead of the section 2 \
+                 selection — its open beams, settings and output folder (unless \
+                 ⇄ / ✏ say otherwise)\n{}",
+                path.display()
+            ),
+            (None, Some(path)) => format!("The section 2 selection\n{}", path.display()),
+            (None, None) => "No configuration file — select one in section 2 or pick \
+                             one here for this run"
+                .to_owned(),
+        };
+        match ran_with {
+            Some(path) if effective.as_ref() != Some(path) => {
+                hover.push_str(&format!(
+                    "\n\nThis run's normalization ran with another file (↻ re-run to \
+                     use the one shown):\n{}",
+                    path.display()
                 ));
             }
-            Some(_) => {
-                ui.label(egui::RichText::new("?").color(dim)).on_hover_text(
-                    "Normalized, but its job log names no configuration file (result \
-                     produced by another tool, or log missing)",
+            Some(_) => hover.push_str("\n\nThis run's normalization ran with this file"),
+            None if matches!(self.run_jobs.get(&run), Some(norm::JobState::Done { .. })) => {
+                hover.push_str(
+                    "\n\nNormalized, but its job log names no configuration file \
+                     (result produced by another tool, or log missing)",
                 );
             }
-            None => self.planned_config_cell(ui),
+            None => {}
         }
+        response.response.on_hover_text(hover);
     }
 
     /// "Output" cell of one row: the base folder the run's result sits
