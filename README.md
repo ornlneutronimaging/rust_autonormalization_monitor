@@ -55,7 +55,17 @@ Single view, top to bottom:
      side (`--compare`: shared colorscale, regions mirrored, one profile
      curve per stack — images only for now).
      Windows log into `rolling/anchor_<run>/logs/last_<N>min.log`.
-5. **Runs in use table** — lists the runs the windows use (the manual
+     A **📈 Timeline** tab next to the heading shows, instead of the
+     windows grid, the same acquisition timeline as section 5 (when each
+     run was acquired, with the window coverage bands on top — see there).
+5. **Live reduction** — **opt-in** like section 4: the heading is a
+   checkbox (saved as the `live_reduction` flag of the shared
+   `autoreduction.cfg`) that makes the per-run normalization of every
+   upcoming run part of the auto normalization. Unchecked (the default
+   for everybody), no run is normalized one by one from this app and the
+   whole section is hidden; with neither box checked, auto normalization
+   ON only registers the configuration in the shared file, nothing fires
+   from here. Checked, the section lists the runs in use (the manual
    list, or — in live mode — every run the widest window has covered since
    the session started: a new run slides the windows, never drops a row,
    so a normalization in progress stays visible). When auto normalization is
@@ -198,10 +208,18 @@ Single view, top to bottom:
    the same per-run normalization on demand; **▶ normalize all missing**
    in the section heading queues every such run (newest first). The
    **parallel jobs** field next to it (default 4, up to 16) says how many
-   per-run normalizations may run side by side — for the queue and for the
-   automatic normalization alike: each one is its own NeuNorm python
-   process, a burst of new runs is throttled to that many, the rest wait
-   for a free slot (retried at every refresh). Selecting a different configuration file while auto
+   per-run normalizations may run side by side — a hard cap for the queue,
+   the automatic normalization and the manual starts (▶ normalize, ↻
+   re-run, "normalize now" in the run editor) alike: each one is its own
+   NeuNorm python process holding the sample and open-beam image stacks in
+   memory (tens of GB), a burst of new runs or of ↻ clicks is throttled to
+   that many, the rest wait in the queue (the row reads **⏳ queued**, with
+   its place in the line on hover) and start by themselves as slots free
+   up. Too many at once and the analysis machine runs out of memory: the
+   system then kills a python process (the row fails with "normalization
+   process killed by the system (signal: 9 (SIGKILL))" and an explanation);
+   such a run is queued for one automatic retry, a second kill stays
+   failed (↻ retries it by hand). Selecting a different configuration file while auto
    normalization is ON re-registers it in `autoreduction.cfg` at once, so
    the autoreduction and this app agree on the open beams. Rows are listed
    newest first, right under the upcoming run. A **📈 Timeline** tab next to the
@@ -221,9 +239,9 @@ The shared configuration is `/SNS/VENUS/shared/autoreduction/autoreduction.cfg`
 `/SNS/VENUS/shared/autoreduce/autoreduction.cfg` when only that one exists.
 It is re-read on the auto-refresh period (default 5 s, adjustable in the
 top bar) so the display always reflects changes made by other tools. The
-monitor adds its own `rolling_combine` key to the notebook's schema; the
-notebook rewrites the file without it when a configuration is registered,
-which resets the opt-in to unchecked.
+monitor adds its own `rolling_combine` and `live_reduction` keys to the
+notebook's schema; the notebook rewrites the file without them when a
+configuration is registered, which resets both opt-ins to unchecked.
 
 ## Run
 

@@ -474,6 +474,17 @@ pub fn prepare_run_job(
     })
 }
 
+/// Start of the failure message of a job whose python process was killed
+/// by a signal (the OOM killer, in practice) — see [`killed_by_system`].
+pub const KILLED_PREFIX: &str = "normalization process killed by the system";
+
+/// Was this job's failure a kill by the system (SIGKILL & co.) rather
+/// than an error of the script? Such a failure is transient (memory
+/// pressure) and worth one automatic retry.
+pub fn killed_by_system(message: &str) -> bool {
+    message.starts_with(KILLED_PREFIX)
+}
+
 /// Launch a prepared job in a background thread; progress and the outcome
 /// arrive on `tx` as [`JobMessage`]s. The job stages into
 /// `<output>.partial` and promotes to `<output>` on success.
@@ -662,10 +673,27 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
         .wait()
         .map_err(|e| format!("cannot wait for the normalization: {e}"))?;
     if !status.success() {
-        let message = format!(
-            "normalization script failed ({status})\n{}",
-            tail.join("\n")
-        );
+        use std::os::unix::process::ExitStatusExt;
+        // A signal (SIGKILL above all) does not come from the script: it is
+        // the kernel's OOM killer when the analysis machine runs out of
+        // memory — every NeuNorm job holds the sample and open-beam stacks
+        // in memory, and too many at once (from this tool, other users or
+        // other tools) exhaust it.
+        let message = if status.signal().is_some() {
+            format!(
+                "{KILLED_PREFIX} ({status}) — the analysis machine most likely ran out of \
+                 memory: every normalization holds the sample and open-beam image stacks \
+                 in memory, and too many at once (this tool's parallel jobs, other users, \
+                 other tools on the same machine) exhaust it. The run is retried once \
+                 automatically when a slot frees up; fewer parallel jobs help.\n{}",
+                tail.join("\n")
+            )
+        } else {
+            format!(
+                "normalization script failed ({status})\n{}",
+                tail.join("\n")
+            )
+        };
         say(&format!("ERROR: {message}"));
         return Err(message);
     }

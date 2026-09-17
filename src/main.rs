@@ -93,7 +93,8 @@ const TIMELINE_PVS: &[(&str, &str)] = &[
 /// The (absolute time, value) points of one DASlogs entry.
 type PvPoints = Vec<(chrono::DateTime<chrono::FixedOffset>, f64)>;
 
-/// The two views of the "Runs in use" section.
+/// The two views of the "Rolling combine" (4) and "Live reduction" (5)
+/// sections: their table, or the acquisition timeline plot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunsView {
     Table,
@@ -333,6 +334,9 @@ struct MonitorApp {
     /// Which view of section 5 is open: the table or the acquisition
     /// timeline plot.
     runs_view: RunsView,
+    /// Which view of section 4 is open: the windows grid or the same
+    /// acquisition timeline.
+    windows_view: RunsView,
     /// Sample-environment PV overlaid on the timeline (index into
     /// [`TIMELINE_PVS`]), if any.
     timeline_pv: Option<usize>,
@@ -368,9 +372,16 @@ struct MonitorApp {
     job_output: HashMap<norm::JobTarget, std::collections::VecDeque<String>>,
     /// The job whose output panel is open, if any.
     output_view: Option<norm::JobTarget>,
-    /// Runs queued by "▶ normalize all missing": started as slots free
-    /// up, at most `parallel_jobs` running at once.
+    /// Runs waiting for a free slot — "▶ normalize all missing", and every
+    /// manual start (▶ normalize, ↻ re-run, the run editor's "normalize
+    /// now") asked for while `parallel_jobs` are already running: started
+    /// in order as slots free up, never more than `parallel_jobs` at once
+    /// (each job holds whole image stacks in memory; too many at once
+    /// get the python processes killed by the system).
     run_queue: std::collections::VecDeque<u64>,
+    /// Runs whose normalization was killed by the system (SIGKILL: memory
+    /// pressure) and already retried once — no second automatic retry.
+    killed_retried: HashSet<u64>,
     /// How many per-run normalizations may run at the same time (queue
     /// and automatic pass alike). Each job is heavy, but the machine has
     /// the cores and memory for several.
@@ -432,6 +443,7 @@ impl MonitorApp {
             run_editor: None,
             ob_error: None,
             runs_view: RunsView::Table,
+            windows_view: RunsView::Table,
             timeline_pv: None,
             pv_cache: HashMap::new(),
             last_live_anchor: None,
@@ -443,6 +455,7 @@ impl MonitorApp {
             job_output: HashMap::new(),
             output_view: None,
             run_queue: std::collections::VecDeque::new(),
+            killed_retried: HashSet::new(),
             parallel_jobs: DEFAULT_PARALLEL_JOBS,
             run_jobs_from: None,
             norm_tx,
@@ -507,6 +520,7 @@ impl MonitorApp {
         self.job_output.clear();
         self.output_view = None;
         self.run_queue.clear();
+        self.killed_retried.clear();
         for w in &mut self.windows {
             w.runs.clear();
             w.state = norm::JobState::Idle;
@@ -682,7 +696,7 @@ impl MonitorApp {
         self.launch_run_jobs();
         // The next NeXus that will land in the IPTS (latest one + 1): what
         // auto-normalization will process next.
-        self.next_run = if self.is_active() {
+        self.next_run = if self.is_active() && self.live_enabled() {
             self.ipts_path().and_then(|ipts_path| {
                 files::latest_nexus_run(&ipts_path)
                     .map(|latest| files::check_runs(&ipts_path, &[latest + 1]).remove(0))
@@ -854,13 +868,14 @@ impl MonitorApp {
             {
                 let registered = cfg.get("user_autoreduction_config_file").map(Path::new);
                 if cfg.activate && registered != Some(selected.as_path()) {
-                    let rolling = cfg.rolling_combine;
+                    let (rolling, live) = (cfg.rolling_combine, cfg.live_reduction);
                     match config::write_full(
                         &self.cfg_path,
                         &ipts,
                         &selected.display().to_string(),
                         true,
                         rolling,
+                        live,
                     ) {
                         Ok(()) => {
                             self.write_error = None;
@@ -888,7 +903,9 @@ impl MonitorApp {
                 .or_else(|| Self::detector_from_layout(&ipts_path));
             self.config_obs = info.map(|i| i.ob_folders).unwrap_or_default();
         }
-        match self.cfg.as_ref().map(|c| c.activate) {
+        // The per-run automatic pass needs auto normalization ON and the
+        // live reduction opted in (shared `live_reduction` flag).
+        match self.cfg.as_ref().map(|c| c.activate && c.live_reduction) {
             Ok(true) => {
                 if self.run_jobs_from.is_none() {
                     // First look while active: everything already
@@ -898,7 +915,8 @@ impl MonitorApp {
                     self.run_jobs_from = Some(Self::newest_corrected_run(&ipts_path));
                 }
             }
-            // Auto normalization OFF: re-armed when it resumes.
+            // Auto normalization OFF (or live reduction opted out):
+            // re-armed when it resumes.
             Ok(false) => self.run_jobs_from = None,
             // Unreadable shared configuration (transient on the shared
             // filesystem): keep the current arming, do not lose track of
@@ -1214,6 +1232,9 @@ impl MonitorApp {
     /// job never runs twice into the same folder. The job log keeps the
     /// history (append-only).
     fn rerun_run(&mut self, run: u64) {
+        if matches!(self.run_jobs.get(&run), Some(norm::JobState::Running { .. })) {
+            return; // already running (started meanwhile): never twice at once
+        }
         if let Some(norm::JobState::Done { output, .. }) = self.run_jobs.get(&run) {
             let output = output.clone();
             if self.planned_output(run).as_ref() == Some(&output) {
@@ -1236,6 +1257,22 @@ impl MonitorApp {
             }
         }
         self.normalize_run_now(run);
+    }
+
+    /// A manual start (▶ normalize, ↻ re-run, "normalize now" in the run
+    /// editor): run now when a slot is free, else wait in the queue —
+    /// `parallel_jobs` is a hard cap, manual starts included. Fourteen
+    /// re-runs clicked in a row used to start fourteen python processes
+    /// at once, and the machine's memory ran out (SIGKILL).
+    fn request_run(&mut self, run: u64) {
+        if matches!(self.run_jobs.get(&run), Some(norm::JobState::Running { .. })) {
+            return;
+        }
+        if self.has_free_job_slot() {
+            self.rerun_run(run);
+        } else if !self.run_queue.contains(&run) {
+            self.run_queue.push_back(run);
+        }
     }
 
     /// The corrected open-beam folders of the IPTS
@@ -1392,7 +1429,7 @@ impl MonitorApp {
             .find(|rf| rf.run == run)
             .is_some_and(|rf| matches!(rf.corrected, files::FileStatus::Present(_)));
         if run_now && corrected_ready {
-            self.rerun_run(run);
+            self.request_run(run);
         } else {
             self.run_jobs.remove(&run);
             self.run_meta.remove(&run);
@@ -1985,15 +2022,42 @@ impl MonitorApp {
         self.cfg.as_ref().map(|c| c.rolling_combine).unwrap_or(false)
     }
 
+    /// Did the user opt the live reduction — every upcoming run normalized
+    /// on its own from here — into the auto normalization (shared
+    /// `live_reduction` flag, false when the key is absent)?
+    fn live_enabled(&self) -> bool {
+        self.cfg.as_ref().map(|c| c.live_reduction).unwrap_or(false)
+    }
+
     /// Opt the rolling windows in/out of the auto normalization: written to
     /// the shared config so it survives restarts and is visible to every
     /// user (the line is added when the notebook-written file lacks it).
     fn set_rolling_enabled(&mut self, enabled: bool) {
+        let live = self.live_enabled();
+        self.set_opt_in(enabled, live, |path| config::set_rolling_combine(path, enabled));
+    }
+
+    /// Opt the live reduction in/out of the auto normalization (same
+    /// shared-config mechanics as the rolling windows).
+    fn set_live_enabled(&mut self, enabled: bool) {
+        let rolling = self.rolling_enabled();
+        self.set_opt_in(rolling, enabled, |path| config::set_live_reduction(path, enabled));
+    }
+
+    /// Write one opt-in flag: `set` toggles its line in the existing shared
+    /// file; when there is no shared file yet (auto normalization never
+    /// turned ON) the file is created, OFF, with the selected
+    /// IPTS/configuration if any and both flags as they should now read
+    /// (`rolling`, `live`).
+    fn set_opt_in(
+        &mut self,
+        rolling: bool,
+        live: bool,
+        set: impl FnOnce(&Path) -> Result<(), String>,
+    ) {
         let result = if self.cfg_path.is_file() {
-            config::set_rolling_combine(&self.cfg_path, enabled)
+            set(&self.cfg_path)
         } else {
-            // No shared file yet (auto normalization never turned ON):
-            // create it, OFF, with the selected IPTS/configuration if any.
             config::write_full(
                 &self.cfg_path,
                 self.ipts.as_deref().unwrap_or(""),
@@ -2003,7 +2067,8 @@ impl MonitorApp {
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
                 false,
-                enabled,
+                rolling,
+                live,
             )
         };
         match result {
@@ -2020,14 +2085,15 @@ impl MonitorApp {
         else {
             return;
         };
-        // The rolling opt-in is the user's own choice: keep it as is.
-        let rolling = self.rolling_enabled();
+        // The opt-ins are the user's own choices: keep them as they are.
+        let (rolling, live) = (self.rolling_enabled(), self.live_enabled());
         match config::write_full(
             &self.cfg_path,
             &ipts,
             &config_file.display().to_string(),
             true,
             rolling,
+            live,
         ) {
             Ok(()) => self.write_error = None,
             Err(e) => self.write_error = Some(e),
@@ -2422,10 +2488,13 @@ impl MonitorApp {
                 if let Ok(cfg) = &self.cfg {
                     let reg_ipts = cfg.get("ipts").unwrap_or("?");
                     let reg_file = cfg.get("user_autoreduction_config_file").unwrap_or("?");
-                    let windows = if cfg.rolling_combine {
-                        " + rolling combine & compare windows"
-                    } else {
-                        " (per-run normalization only)"
+                    let windows = match (cfg.live_reduction, cfg.rolling_combine) {
+                        (true, true) => " — live reduction + rolling combine & compare windows",
+                        (true, false) => " — live reduction only",
+                        (false, true) => " — rolling combine & compare windows only",
+                        (false, false) => {
+                            " — nothing fires from here: check 4. and/or 5. below"
+                        }
                     };
                     ui.label(
                         egui::RichText::new(format!(
@@ -2507,11 +2576,29 @@ impl MonitorApp {
             if response.changed() {
                 self.set_rolling_enabled(opted_in);
             }
+            if !self.rolling_enabled() {
+                return;
+            }
+            // Same view switch as section 5: the windows grid, or the
+            // acquisition timeline with the window coverage bands.
+            ui.add_space(theme::SPACE_MD);
+            for (view, label) in [
+                (RunsView::Table, "☰ Windows"),
+                (RunsView::Timeline, "📈 Timeline"),
+            ] {
+                if ui.selectable_label(self.windows_view == view, label).clicked() {
+                    self.windows_view = view;
+                }
+            }
         });
         if !self.rolling_enabled() {
             return;
         }
         ui.add_space(theme::SPACE_XS);
+        if self.windows_view == RunsView::Timeline {
+            self.runs_timeline(ui, "windows");
+            return;
+        }
         theme::section_frame(ui, |ui| {
             let live = self.runs.is_empty();
             let active = self.is_active();
@@ -2814,7 +2901,8 @@ impl MonitorApp {
         }
     }
 
-    /// Timeline view of section 5: one horizontal bar per run (acquisition
+    /// Timeline view of sections 4 and 5 (`id` keeps the two apart when
+    /// both are open): one horizontal bar per run (acquisition
     /// start → end, from the NeXus times) and, on top, the coverage of the
     /// three rolling windows — all on a shared time axis in minutes
     /// relative to the anchor (the newest non-rejected run).
@@ -2829,7 +2917,7 @@ impl MonitorApp {
             .join("\n")
     }
 
-    fn runs_timeline(&mut self, ui: &mut egui::Ui) {
+    fn runs_timeline(&mut self, ui: &mut egui::Ui, id: &str) {
         use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text, VLine};
         theme::section_frame(ui, |ui| {
             // (run, start, end, out) in table order (ascending runs); `out`
@@ -2866,7 +2954,7 @@ impl MonitorApp {
                     || "none".to_owned(),
                     |i| format!("{}{}", TIMELINE_PVS[i].0, TIMELINE_PVS[i].1),
                 );
-                egui::ComboBox::from_id_salt("timeline_pv")
+                egui::ComboBox::from_id_salt(("timeline_pv", id))
                     .selected_text(current)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.timeline_pv, None, "none");
@@ -3038,7 +3126,7 @@ impl MonitorApp {
             let height = ((n + 5) as f32 * 24.0).clamp(200.0, 440.0);
             let anchor_for_cursor = anchor;
             let hover_pv = pv_scale.map(|scale| (pv_label.clone(), scale, band));
-            let response = Plot::new("acq_timeline")
+            let response = Plot::new(("acq_timeline", id))
                 .height(height)
                 .allow_scroll(false)
                 .custom_y_axes(y_axes)
@@ -3158,34 +3246,55 @@ impl MonitorApp {
         });
     }
 
-    /// Section 5 — the runs in use (the list, or the widest window in live
-    /// mode): file status per run, a preview of the corrected data in the
-    /// TIFF viewer, and a reject/restore toggle — rejected runs stay
-    /// listed, crossed out, but leave the windows and their
-    /// normalizations. The upcoming run tops the table when
-    /// auto-normalization is ON.
+    /// Section 5 — the live reduction: the runs in use (the list, or the
+    /// widest window in live mode), file status per run, a preview of the
+    /// corrected data in the TIFF viewer, and a reject/restore toggle —
+    /// rejected runs stay listed, crossed out, but leave the windows and
+    /// their normalizations. The upcoming run tops the table when
+    /// auto-normalization is ON. Like section 4, the heading line carries
+    /// the opt-in box (shared `live_reduction` flag) that makes the per-run
+    /// normalization of every upcoming run part of the auto normalization;
+    /// unchecked, the whole section is folded away.
     fn runs_table(&mut self, ui: &mut egui::Ui) {
-        if self.run_files.is_empty() && self.next_run.is_none() {
-            return;
-        }
         let rejected_count = self
             .run_files
             .iter()
             .filter(|r| self.rejected.contains(&r.run))
             .count();
-        let heading = if self.run_files.is_empty() {
-            "5. Runs in use — next auto-normalized run".to_owned()
+        // Nothing to show under the heading (opted out, or no run yet).
+        let folded =
+            !self.live_enabled() || (self.run_files.is_empty() && self.next_run.is_none());
+        let heading = if folded {
+            "5. Live reduction".to_owned()
+        } else if self.run_files.is_empty() {
+            "5. Live reduction — next auto-normalized run".to_owned()
         } else if rejected_count > 0 {
             format!(
-                "5. Runs in use ({}, {rejected_count} rejected)",
+                "5. Live reduction ({} runs, {rejected_count} rejected)",
                 self.run_files.len() - rejected_count
             )
         } else {
-            format!("5. Runs in use ({})", self.run_files.len())
+            format!("5. Live reduction ({} runs)", self.run_files.len())
         };
-        // Heading + view switch (table / acquisition timeline).
+        // Heading (opt-in box) + view switch (table / acquisition timeline).
         ui.horizontal(|ui| {
-            ui.label(theme::section_heading(&heading));
+            let mut opted_in = self.live_enabled();
+            let response = ui
+                .checkbox(&mut opted_in, theme::section_heading(&heading))
+                .on_hover_text(
+                    "Opt-in, saved in the shared configuration: when checked, the \
+                     auto normalization normalizes every upcoming run on its own \
+                     from here, as soon as its corrected data is complete (auto \
+                     normalization ON + configuration selected). Unchecked (the \
+                     default for everybody), no run is normalized one by one from \
+                     this app and this section is hidden.",
+                );
+            if response.changed() {
+                self.set_live_enabled(opted_in);
+            }
+            if folded {
+                return;
+            }
             ui.add_space(theme::SPACE_MD);
             for (view, label) in [
                 (RunsView::Table, "☰ Table"),
@@ -3251,9 +3360,13 @@ impl MonitorApp {
                     .speed(0.1),
             )
             .on_hover_text(
-                "How many per-run normalizations may run at the same time (queue \
-                 and automatic normalization alike). Each one is a NeuNorm python \
-                 process; 4 is a safe default on the analysis machines.",
+                "How many per-run normalizations may run at the same time — a hard \
+                 cap: automatic normalization, ▶ normalize all missing, and manual \
+                 starts (▶ normalize, ↻ re-run) alike; the rest waits in the queue. \
+                 Each one is a NeuNorm python process holding the sample and \
+                 open-beam image stacks in memory (tens of GB); too many at once \
+                 and the system kills them (SIGKILL). 4 is a safe default on the \
+                 analysis machines.",
             );
             let running = self.running_run_jobs();
             ui.label(if running == 0 {
@@ -3262,10 +3375,13 @@ impl MonitorApp {
                 format!("parallel jobs ({running} running)")
             });
         });
+        if folded {
+            return;
+        }
         ui.add_space(theme::SPACE_XS);
         self.new_open_beams_banner(ui);
         if self.runs_view == RunsView::Timeline {
-            self.runs_timeline(ui);
+            self.runs_timeline(ui, "runs");
             return;
         }
         let mut toggle_run: Option<u64> = None;
@@ -3274,6 +3390,7 @@ impl MonitorApp {
         let mut open_normalized: Option<PathBuf> = None;
         let mut retry_run: Option<u64> = None;
         let mut rerun: Option<u64> = None;
+        let running_jobs = self.running_run_jobs();
         let mut edit_run: Option<(u64, EditorMode)> = None;
         let mut output_toggle: Option<norm::JobTarget> = None;
         let active = self.is_active();
@@ -3432,6 +3549,10 @@ impl MonitorApp {
                                         .map(|folder| (kind, folder)),
                                     watched && !rejected,
                                     no_config,
+                                    self.run_queue
+                                        .iter()
+                                        .position(|r| *r == run.run)
+                                        .map(|ahead| (ahead, running_jobs)),
                                     &mut view_normalized,
                                     &mut open_normalized,
                                     &mut retry_run,
@@ -3563,10 +3684,10 @@ impl MonitorApp {
             self.open_folder(&folder);
         }
         if let Some(run) = retry_run {
-            self.normalize_run_now(run);
+            self.request_run(run);
         }
         if let Some(run) = rerun {
-            self.rerun_run(run);
+            self.request_run(run);
         }
         if let Some((run, config)) = change_config {
             self.set_run_config(run, config);
@@ -4140,7 +4261,8 @@ impl MonitorApp {
     /// progress bar while NeuNorm runs, view/open icons when done, error +
     /// retry when failed. `watched` = auto normalization will (or did)
     /// pick this run. `special` = the kind and recorded image folder of a
-    /// run that is never normalized (alignment, open beam).
+    /// run that is never normalized (alignment, open beam). `queued` =
+    /// (runs ahead of it, jobs running) when the run waits for a slot.
     fn normalized_cell(
         ui: &mut egui::Ui,
         run: &files::RunFiles,
@@ -4148,6 +4270,7 @@ impl MonitorApp {
         special: Option<(h5::RunKind, &String)>,
         watched: bool,
         no_config: bool,
+        queued: Option<(usize, usize)>,
         view_normalized: &mut Option<PathBuf>,
         open_normalized: &mut Option<PathBuf>,
         retry_run: &mut Option<u64>,
@@ -4180,6 +4303,22 @@ impl MonitorApp {
             };
             ui.label(egui::RichText::new(text).color(dim))
                 .on_hover_text(format!("{hover}\n{folder}"));
+            return;
+        }
+        // Waiting for a free slot (every slot busy when it was asked for):
+        // whatever its last state, the row says so — the job starts by
+        // itself, in order.
+        if let Some((ahead, running)) = queued {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("⏳ queued").color(theme::INFO))
+                    .on_hover_text(format!(
+                        "Waiting for a free slot: {running} normalization(s) running \
+                         (the parallel jobs cap), {ahead} queued ahead of this run. \
+                         It starts by itself; ✖ clear queue (above the table) \
+                         cancels the wait"
+                    ));
+                Self::output_toggle(ui, target, output_toggle);
+            });
             return;
         }
         match state {
@@ -4377,6 +4516,18 @@ impl eframe::App for MonitorApp {
                     }
                 }
                 norm::JobMessage::Finished { target, runs, result, log } => {
+                    // A process killed by the system (memory pressure) is
+                    // retried once, through the queue (it waits for a slot).
+                    let retry = match (&target, &result) {
+                        (norm::JobTarget::Run(run), Err(message))
+                            if norm::killed_by_system(message)
+                                && self.killed_retried.insert(*run) =>
+                        {
+                            Some(*run)
+                        }
+                        _ => None,
+                    };
+                    let succeeded = result.is_ok();
                     if let Some(state) = self.job_state_mut(target) {
                         *state = match result {
                             Ok(output) => norm::JobState::Done {
@@ -4385,22 +4536,35 @@ impl eframe::App for MonitorApp {
                                 runs,
                             },
                             Err(message) => norm::JobState::Failed {
-                                message,
+                                message: if retry.is_some() {
+                                    format!("{message}\n\n→ queued for one automatic retry")
+                                } else {
+                                    message
+                                },
                                 log: Some(log),
                             },
                         };
+                    }
+                    if let Some(run) = retry.filter(|run| !self.run_queue.contains(run)) {
+                        self.run_queue.push_back(run);
+                    } else if let (norm::JobTarget::Run(run), true) = (&target, succeeded) {
+                        // A success clears the one-retry mark: a later
+                        // re-run of this row gets its own retry again.
+                        self.killed_retried.remove(run);
                     }
                 }
             }
         }
 
-        // Queued runs ("normalize all missing"): fill the free slots, up
-        // to `parallel_jobs` running at once.
+        // Queued runs ("normalize all missing", manual starts asked for
+        // while every slot was busy, automatic retries): fill the free
+        // slots, up to `parallel_jobs` running at once. A queued run that
+        // got started meanwhile (automatic pass) is simply dropped.
         while self.has_free_job_slot() {
             let Some(run) = self.run_queue.pop_front() else {
                 break;
             };
-            self.normalize_run_now(run);
+            self.rerun_run(run);
         }
 
         // While jobs run, keep frames coming so the spinner moves and the
