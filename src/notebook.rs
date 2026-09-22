@@ -100,12 +100,19 @@ fn provision(ipts_path: &Path) -> Result<(PathBuf, PathBuf), String> {
     Ok((dest, PathBuf::from(file_name)))
 }
 
+/// Environment variable naming the configuration file the notebook loads
+/// at startup (its "Load a Session Configuration" step done for the user).
+pub const CONFIG_ENV: &str = "NORMALIZATION_TOF_CONFIG";
+
 /// Provision + launch the notebook for `ipts_path`, opening the served URL
-/// in firefox as soon as marimo prints it. The marimo process is detached
-/// and keeps running after this application exits.
-pub fn launch(ipts_path: &Path) -> Result<String, String> {
+/// in firefox as soon as marimo prints it. With `config`, the notebook
+/// starts with that configuration file loaded (via [`CONFIG_ENV`]). The
+/// marimo process is detached and keeps running after this application
+/// exits.
+pub fn launch(ipts_path: &Path, config: Option<&Path>) -> Result<String, String> {
     let (dest, notebook_name) = provision(ipts_path)?;
-    let mut child = Command::new(MARIMO_BIN)
+    let mut command = Command::new(MARIMO_BIN);
+    command
         .arg("run")
         .arg(&notebook_name)
         .arg("--headless")
@@ -115,7 +122,11 @@ pub fn launch(ipts_path: &Path) -> Result<String, String> {
         .env("MARIMO_OUTPUT_MAX_BYTES", "20000000")
         .current_dir(&dest)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(config) = config {
+        command.env(CONFIG_ENV, config);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("failed to launch {MARIMO_BIN}: {e}"))?;
 
@@ -147,5 +158,12 @@ pub fn launch(ipts_path: &Path) -> Result<String, String> {
     }
     // Detach: keep marimo running after we drop the handle.
     std::mem::forget(child);
-    Ok(format!("Notebook launched from {}", dest.display()))
+    Ok(match config {
+        Some(config) => format!(
+            "Notebook launched from {} with {} loaded",
+            dest.display(),
+            config.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        ),
+        None => format!("Notebook launched from {}", dest.display()),
+    })
 }

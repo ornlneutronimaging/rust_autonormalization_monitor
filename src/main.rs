@@ -1,15 +1,17 @@
 //! VENUS Auto Normalization — single-view application.
 //!
-//! Workflow, top to bottom:
+//! Workflow, top to bottom. A status strip under the title holds the
+//! auto-normalization ON/OFF button (ON: every upcoming run gets
+//! normalized — writes the shared `autoreduction.cfg`; needs 1. and 2.).
 //! 1. Select the IPTS (dropdown of accessible IPTS-* folders, or manual
 //!    entry). Everything below is disabled until an IPTS is chosen.
 //! 2. Select the normalization configuration file
 //!    (`<IPTS>/shared/autoreduce/*.h5` or its `configs/` subfolder, created with the marimo
 //!    "Normalization TOF at VENUS" notebook — a button launches that
-//!    notebook directly in the selected IPTS).
-//! 3. Either turn auto-normalization ON (every upcoming run gets
-//!    normalized — writes the shared `autoreduction.cfg`), or type a list
-//!    of runs to normalize.
+//!    notebook directly in the selected IPTS, blank or with the selected
+//!    file loaded — or tick "Use default configuration": the notebook's
+//!    defaults, results in `<IPTS>/shared/processed_data/autoreduction`).
+//! 3. Or type a list of runs to normalize.
 //! 4. When a run list is given, a table shows for each run whether its
 //!    NeXus / raw / corrected / normalized files exist yet (hover an icon
 //!    for the full path). With auto-normalization ON, every run landing
@@ -275,6 +277,15 @@ struct MonitorApp {
     configs: Vec<ConfigFile>,
     configs_error: Option<String>,
     selected_config: Option<PathBuf>,
+    /// "Use default configuration" (section 2): the normalization runs
+    /// with the notebook's default parameters and sends its results to
+    /// `<IPTS>/shared/processed_data/autoreduction` — a configuration
+    /// file holding those defaults is written there and selected (the
+    /// autoreduction registers a real file). No file to pick, nothing to
+    /// browse: the drop-down and Browse… are disabled while on.
+    use_default_config: bool,
+    /// Error from the last attempt to write the default configuration.
+    default_config_error: Option<String>,
     /// Status/errors from the last notebook launch.
     launch_status: Option<(String, egui::Color32)>,
     /// Error from the last attempt to preview a configuration file.
@@ -426,6 +437,8 @@ impl MonitorApp {
             configs: Vec::new(),
             configs_error: None,
             selected_config: None,
+            use_default_config: false,
+            default_config_error: None,
             launch_status: None,
             preview_error: None,
             run_list_text: String::new(),
@@ -532,6 +545,9 @@ impl MonitorApp {
         }
         self.rescan_configs();
         self.select_newest_config();
+        if self.use_default_config {
+            self.apply_default_config();
+        }
         self.check_runs();
     }
 
@@ -542,6 +558,50 @@ impl MonitorApp {
         if let Some(newest) = self.configs.first() {
             self.selected_config = Some(newest.path.clone());
             self.preview_error = None;
+        }
+    }
+
+    /// Where the default configuration sends the results:
+    /// `<IPTS>/shared/processed_data/autoreduction`.
+    fn default_output_folder(ipts_path: &Path) -> PathBuf {
+        ipts_path.join("shared/processed_data/autoreduction")
+    }
+
+    /// The default configuration file of an IPTS, written in its output
+    /// folder (not in `shared/autoreduce`, so it never shows up in the
+    /// drop-down as one more file to pick).
+    fn default_config_path(ipts_path: &Path) -> PathBuf {
+        Self::default_output_folder(ipts_path).join("default_normalization_config.h5")
+    }
+
+    /// "Use default configuration" ON (or the IPTS changed while it is):
+    /// write the notebook's default parameters as a configuration file in
+    /// the IPTS' default output folder — a fresh copy every time, so the
+    /// detector and the output folder follow the IPTS — and select it.
+    /// The open beams come from the table ("⇄ replace by…" writes a
+    /// derived copy next to it, as with any configuration). On failure
+    /// the switch goes back OFF with the error shown under it.
+    fn apply_default_config(&mut self) {
+        let Some(ipts) = self.ipts.clone() else {
+            return;
+        };
+        let ipts_path = Path::new(IPTS_ROOT).join(&ipts);
+        let output = Self::default_output_folder(&ipts_path);
+        let path = Self::default_config_path(&ipts_path);
+        let detector = Self::detector_from_layout(&ipts_path)
+            .or_else(|| self.detector.clone())
+            .unwrap_or_else(|| "tpx1".to_owned());
+        match h5::write_default_config(&path, &ipts, &detector, &output) {
+            Ok(()) => {
+                self.default_config_error = None;
+                self.selected_config = Some(path);
+                self.preview_error = None;
+                self.keep_selected_config();
+            }
+            Err(e) => {
+                self.default_config_error = Some(e);
+                self.use_default_config = false;
+            }
         }
     }
 
@@ -2453,6 +2513,19 @@ impl MonitorApp {
         });
     }
 
+    /// Launch the normalization notebook in the selected IPTS — with
+    /// `config` loaded at startup when given (its "Load configuration"
+    /// step done), to edit a configuration without running it here.
+    fn launch_notebook(&mut self, config: Option<PathBuf>) {
+        let Some(ipts_path) = self.ipts_path() else {
+            return;
+        };
+        self.launch_status = Some(match notebook::launch(&ipts_path, config.as_deref()) {
+            Ok(msg) => (msg, theme::SUCCESS),
+            Err(e) => (e, theme::DANGER),
+        });
+    }
+
     /// Open the selected configuration file in the NeXus viewer (detached).
     fn preview_config(&mut self) {
         let Some(path) = self.selected_config.clone() else {
@@ -2477,8 +2550,10 @@ impl MonitorApp {
         ui.add_space(theme::SPACE_XS);
         theme::section_frame(ui, |ui| {
             let mut selected: Option<PathBuf> = None;
+            let use_default = self.use_default_config;
             ui.horizontal(|ui| {
                 ui.label("Configuration file:");
+                ui.add_enabled_ui(!use_default, |ui| {
                 let current_name = self
                     .selected_config
                     .as_ref()
@@ -2506,7 +2581,14 @@ impl MonitorApp {
                     }
                 });
                 if let Some(path) = &self.selected_config {
-                    response.response.on_hover_text(path.display().to_string());
+                    response.response.on_hover_text(if use_default {
+                        format!(
+                            "The default configuration (Use default configuration is on)\n{}",
+                            path.display()
+                        )
+                    } else {
+                        path.display().to_string()
+                    });
                 }
                 if ui
                     .button("⟳")
@@ -2527,6 +2609,7 @@ impl MonitorApp {
                 {
                     self.browse_config();
                 }
+                });
                 // Preview the selected configuration in the NeXus viewer
                 // (the config is a plain HDF5 file).
                 let preview = ui.add_enabled(
@@ -2575,26 +2658,77 @@ impl MonitorApp {
             }
             ui.add_space(theme::SPACE_SM);
             ui.horizontal(|ui| {
+                // Nothing selected: the notebook opens blank, to create a
+                // file. A file selected: it opens with that file loaded,
+                // to change it — saved again under the same name, or a
+                // new one.
+                let (label, hover) = match &self.selected_config {
+                    None => (
+                        "🚀 Create new configuration (normalization notebook)".to_owned(),
+                        format!(
+                            "Launch the marimo \"Normalization TOF at VENUS\" notebook\n\
+                             directly in the selected IPTS\n{}",
+                            notebook::NOTEBOOK_PATH
+                        ),
+                    ),
+                    Some(path) => (
+                        "✏ Edit and/or replace current configuration (normalization notebook)"
+                            .to_owned(),
+                        format!(
+                            "Launch the marimo \"Normalization TOF at VENUS\" notebook in \
+                             the selected IPTS with this configuration already loaded — \
+                             change what you need and save it again, as the same file \
+                             or a new one\n{}",
+                            path.display()
+                        ),
+                    ),
+                };
                 if ui
-                    .add(theme::primary_button("🚀 Create new configuration (normalization notebook)"))
-                    .on_hover_text(format!(
-                        "Launch the marimo \"Normalization TOF at VENUS\" notebook\n\
-                         directly in the selected IPTS\n{}",
-                        notebook::NOTEBOOK_PATH
-                    ))
+                    .add(theme::primary_button(&label))
+                    .on_hover_text(hover)
                     .clicked()
                 {
-                    if let Some(ipts_path) = self.ipts_path() {
-                        self.launch_status = Some(match notebook::launch(&ipts_path) {
-                            Ok(msg) => (msg, theme::SUCCESS),
-                            Err(e) => (e, theme::DANGER),
-                        });
+                    self.launch_notebook(self.selected_config.clone());
+                }
+                ui.add_space(theme::SPACE_SM);
+                let default_output = self
+                    .ipts_path()
+                    .map(|p| Self::default_output_folder(&p).display().to_string())
+                    .unwrap_or_default();
+                let response = ui
+                    .checkbox(&mut self.use_default_config, "Use default configuration")
+                    .on_hover_text(format!(
+                        "Normalize with the notebook's default parameters instead of a \
+                         configuration file of your own: Bragg mode, proton-charge \
+                         normalization, no background matching, no inpainting, no \
+                         manual TOF binning, 25 m flight path, 700 ns bins, no crop, \
+                         no mask; TIFF stack + integrated TIFF + x_axis.txt. The \
+                         results go to\n{default_output}\nwhere a configuration file \
+                         holding those defaults is written and selected (the open \
+                         beams come from the table: ⇄ replace by…)."
+                    ));
+                if response.changed() {
+                    if self.use_default_config {
+                        self.apply_default_config();
+                    } else {
+                        // Back to the files of the IPTS, the newest selected.
+                        self.default_config_error = None;
+                        self.selected_config = None;
+                        self.rescan_configs();
+                        self.select_newest_config();
                     }
+                    self.check_runs();
                 }
                 if let Some((msg, color)) = &self.launch_status {
                     ui.label(egui::RichText::new(msg).color(*color));
                 }
             });
+            if let Some(err) = &self.default_config_error {
+                ui.label(
+                    egui::RichText::new(format!("Cannot write the default configuration: {err}"))
+                        .color(theme::DANGER),
+                );
+            }
             if let Some(path) = selected {
                 self.selected_config = Some(path);
                 self.preview_error = None;
@@ -2602,93 +2736,97 @@ impl MonitorApp {
         });
     }
 
-    /// Section 3 — auto-normalization ON/OFF, or a manual list of runs.
+    /// Status strip under the header — auto normalization ON/OFF, the
+    /// shared configuration file it lives in, what is registered while
+    /// ON. At the top because it is the one thing everybody wants to see
+    /// first, whatever section is being edited below.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let active = self.is_active();
+        ui.horizontal(|ui| {
+            let (label, fill) = if active {
+                ("Auto normalization: ON", theme::SUCCESS)
+            } else {
+                ("Auto normalization: OFF", theme::DANGER)
+            };
+            let text = egui::RichText::new(label)
+                .color(theme::TEXT_WHITE)
+                .strong()
+                .size(18.0);
+            let button = egui::Button::new(text)
+                .fill(fill)
+                .corner_radius(8.0)
+                .min_size(egui::vec2(260.0, 40.0));
+            // Needs an IPTS and a configuration (sections 1 and 2 below).
+            let can_turn_on = self.selected_config.is_some();
+            let response = ui.add_enabled(active || can_turn_on, button);
+            let response = if active {
+                response.on_hover_text(
+                    "Every upcoming run is normalized automatically — click to turn OFF",
+                )
+            } else if can_turn_on {
+                response.on_hover_text(
+                    "Click to normalize every upcoming run with the selected configuration",
+                )
+            } else {
+                response.on_disabled_hover_text(
+                    "Select an IPTS (1.) and a normalization configuration file (2.) first",
+                )
+            };
+            if response.clicked() {
+                if active {
+                    self.turn_off();
+                } else {
+                    self.turn_on();
+                }
+            }
+            ui.label(
+                egui::RichText::new(format!("({})", self.cfg_path.display()))
+                    .color(theme::text_emphasis(ui.visuals()))
+                    .small(),
+            );
+        });
+        if let Some(err) = &self.write_error {
+            ui.label(
+                egui::RichText::new(format!("Failed to update the configuration: {err}"))
+                    .color(theme::DANGER),
+            );
+        }
+        // The shared config may point at another IPTS/config than the
+        // one selected here — make that visible.
+        if active {
+            if let Ok(cfg) = &self.cfg {
+                let reg_ipts = cfg.get("ipts").unwrap_or("?");
+                let reg_file = cfg.get("user_autoreduction_config_file").unwrap_or("?");
+                let windows = match (cfg.live_reduction, cfg.rolling_combine) {
+                    (true, true) => " — live reduction + rolling combine & compare windows",
+                    (true, false) => " — live reduction only",
+                    (false, true) => " — rolling combine & compare windows only",
+                    (false, false) => {
+                        " — nothing fires from here: check 4. and/or 5. below"
+                    }
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Active on {reg_ipts} with {}{windows}",
+                        Path::new(reg_file)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| reg_file.to_owned())
+                    ))
+                    .color(theme::text_emphasis(ui.visuals())),
+                )
+                .on_hover_text(reg_file);
+            }
+        }
+    }
+
+    /// Section 3 — a manual list of runs to normalize.
     fn mode_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(theme::section_heading("3. What to normalize"));
+        ui.label(theme::section_heading("3. Normalize a list of runs"));
         ui.add_space(theme::SPACE_XS);
         theme::section_frame(ui, |ui| {
-            let active = self.is_active();
             ui.horizontal(|ui| {
-                let (label, fill) = if active {
-                    ("Auto normalization: ON", theme::SUCCESS)
-                } else {
-                    ("Auto normalization: OFF", theme::DANGER)
-                };
-                let text = egui::RichText::new(label)
-                    .color(theme::TEXT_WHITE)
-                    .strong()
-                    .size(18.0);
-                let button = egui::Button::new(text)
-                    .fill(fill)
-                    .corner_radius(8.0)
-                    .min_size(egui::vec2(260.0, 40.0));
-                let can_turn_on = self.selected_config.is_some();
-                let response = ui.add_enabled(active || can_turn_on, button);
-                let response = if active {
-                    response.on_hover_text(
-                        "Every upcoming run is normalized automatically — click to turn OFF",
-                    )
-                } else if can_turn_on {
-                    response.on_hover_text(
-                        "Click to normalize every upcoming run with the selected configuration",
-                    )
-                } else {
-                    response.on_disabled_hover_text(
-                        "Select a normalization configuration file first",
-                    )
-                };
-                if response.clicked() {
-                    if active {
-                        self.turn_off();
-                    } else {
-                        self.turn_on();
-                    }
-                }
-                ui.label(
-                    egui::RichText::new(format!("({})", self.cfg_path.display()))
-                        .color(theme::text_emphasis(ui.visuals()))
-                        .small(),
-                );
-            });
-            if let Some(err) = &self.write_error {
-                ui.label(
-                    egui::RichText::new(format!("Failed to update the configuration: {err}"))
-                        .color(theme::DANGER),
-                );
-            }
-            // The shared config may point at another IPTS/config than the
-            // one selected here — make that visible.
-            if active {
-                if let Ok(cfg) = &self.cfg {
-                    let reg_ipts = cfg.get("ipts").unwrap_or("?");
-                    let reg_file = cfg.get("user_autoreduction_config_file").unwrap_or("?");
-                    let windows = match (cfg.live_reduction, cfg.rolling_combine) {
-                        (true, true) => " — live reduction + rolling combine & compare windows",
-                        (true, false) => " — live reduction only",
-                        (false, true) => " — rolling combine & compare windows only",
-                        (false, false) => {
-                            " — nothing fires from here: check 4. and/or 5. below"
-                        }
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Active on {reg_ipts} with {}{windows}",
-                            Path::new(reg_file)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| reg_file.to_owned())
-                        ))
-                        .color(theme::text_emphasis(ui.visuals())),
-                    )
-                    .on_hover_text(reg_file);
-                }
-            }
-
-            ui.add_space(theme::SPACE_SM);
-            ui.separator();
-            ui.add_space(theme::SPACE_XS);
-            ui.horizontal(|ui| {
-                ui.label("…or normalize a list of runs:");
+                ui.label("Runs:");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.run_list_text)
                         .hint_text("e.g. 23615-23620, 23642")
@@ -4858,7 +4996,21 @@ impl eframe::App for MonitorApp {
 
         self.header(ctx);
 
-        // Slim strip under the header: theme toggle + refresh controls.
+        // Status strip: auto normalization ON/OFF and what it registers.
+        egui::TopBottomPanel::top("status_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::surface_weak(&ctx.style().visuals))
+                    .inner_margin(egui::Margin {
+                        left: 16,
+                        right: 16,
+                        top: 8,
+                        bottom: 4,
+                    }),
+            )
+            .show(ctx, |ui| self.status_bar(ui));
+
+        // Slim strip under it: theme toggle + refresh controls.
         egui::TopBottomPanel::top("controls_bar")
             .frame(
                 egui::Frame::new()
