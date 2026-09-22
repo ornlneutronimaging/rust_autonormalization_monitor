@@ -9,15 +9,20 @@
 //! last_modified_by: j35
 //! rolling_combine: false
 //! live_reduction: false
+//! live_open_beams: false
 //! ```
 //!
 //! `rolling_combine` and `live_reduction` are the opt-in flags of this
 //! tool's two normalization sections: only when `rolling_combine` is true
 //! does the auto normalization also fire the rolling combine & compare
 //! window normalizations, and only when `live_reduction` is true does it
-//! normalize every upcoming run on its own from here. The notebook does not
-//! know those keys (it rewrites the file without them), so a missing key
-//! means false — nothing fires from this tool unless the box is checked.
+//! normalize every upcoming run on its own from here. `live_open_beams` is
+//! independent of either: only when true does the tool itself replace the
+//! configuration's open beams by the newest complete, consecutive
+//! open-beam run(s) landed after them, as soon as they land — no manual
+//! "⇄ replace by…" needed. The notebook does not know those keys (it
+//! rewrites the file without them), so a missing key means false — nothing
+//! fires from this tool unless the box is checked.
 //!
 //! Only the toggled line is rewritten when a flag changes (plus the
 //! `last_modified`/`last_modified_by` bookkeeping lines the file already
@@ -32,6 +37,8 @@ use std::path::Path;
 pub const ROLLING_COMBINE_KEY: &str = "rolling_combine";
 /// Key of the live reduction (per-run normalization) opt-in flag.
 pub const LIVE_REDUCTION_KEY: &str = "live_reduction";
+/// Key of the live open-beams (automatic OB replacement) opt-in flag.
+pub const LIVE_OPEN_BEAMS_KEY: &str = "live_open_beams";
 
 /// Snapshot of the configuration file, keeping the raw key order for display.
 #[derive(Clone, Debug, Default)]
@@ -44,6 +51,9 @@ pub struct AutoNormConfig {
     /// Parsed value of the `live_reduction` opt-in flag (false when the
     /// key is absent).
     pub live_reduction: bool,
+    /// Parsed value of the `live_open_beams` opt-in flag (false when the
+    /// key is absent).
+    pub live_open_beams: bool,
     /// All `key: value` pairs in file order (values with quotes stripped),
     /// for read-only display in the UI.
     pub entries: Vec<(String, String)>,
@@ -83,6 +93,8 @@ pub fn read(path: &Path) -> Result<AutoNormConfig, String> {
                 cfg.rolling_combine = parse_bool(value);
             } else if key == LIVE_REDUCTION_KEY {
                 cfg.live_reduction = parse_bool(value);
+            } else if key == LIVE_OPEN_BEAMS_KEY {
+                cfg.live_open_beams = parse_bool(value);
             }
             cfg.entries.push((
                 key.to_owned(),
@@ -177,10 +189,20 @@ pub fn set_live_reduction(path: &Path, enabled: bool) -> Result<(), String> {
     )
 }
 
+/// Set the `live_open_beams` opt-in flag, adding the line when the file
+/// (written by the notebook) does not carry it yet.
+pub fn set_live_open_beams(path: &Path, enabled: bool) -> Result<(), String> {
+    set_or_append_value(
+        path,
+        LIVE_OPEN_BEAMS_KEY,
+        if enabled { "true" } else { "false" },
+    )
+}
+
 /// (Re)write the whole configuration file with the 5-key schema the
 /// normalization notebook uses (`register_config_for_autoreduction`) plus
-/// this tool's `rolling_combine` and `live_reduction` flags, creating the
-/// parent folder / file if needed.
+/// this tool's `rolling_combine`, `live_reduction` and `live_open_beams`
+/// flags, creating the parent folder / file if needed.
 pub fn write_full(
     path: &Path,
     ipts: &str,
@@ -188,6 +210,7 @@ pub fn write_full(
     activate: bool,
     rolling_combine: bool,
     live_reduction: bool,
+    live_open_beams: bool,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -202,7 +225,8 @@ pub fn write_full(
          last_modified: '{now}'\n\
          last_modified_by: {user}\n\
          {ROLLING_COMBINE_KEY}: {rolling_combine}\n\
-         {LIVE_REDUCTION_KEY}: {live_reduction}\n"
+         {LIVE_REDUCTION_KEY}: {live_reduction}\n\
+         {LIVE_OPEN_BEAMS_KEY}: {live_open_beams}\n"
     );
     fs::write(path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
@@ -288,11 +312,12 @@ last_modified_by: j35
         let dir = std::env::temp_dir().join("anm_test_write_full/sub");
         let _ = fs::remove_dir_all(std::env::temp_dir().join("anm_test_write_full"));
         let path = dir.join("autoreduction.cfg");
-        write_full(&path, "IPTS-36967", "/tmp/config.h5", true, true, false).unwrap();
+        write_full(&path, "IPTS-36967", "/tmp/config.h5", true, true, false, false).unwrap();
         let cfg = read(&path).unwrap();
         assert!(cfg.activate);
         assert!(cfg.rolling_combine);
         assert!(!cfg.live_reduction);
+        assert!(!cfg.live_open_beams);
         assert_eq!(cfg.get("ipts"), Some("IPTS-36967"));
         assert_eq!(cfg.get("user_autoreduction_config_file"), Some("/tmp/config.h5"));
         assert!(cfg.get("last_modified").is_some());
@@ -337,6 +362,26 @@ last_modified_by: j35
         assert!(!cfg.live_reduction);
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content.matches("live_reduction").count(), 1);
+    }
+
+    #[test]
+    fn live_open_beams_is_appended_then_toggled_in_place() {
+        let dir = std::env::temp_dir().join("anm_test_live_ob");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_sample(&dir);
+        // Absent in the notebook's file → opted out.
+        assert!(!read(&path).unwrap().live_open_beams);
+        set_live_open_beams(&path, true).unwrap();
+        let cfg = read(&path).unwrap();
+        assert!(cfg.live_open_beams);
+        assert!(!cfg.rolling_combine);
+        assert!(!cfg.live_reduction);
+        assert_eq!(cfg.entries[5].0, "live_open_beams");
+        set_live_open_beams(&path, false).unwrap();
+        let cfg = read(&path).unwrap();
+        assert!(!cfg.live_open_beams);
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("live_open_beams").count(), 1);
     }
 
     #[test]

@@ -704,6 +704,12 @@ impl MonitorApp {
         } else {
             None
         };
+        // Live open beams (opt-in): config_obs above is now the current
+        // selection's — switch it on its own when a new one landed and
+        // completed. Recurses into check_runs once, through
+        // use_as_open_beams; by then new_open_beams() is empty (the switch
+        // already happened), so it stops there.
+        self.maybe_auto_switch_open_beams();
     }
 
     /// Recompute which runs fall in each rolling window: the user's run
@@ -868,7 +874,8 @@ impl MonitorApp {
             {
                 let registered = cfg.get("user_autoreduction_config_file").map(Path::new);
                 if cfg.activate && registered != Some(selected.as_path()) {
-                    let (rolling, live) = (cfg.rolling_combine, cfg.live_reduction);
+                    let (rolling, live, live_ob) =
+                        (cfg.rolling_combine, cfg.live_reduction, cfg.live_open_beams);
                     match config::write_full(
                         &self.cfg_path,
                         &ipts,
@@ -876,6 +883,7 @@ impl MonitorApp {
                         true,
                         rolling,
                         live,
+                        live_ob,
                     ) {
                         Ok(()) => {
                             self.write_error = None;
@@ -1930,6 +1938,39 @@ impl MonitorApp {
             .collect()
     }
 
+    /// The folders of `candidates` (from [`Self::new_open_beams`]), ready
+    /// to become the configuration's open beams — only once EVERY one of
+    /// them has landed (`Present`): waiting on any keeps the configuration
+    /// on the previous open beams rather than switching to a partial,
+    /// still-acquiring set. `None` when there is nothing to switch to yet.
+    fn ready_new_open_beams(candidates: &[(u64, files::FileStatus)]) -> Option<Vec<PathBuf>> {
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates
+            .iter()
+            .map(|(_, status)| match status {
+                files::FileStatus::Present(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Live open beams (opt-in `live_open_beams` flag): the configuration's
+    /// open beams follow the acquisition on their own — as soon as a new,
+    /// complete, consecutive run of open-beam runs lands after the
+    /// configuration's current ones, it replaces them, and every sample run
+    /// from then on divides by it, until the next such run lands. Manual
+    /// "⇄ replace by…" still works, opted in or not.
+    fn maybe_auto_switch_open_beams(&mut self) {
+        if !self.live_open_beams_enabled() || self.selected_config.is_none() {
+            return;
+        }
+        if let Some(folders) = Self::ready_new_open_beams(&self.new_open_beams()) {
+            self.use_as_open_beams(folders);
+        }
+    }
+
     /// Make `folders` (complete corrected open-beam folders) the open
     /// beams of every normalization to come: a copy of the selected
     /// configuration with those folders as its open beams is written next
@@ -2029,30 +2070,52 @@ impl MonitorApp {
         self.cfg.as_ref().map(|c| c.live_reduction).unwrap_or(false)
     }
 
+    /// Did the user opt the live open beams — the configuration's open
+    /// beams replaced automatically by the newest complete, consecutive
+    /// open-beam run(s) as they land — into the tool (shared
+    /// `live_open_beams` flag, false when the key is absent)?
+    fn live_open_beams_enabled(&self) -> bool {
+        self.cfg.as_ref().map(|c| c.live_open_beams).unwrap_or(false)
+    }
+
     /// Opt the rolling windows in/out of the auto normalization: written to
     /// the shared config so it survives restarts and is visible to every
     /// user (the line is added when the notebook-written file lacks it).
     fn set_rolling_enabled(&mut self, enabled: bool) {
-        let live = self.live_enabled();
-        self.set_opt_in(enabled, live, |path| config::set_rolling_combine(path, enabled));
+        let (live, live_ob) = (self.live_enabled(), self.live_open_beams_enabled());
+        self.set_opt_in(enabled, live, live_ob, |path| {
+            config::set_rolling_combine(path, enabled)
+        });
     }
 
     /// Opt the live reduction in/out of the auto normalization (same
     /// shared-config mechanics as the rolling windows).
     fn set_live_enabled(&mut self, enabled: bool) {
-        let rolling = self.rolling_enabled();
-        self.set_opt_in(rolling, enabled, |path| config::set_live_reduction(path, enabled));
+        let (rolling, live_ob) = (self.rolling_enabled(), self.live_open_beams_enabled());
+        self.set_opt_in(rolling, enabled, live_ob, |path| {
+            config::set_live_reduction(path, enabled)
+        });
+    }
+
+    /// Opt the live open beams in/out (same shared-config mechanics as the
+    /// other two flags).
+    fn set_live_open_beams_enabled(&mut self, enabled: bool) {
+        let (rolling, live) = (self.rolling_enabled(), self.live_enabled());
+        self.set_opt_in(rolling, live, enabled, |path| {
+            config::set_live_open_beams(path, enabled)
+        });
     }
 
     /// Write one opt-in flag: `set` toggles its line in the existing shared
     /// file; when there is no shared file yet (auto normalization never
     /// turned ON) the file is created, OFF, with the selected
-    /// IPTS/configuration if any and both flags as they should now read
-    /// (`rolling`, `live`).
+    /// IPTS/configuration if any and all three flags as they should now
+    /// read (`rolling`, `live`, `live_ob`).
     fn set_opt_in(
         &mut self,
         rolling: bool,
         live: bool,
+        live_ob: bool,
         set: impl FnOnce(&Path) -> Result<(), String>,
     ) {
         let result = if self.cfg_path.is_file() {
@@ -2069,6 +2132,7 @@ impl MonitorApp {
                 false,
                 rolling,
                 live,
+                live_ob,
             )
         };
         match result {
@@ -2086,7 +2150,8 @@ impl MonitorApp {
             return;
         };
         // The opt-ins are the user's own choices: keep them as they are.
-        let (rolling, live) = (self.rolling_enabled(), self.live_enabled());
+        let (rolling, live, live_ob) =
+            (self.rolling_enabled(), self.live_enabled(), self.live_open_beams_enabled());
         match config::write_full(
             &self.cfg_path,
             &ipts,
@@ -2094,6 +2159,7 @@ impl MonitorApp {
             true,
             rolling,
             live,
+            live_ob,
         ) {
             Ok(()) => self.write_error = None,
             Err(e) => self.write_error = Some(e),
@@ -3292,6 +3358,23 @@ impl MonitorApp {
             if response.changed() {
                 self.set_live_enabled(opted_in);
             }
+            ui.add_space(theme::SPACE_MD);
+            let mut live_ob = self.live_open_beams_enabled();
+            let ob_response = ui
+                .checkbox(&mut live_ob, "🔆 Live open beams")
+                .on_hover_text(
+                    "Opt-in, saved in the shared configuration, independent of the \
+                     flag above: when checked, the configuration's open beams are \
+                     replaced on their own by the newest complete, consecutive \
+                     open-beam run(s) as soon as they land, no \"⇄ replace by…\" \
+                     needed — e.g. runs 30338+30339 (open beam), then 30340+ \
+                     (sample) divide by them, until the next open-beam run(s) \
+                     land and replace them in turn. Unchecked (the default), \
+                     only \"⇄ replace by…\" on a row switches them.",
+                );
+            if ob_response.changed() {
+                self.set_live_open_beams_enabled(live_ob);
+            }
             if folded {
                 return;
             }
@@ -3376,6 +3459,14 @@ impl MonitorApp {
             });
         });
         if folded {
+            // The table (and the banner below, with its own error line) is
+            // hidden, but a failed automatic switch still needs to be seen.
+            if let Some(err) = &self.ob_error {
+                ui.label(
+                    egui::RichText::new(format!("Cannot switch the open beams: {err}"))
+                        .color(theme::DANGER),
+                );
+            }
             return;
         }
         ui.add_space(theme::SPACE_XS);
@@ -4674,6 +4765,27 @@ mod tests {
         assert_eq!(strip("normalization_config_20260910_102311"), "normalization_config_20260910_102311");
         assert_eq!(strip("my_ob"), "my_ob");
         assert_eq!(strip("config_ob_"), "config_ob_");
+    }
+
+    #[test]
+    fn ready_new_open_beams_waits_for_every_candidate() {
+        let ready = MonitorApp::ready_new_open_beams;
+        // Nothing landed: nothing to switch to.
+        assert_eq!(ready(&[]), None);
+        // Two consecutive open beams, both corrected: ready to swap in, as
+        // one group (this is what makes 30338+30339 replace an older pair
+        // once 30340, a sample run, needs them).
+        let a = files::FileStatus::Present(PathBuf::from("/x/ob/Run_30338"));
+        let b = files::FileStatus::Present(PathBuf::from("/x/ob/Run_30339"));
+        assert_eq!(
+            ready(&[(30338, a.clone()), (30339, b.clone())]),
+            Some(vec![PathBuf::from("/x/ob/Run_30338"), PathBuf::from("/x/ob/Run_30339")])
+        );
+        // One of them still being written: the pair is not ready yet — the
+        // previous open beams stay in use rather than switching to a half
+        // landed set.
+        let writing = files::FileStatus::Writing(PathBuf::from("/x/ob/Run_30339"));
+        assert_eq!(ready(&[(30338, a), (30339, writing)]), None);
     }
 
     #[test]
