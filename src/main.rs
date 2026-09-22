@@ -175,6 +175,11 @@ struct ConfigFile {
 struct RunMeta {
     /// The open-beam folders it divides by.
     obs: Vec<PathBuf>,
+    /// Open beams of its settings left out at launch: acquired at another
+    /// starting wavelength than the run (live open beams). Shown struck
+    /// through in the Open beam column; not in the job log, so empty for
+    /// a result read back from disk.
+    dropped_obs: Vec<PathBuf>,
     /// The configuration file (settings) it runs with.
     config: Option<PathBuf>,
     /// Its result folder (`…/Run_<run>/normalization`).
@@ -983,6 +988,7 @@ impl MonitorApp {
                     run,
                     RunMeta {
                         obs: launch.as_ref().map(|l| l.obs.clone()).unwrap_or_default(),
+                        dropped_obs: Vec::new(),
                         config: launch.and_then(|l| l.config),
                         output: Some(output.clone()),
                     },
@@ -1079,15 +1085,28 @@ impl MonitorApp {
         };
         // The row's own settings (✏) replace the configuration's open
         // beams / output folder for this run.
-        let info = self.effective_info(run, info);
+        let mut info = self.effective_info(run, info);
         // Live open beams: an open beam from another chopper wavelength
-        // setting would divide with the wrong TOF binning — the run is
-        // rejected outright (crossed out, like a manual ✖; ↩ restores it,
-        // and it is checked again at the next start) rather than
-        // normalized wrong. Every start goes through here: the automatic
-        // pass, ▶ normalize, ↻ re-run and the queue alike.
-        if self.wavelength_mismatch(run, &info.ob_folders).is_some() {
-            self.rejected.insert(run);
+        // setting would divide with the wrong TOF binning — it is left
+        // out of this run's normalization (struck through in the Open
+        // beam column), which goes on with the matching ones. Every start
+        // goes through here: the automatic pass, ▶ normalize, ↻ re-run
+        // and the queue alike.
+        let dropped = self.dropped_open_beams(run, &info.ob_folders);
+        info.ob_folders.retain(|f| !dropped.contains(f));
+        if info.ob_folders.is_empty() && !dropped.is_empty() {
+            self.run_meta.remove(&run);
+            self.run_jobs.insert(
+                run,
+                norm::JobState::Failed {
+                    message: format!(
+                        "no open beam at this run's starting wavelength: {} acquired at \
+                         another one (live open beams) — ⇄ replace by… one that matches",
+                        Self::ob_runs_text(&dropped)
+                    ),
+                    log: None,
+                },
+            );
             return;
         }
         let state = match norm::prepare_run_job(run, &corrected, ipts_path, config, &info) {
@@ -1097,6 +1116,7 @@ impl MonitorApp {
                     run,
                     RunMeta {
                         obs: spec.ob_folders(),
+                        dropped_obs: dropped,
                         config: Some(spec.config().to_path_buf()),
                         output: Some(spec.output().to_path_buf()),
                     },
@@ -2114,33 +2134,34 @@ impl MonitorApp {
     }
 
     /// Among `obs` (the open-beam folders a run is about to divide by),
-    /// the first one acquired at a starting wavelength other than
-    /// `sample`'s (the run's own): its folder, for the message/hover.
-    /// `None` when every open beam matches — or when a wavelength is not
-    /// known (the run's, or an open beam whose folder name carries no
-    /// `AngsMin` token): missing information is not a mismatch, the run
-    /// is normalized as before.
-    fn mismatched_open_beam(sample: Option<f64>, obs: &[PathBuf]) -> Option<PathBuf> {
-        let sample = sample?;
+    /// those acquired at a starting wavelength other than `sample`'s (the
+    /// run's own) — to leave out of its normalization. Empty when every
+    /// open beam matches, or when a wavelength is not known (the run's, or
+    /// an open beam whose folder name carries no `AngsMin` token): missing
+    /// information is not a mismatch, the open beam stays in.
+    fn mismatched_open_beams(sample: Option<f64>, obs: &[PathBuf]) -> Vec<PathBuf> {
+        let Some(sample) = sample else {
+            return Vec::new();
+        };
         obs.iter()
-            .find(|folder| {
+            .filter(|folder| {
                 folder
                     .file_name()
                     .and_then(|n| files::starting_wavelength_in_name(&n.to_string_lossy()))
                     .is_some_and(|w| !Self::wavelengths_match(w, sample))
             })
             .cloned()
+            .collect()
     }
 
-    /// Live open beams (opt-in): would normalizing `run` divide it by an
-    /// open beam from another chopper wavelength setting? The folder of
-    /// the offending open beam when so; `None` otherwise, and always when
-    /// the opt-in is off.
-    fn wavelength_mismatch(&self, run: u64, obs: &[PathBuf]) -> Option<PathBuf> {
+    /// Live open beams (opt-in): the open beams among `obs` that `run`
+    /// must not divide by — acquired at another chopper wavelength
+    /// setting than the run. Empty when the opt-in is off.
+    fn dropped_open_beams(&self, run: u64, obs: &[PathBuf]) -> Vec<PathBuf> {
         if !self.live_open_beams_enabled() {
-            return None;
+            return Vec::new();
         }
-        Self::mismatched_open_beam(self.starting_wavelength(run), obs)
+        Self::mismatched_open_beams(self.starting_wavelength(run), obs)
     }
 
     /// Did the user opt the rolling combine & compare windows into the
@@ -3664,26 +3685,9 @@ impl MonitorApp {
                                 }
                                 let label = ui.label(run_text);
                                 if rejected {
-                                    // The same open beams the start checked
-                                    // (the row's ✏ ones, else its configuration's).
-                                    let obs = self
-                                        .run_overrides
-                                        .get(&run.run)
-                                        .and_then(|o| o.obs.clone())
-                                        .unwrap_or_else(|| self.config_obs_for_run(run.run));
-                                    match self.wavelength_mismatch(run.run, &obs) {
-                                        Some(ob) => label.on_hover_text(format!(
-                                            "Rejected automatically (live open beams): its \
-                                             open beam {} was acquired at another starting \
-                                             wavelength than this run — ↩ restores it once the \
-                                             right open beam is in use\n{}",
-                                            Self::ob_runs_text(std::slice::from_ref(&ob)),
-                                            ob.display()
-                                        )),
-                                        None => label.on_hover_text(
-                                            "Rejected — excluded from the windows",
-                                        ),
-                                    };
+                                    label.on_hover_text(
+                                        "Rejected — excluded from the windows",
+                                    );
                                 } else if alignment {
                                     label.on_hover_text(
                                         "Alignment run — no normalization needed",
@@ -3999,6 +4003,48 @@ impl MonitorApp {
         }
     }
 
+    /// A run list of open beams (`29905, 29906`) with the ones in
+    /// `dropped` struck through: left out of the normalization, acquired
+    /// at another starting wavelength than the run (live open beams).
+    /// `hover` is the cell's explanation; the dropped ones add theirs.
+    fn ob_runs_label(
+        ui: &mut egui::Ui,
+        obs: &[PathBuf],
+        dropped: &[PathBuf],
+        color: egui::Color32,
+        hover: String,
+    ) {
+        let dim = theme::text_emphasis(ui.visuals());
+        let mut hover = hover;
+        if !dropped.is_empty() {
+            hover.push_str(&format!(
+                "\n\nLeft out — acquired at another starting wavelength than this run \
+                 (live open beams): {}\n{}",
+                Self::ob_runs_text(dropped),
+                Self::ob_folders_text(dropped)
+            ));
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let all: Vec<&PathBuf> = obs.iter().chain(dropped.iter()).collect();
+            for (i, folder) in all.iter().enumerate() {
+                let name = Self::ob_runs_text(std::slice::from_ref(*folder));
+                let text = if dropped.contains(folder) {
+                    egui::RichText::new(name).strikethrough().color(dim)
+                } else {
+                    egui::RichText::new(name).color(color)
+                };
+                let sep = if i + 1 < all.len() { ", " } else { "" };
+                ui.label(text);
+                if !sep.is_empty() {
+                    ui.label(egui::RichText::new(sep).color(color));
+                }
+            }
+        })
+        .response
+        .on_hover_text(hover);
+    }
+
     /// "Open beam" cell of one row. Sample run: the open beams its
     /// normalization used (recorded at launch, or read from the job log
     /// of a result found on disk), else the configuration's, dimmed, as
@@ -4033,12 +4079,19 @@ impl MonitorApp {
                     );
                 }
             }
-            h5::RunKind::Sample => match self.run_meta.get(&run).map(|m| &m.obs) {
-                Some(obs) if !obs.is_empty() => {
-                    ui.label(Self::ob_runs_text(obs)).on_hover_text(format!(
-                        "Open beam(s) this run's normalization divides by\n{}",
-                        Self::ob_folders_text(obs)
-                    ));
+            h5::RunKind::Sample => match self.run_meta.get(&run) {
+                Some(meta) if !meta.obs.is_empty() => {
+                    let text = ui.visuals().text_color();
+                    Self::ob_runs_label(
+                        ui,
+                        &meta.obs,
+                        &meta.dropped_obs,
+                        text,
+                        format!(
+                            "Open beam(s) this run's normalization divides by\n{}",
+                            Self::ob_folders_text(&meta.obs)
+                        ),
+                    );
                 }
                 _ => {
                     let done = matches!(self.run_jobs.get(&run), Some(norm::JobState::Done { .. }));
@@ -4047,16 +4100,30 @@ impl MonitorApp {
                             "Normalized, but its job log names no open beam (result \
                              produced by another tool, or log missing)",
                         );
-                    } else if let Some(obs) = self.run_overrides.get(&run).and_then(|o| o.obs.as_ref())
-                    {
-                        ui.label(egui::RichText::new(Self::ob_runs_text(obs)).color(theme::INFO))
-                            .on_hover_text(format!(
-                                "Will divide by the open beam(s) chosen for this run (⇄)\n{}",
-                                Self::ob_folders_text(obs)
-                            ));
-                    } else {
-                        self.planned_obs_cell(ui, Some(run));
+                        return;
                     }
+                    // What it will divide by: the row's ⇄ choice, else its
+                    // configuration's — minus what live open beams will
+                    // leave out at the start.
+                    let (obs, color, what) =
+                        match self.run_overrides.get(&run).and_then(|o| o.obs.clone()) {
+                            Some(obs) => (obs, theme::INFO, "the open beam(s) chosen for this run (⇄)"),
+                            None => (self.config_obs_for_run(run), dim, "the configuration's open beam(s)"),
+                        };
+                    if obs.is_empty() {
+                        self.planned_obs_cell(ui, Some(run));
+                        return;
+                    }
+                    let dropped = self.dropped_open_beams(run, &obs);
+                    let kept: Vec<PathBuf> =
+                        obs.iter().filter(|f| !dropped.contains(f)).cloned().collect();
+                    Self::ob_runs_label(
+                        ui,
+                        &kept,
+                        &dropped,
+                        color,
+                        format!("Will divide by {what}\n{}", Self::ob_folders_text(&kept)),
+                    );
                 }
             },
         }
@@ -4913,22 +4980,21 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_open_beam_is_the_one_at_another_wavelength() {
-        let mismatched = MonitorApp::mismatched_open_beam;
+    fn mismatched_open_beams_are_the_ones_at_another_wavelength() {
+        let mismatched = MonitorApp::mismatched_open_beams;
         let ob_07 = PathBuf::from("/x/ob/20260921_Run_30338_ob__2_900C_0_700AngsMin_ob_0");
         let ob_30 = PathBuf::from("/x/ob/20260921_Run_30339_ob__2_900C_3_000AngsMin_ob_0");
-        // Sample 30340 at 3.0 A: 30339 matches, 30338 does not — the run
-        // is rejected rather than divided by it.
-        assert_eq!(mismatched(Some(3.0), &[ob_30.clone()]), None);
-        assert_eq!(mismatched(Some(3.0), &[ob_30.clone(), ob_07.clone()]), Some(ob_07.clone()));
+        // Sample 30340 at 3.0 A: 30339 stays, 30338 is left out of its
+        // normalization (the run itself is kept).
+        assert!(mismatched(Some(3.0), &[ob_30.clone()]).is_empty());
+        assert_eq!(mismatched(Some(3.0), &[ob_30.clone(), ob_07.clone()]), vec![ob_07.clone()]);
         // The sample's wavelength is not known (no AngsMin token in its
-        // folder name, or no folder yet): not a mismatch.
-        assert_eq!(mismatched(None, &[ob_07.clone()]), None);
-        // An open beam whose folder name carries no token is not a
-        // mismatch either.
+        // folder name, or no folder yet): nothing left out.
+        assert!(mismatched(None, &[ob_07.clone()]).is_empty());
+        // An open beam whose folder name carries no token stays in too.
         let unnamed = PathBuf::from("/x/ob/20260430_OB_RT_1_393C");
-        assert_eq!(mismatched(Some(3.0), &[unnamed]), None);
-        assert_eq!(mismatched(Some(3.0), &[]), None);
+        assert!(mismatched(Some(3.0), &[unnamed]).is_empty());
+        assert!(mismatched(Some(3.0), &[]).is_empty());
     }
 
     #[test]
