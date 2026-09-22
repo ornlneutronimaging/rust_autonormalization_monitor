@@ -36,7 +36,6 @@ mod theme;
 mod zoom;
 
 use eframe::egui;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -312,12 +311,6 @@ struct MonitorApp {
     /// input, never normalized. Such runs stay listed but are neither
     /// waited for nor put in the windows.
     image_path_cache: HashMap<u64, String>,
-    /// A run's starting wavelength (Å, its NeXus `BL10:Exp:Chop:
-    /// LambdaMinActual` log, read once alongside `image_path_cache`): the
-    /// live open-beams switch only adopts an open-beam run that shares it
-    /// with the newest one landed — an older one belongs to a previous,
-    /// now-stale chopper setting and is left out rather than mixed in.
-    wavelength_cache: HashMap<u64, f64>,
     /// The open-beam folders of the selected configuration file (read
     /// when the selection changes): what every upcoming normalization
     /// divides by, shown in the "Open beam" column of the table.
@@ -443,7 +436,6 @@ impl MonitorApp {
                 .collect(),
             time_cache: HashMap::new(),
             image_path_cache: HashMap::new(),
-            wavelength_cache: HashMap::new(),
             config_obs: Vec::new(),
             run_meta: HashMap::new(),
             run_overrides: HashMap::new(),
@@ -510,7 +502,6 @@ impl MonitorApp {
         self.selected_config = None;
         self.time_cache.clear();
         self.image_path_cache.clear();
-        self.wavelength_cache.clear();
         self.pv_cache.clear();
         self.rejected.clear();
         self.last_live_anchor = None;
@@ -2084,29 +2075,32 @@ impl MonitorApp {
         stem.to_owned()
     }
 
-    /// Read (once each) where the DAQ filed a run's images and its
-    /// starting wavelength, from its NeXus — nothing is stored for either
-    /// when the file is missing or still being written, so the next
-    /// refresh retries.
+    /// Read (once) where the DAQ filed a run's images, from its NeXus —
+    /// nothing is stored when the file is missing or still being written,
+    /// so the next refresh retries.
     fn classify_run(&mut self, ipts_path: &Path, run: u64) {
-        let nexus_path = files::nexus_path(ipts_path, run);
-        if let Entry::Vacant(e) = self.image_path_cache.entry(run) {
-            if let Some(path) = h5::nexus_image_path(&nexus_path) {
-                e.insert(path);
-            }
+        if self.image_path_cache.contains_key(&run) {
+            return;
         }
-        if let Entry::Vacant(e) = self.wavelength_cache.entry(run) {
-            if let Some(wavelength) = h5::nexus_starting_wavelength(&nexus_path) {
-                e.insert(wavelength);
-            }
+        if let Some(path) = h5::nexus_image_path(&files::nexus_path(ipts_path, run)) {
+            self.image_path_cache.insert(run, path);
         }
     }
 
-    /// A run's starting wavelength (Å), cached by [`Self::classify_run`]
-    /// once its NeXus could be read. `None` before that (or when the
-    /// NeXus has no such log).
+    /// A run's starting wavelength (Å), from its raw or corrected folder
+    /// name — the DAQ bakes it in as `..._<n>_<nnn>AngsMin`
+    /// ([`files::starting_wavelength_in_name`]), whichever folder is known
+    /// yet (raw usually lands first). `None` before either folder is
+    /// found, or when its name carries no such token.
     fn starting_wavelength(&self, run: u64) -> Option<f64> {
-        self.wavelength_cache.get(&run).copied()
+        let rf = self.run_files.iter().find(|rf| rf.run == run)?;
+        [&rf.raw, &rf.corrected].into_iter().find_map(|status| {
+            let path = match status {
+                files::FileStatus::Present(p) | files::FileStatus::Writing(p) => Some(p),
+                files::FileStatus::Missing(_) => None,
+            }?;
+            files::starting_wavelength_in_name(&path.file_name()?.to_string_lossy())
+        })
     }
 
     /// Did the user opt the rolling combine & compare windows into the

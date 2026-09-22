@@ -61,6 +61,32 @@ pub fn run_number_in_name(name: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// Extract the starting wavelength (Å) the DAQ bakes into a run's folder
+/// name, e.g. `..._2_900C_3_000AngsMin_...` → `3.000` (the `AngsMin`
+/// token; the underscore between its two digit groups stands for the
+/// decimal point — not to be confused with an unrelated digit group
+/// earlier in the name, like a temperature such as `2_900C` here).
+/// `None` when the name carries no such token.
+pub fn starting_wavelength_in_name(name: &str) -> Option<f64> {
+    let idx = name.find("AngsMin")?;
+    let prefix = &name[..idx];
+    let frac_start = prefix.rfind(|c: char| !c.is_ascii_digit())?;
+    if prefix.as_bytes()[frac_start] != b'_' {
+        return None;
+    }
+    let frac = &prefix[frac_start + 1..];
+    if frac.is_empty() {
+        return None;
+    }
+    let before = &prefix[..frac_start];
+    let int_start = before.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |i| i + 1);
+    let int_part = &before[int_start..];
+    if int_part.is_empty() {
+        return None;
+    }
+    format!("{int_part}.{frac}").parse().ok()
+}
+
 /// Walk `root` (depth-limited) and map each wanted run number to the first
 /// folder found whose name carries it. Matched folders are not descended
 /// into. A missing/unreadable root simply yields an empty map.
@@ -310,6 +336,32 @@ mod tests {
         assert_eq!(run_number_in_name("Run_7"), Some(7));
         assert_eq!(run_number_in_name("no_run_here"), None);
         assert_eq!(run_number_in_name("Run_"), None);
+    }
+
+    #[test]
+    fn extracts_starting_wavelength_from_folder_names() {
+        // Real IPTS-38902 names: an unrelated digit group (the "2_900C"
+        // temperature) sits right before the wavelength token and must
+        // not be picked up instead.
+        assert_eq!(
+            starting_wavelength_in_name("20260921_Run_30338_ob__2_900C_0_700AngsMin_ob_0"),
+            Some(0.7)
+        );
+        assert_eq!(
+            starting_wavelength_in_name("20260921_Run_30339_ob__2_900C_3_000AngsMin_ob_0"),
+            Some(3.0)
+        );
+        assert_eq!(
+            starting_wavelength_in_name(
+                "20260921_Run_30340_reptVertMx_PFV089_2_900C_3_000AngsMin_0"
+            ),
+            Some(3.0)
+        );
+        // Multi-digit integer part, no leading token.
+        assert_eq!(starting_wavelength_in_name("12_500AngsMin"), Some(12.5));
+        // No token at all.
+        assert_eq!(starting_wavelength_in_name("20260430_OB_RT_1_393C_no_token_here"), None);
+        assert_eq!(starting_wavelength_in_name("AngsMin"), None);
     }
 
     #[test]
