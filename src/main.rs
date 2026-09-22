@@ -36,6 +36,7 @@ mod theme;
 mod zoom;
 
 use eframe::egui;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -311,6 +312,12 @@ struct MonitorApp {
     /// input, never normalized. Such runs stay listed but are neither
     /// waited for nor put in the windows.
     image_path_cache: HashMap<u64, String>,
+    /// A run's starting wavelength (Å, its NeXus `BL10:Exp:Chop:
+    /// LambdaMinActual` log, read once alongside `image_path_cache`): the
+    /// live open-beams switch only adopts an open-beam run that shares it
+    /// with the newest one landed — an older one belongs to a previous,
+    /// now-stale chopper setting and is left out rather than mixed in.
+    wavelength_cache: HashMap<u64, f64>,
     /// The open-beam folders of the selected configuration file (read
     /// when the selection changes): what every upcoming normalization
     /// divides by, shown in the "Open beam" column of the table.
@@ -436,6 +443,7 @@ impl MonitorApp {
                 .collect(),
             time_cache: HashMap::new(),
             image_path_cache: HashMap::new(),
+            wavelength_cache: HashMap::new(),
             config_obs: Vec::new(),
             run_meta: HashMap::new(),
             run_overrides: HashMap::new(),
@@ -502,6 +510,7 @@ impl MonitorApp {
         self.selected_config = None;
         self.time_cache.clear();
         self.image_path_cache.clear();
+        self.wavelength_cache.clear();
         self.pv_cache.clear();
         self.rejected.clear();
         self.last_live_anchor = None;
@@ -1938,17 +1947,44 @@ impl MonitorApp {
             .collect()
     }
 
-    /// The folders of `candidates` (from [`Self::new_open_beams`]), ready
-    /// to become the configuration's open beams — only once EVERY one of
-    /// them has landed (`Present`): waiting on any keeps the configuration
-    /// on the previous open beams rather than switching to a partial,
-    /// still-acquiring set. `None` when there is nothing to switch to yet.
-    fn ready_new_open_beams(candidates: &[(u64, files::FileStatus)]) -> Option<Vec<PathBuf>> {
-        if candidates.is_empty() {
+    /// Same chopper wavelength setting, allowing for floating-point noise
+    /// in the PV readback (set points are round numbers, e.g. 0.7, 3.0 Å).
+    fn wavelengths_match(a: f64, b: f64) -> bool {
+        (a - b).abs() < 0.01
+    }
+
+    /// The folders of `candidates` (from [`Self::new_open_beams`]) ready to
+    /// become the configuration's open beams: only those that share their
+    /// starting wavelength with the NEWEST candidate (the chopper's
+    /// current setting — an open beam must match the sample it divides, or
+    /// the normalization mixes incompatible TOF binnings); an older
+    /// candidate with a different wavelength belongs to a previous,
+    /// already-superseded scan step and is left out rather than mixed in
+    /// (it never resurfaces: once its newer, matching sibling is in use,
+    /// [`Self::new_open_beams`] no longer lists it). Among the matching
+    /// ones, `Some(folders)` only once EVERY one has landed (`Present`):
+    /// waiting on any of them keeps the configuration on the previous open
+    /// beams rather than switching to a partial, still-acquiring set.
+    /// `wavelength` looks up a run's starting wavelength (`None` when not
+    /// read yet, which also holds off the switch). `None` when there is
+    /// nothing to switch to yet.
+    fn ready_new_open_beams(
+        candidates: &[(u64, files::FileStatus)],
+        wavelength: impl Fn(u64) -> Option<f64>,
+    ) -> Option<Vec<PathBuf>> {
+        let newest_run = candidates.iter().map(|(run, _)| *run).max()?;
+        let reference = wavelength(newest_run)?;
+        let matching: Vec<&(u64, files::FileStatus)> = candidates
+            .iter()
+            .filter(|(run, _)| {
+                wavelength(*run).is_some_and(|w| Self::wavelengths_match(w, reference))
+            })
+            .collect();
+        if matching.is_empty() {
             return None;
         }
-        candidates
-            .iter()
+        matching
+            .into_iter()
             .map(|(_, status)| match status {
                 files::FileStatus::Present(path) => Some(path.clone()),
                 _ => None,
@@ -1958,15 +1994,19 @@ impl MonitorApp {
 
     /// Live open beams (opt-in `live_open_beams` flag): the configuration's
     /// open beams follow the acquisition on their own — as soon as a new,
-    /// complete, consecutive run of open-beam runs lands after the
-    /// configuration's current ones, it replaces them, and every sample run
-    /// from then on divides by it, until the next such run lands. Manual
-    /// "⇄ replace by…" still works, opted in or not.
+    /// complete, consecutive run of open-beam runs at the current chopper
+    /// wavelength setting lands after the configuration's current ones
+    /// ([`Self::ready_new_open_beams`]), it replaces them, and every sample
+    /// run from then on divides by it, until the next such run lands.
+    /// Manual "⇄ replace by…" still works, opted in or not.
     fn maybe_auto_switch_open_beams(&mut self) {
         if !self.live_open_beams_enabled() || self.selected_config.is_none() {
             return;
         }
-        if let Some(folders) = Self::ready_new_open_beams(&self.new_open_beams()) {
+        let candidates = self.new_open_beams();
+        if let Some(folders) =
+            Self::ready_new_open_beams(&candidates, |run| self.starting_wavelength(run))
+        {
             self.use_as_open_beams(folders);
         }
     }
@@ -2044,16 +2084,29 @@ impl MonitorApp {
         stem.to_owned()
     }
 
-    /// Read (once) where the DAQ filed a run's images, from its NeXus —
-    /// nothing is stored when the file is missing or still being written,
-    /// so the next refresh retries.
+    /// Read (once each) where the DAQ filed a run's images and its
+    /// starting wavelength, from its NeXus — nothing is stored for either
+    /// when the file is missing or still being written, so the next
+    /// refresh retries.
     fn classify_run(&mut self, ipts_path: &Path, run: u64) {
-        if self.image_path_cache.contains_key(&run) {
-            return;
+        let nexus_path = files::nexus_path(ipts_path, run);
+        if let Entry::Vacant(e) = self.image_path_cache.entry(run) {
+            if let Some(path) = h5::nexus_image_path(&nexus_path) {
+                e.insert(path);
+            }
         }
-        if let Some(path) = h5::nexus_image_path(&files::nexus_path(ipts_path, run)) {
-            self.image_path_cache.insert(run, path);
+        if let Entry::Vacant(e) = self.wavelength_cache.entry(run) {
+            if let Some(wavelength) = h5::nexus_starting_wavelength(&nexus_path) {
+                e.insert(wavelength);
+            }
         }
+    }
+
+    /// A run's starting wavelength (Å), cached by [`Self::classify_run`]
+    /// once its NeXus could be read. `None` before that (or when the
+    /// NeXus has no such log).
+    fn starting_wavelength(&self, run: u64) -> Option<f64> {
+        self.wavelength_cache.get(&run).copied()
     }
 
     /// Did the user opt the rolling combine & compare windows into the
@@ -3365,12 +3418,15 @@ impl MonitorApp {
                 .on_hover_text(
                     "Opt-in, saved in the shared configuration, independent of the \
                      flag above: when checked, the configuration's open beams are \
-                     replaced on their own by the newest complete, consecutive \
-                     open-beam run(s) as soon as they land, no \"⇄ replace by…\" \
-                     needed — e.g. runs 30338+30339 (open beam), then 30340+ \
-                     (sample) divide by them, until the next open-beam run(s) \
-                     land and replace them in turn. Unchecked (the default), \
-                     only \"⇄ replace by…\" on a row switches them.",
+                     replaced on their own by the newest complete open-beam run(s) \
+                     as soon as they land, no \"⇄ replace by…\" needed — e.g. runs \
+                     30338+30339 (open beam), then 30340+ (sample) divide by them, \
+                     until the next open-beam run(s) land and replace them in turn. \
+                     Only open-beam runs at the SAME starting wavelength as the \
+                     newest one are used — an older one at a different setting \
+                     (a previous scan step) is left out rather than mixed in. \
+                     Unchecked (the default), only \"⇄ replace by…\" on a row \
+                     switches them.",
                 );
             if ob_response.changed() {
                 self.set_live_open_beams_enabled(live_ob);
@@ -4768,24 +4824,41 @@ mod tests {
     }
 
     #[test]
-    fn ready_new_open_beams_waits_for_every_candidate() {
-        let ready = MonitorApp::ready_new_open_beams;
+    fn ready_new_open_beams_waits_for_every_matching_candidate() {
+        let ready = |candidates: &[(u64, files::FileStatus)], wavelengths: &[(u64, f64)]| {
+            MonitorApp::ready_new_open_beams(candidates, |run| {
+                wavelengths.iter().find(|(r, _)| *r == run).map(|(_, w)| *w)
+            })
+        };
         // Nothing landed: nothing to switch to.
-        assert_eq!(ready(&[]), None);
-        // Two consecutive open beams, both corrected: ready to swap in, as
-        // one group (this is what makes 30338+30339 replace an older pair
-        // once 30340, a sample run, needs them).
+        assert_eq!(ready(&[], &[]), None);
         let a = files::FileStatus::Present(PathBuf::from("/x/ob/Run_30338"));
         let b = files::FileStatus::Present(PathBuf::from("/x/ob/Run_30339"));
+        // 30338 (0.7 A) and 30339 (3.0 A) landed, both corrected, but at
+        // different chopper wavelength settings — the real scenario of
+        // IPTS-38902: 30340, the sample after them, needs 3.0 A. Only
+        // 30339 (matching the newest, 30339 itself) is adopted; 30338 is
+        // left out rather than mixed in.
         assert_eq!(
-            ready(&[(30338, a.clone()), (30339, b.clone())]),
+            ready(&[(30338, a.clone()), (30339, b.clone())], &[(30338, 0.7), (30339, 3.0)]),
+            Some(vec![PathBuf::from("/x/ob/Run_30339")])
+        );
+        // Same wavelength: both adopted, as one group.
+        assert_eq!(
+            ready(&[(30338, a.clone()), (30339, b.clone())], &[(30338, 3.0), (30339, 3.0)]),
             Some(vec![PathBuf::from("/x/ob/Run_30338"), PathBuf::from("/x/ob/Run_30339")])
         );
-        // One of them still being written: the pair is not ready yet — the
-        // previous open beams stay in use rather than switching to a half
-        // landed set.
+        // The matching one (30339) still being written: not ready yet —
+        // the previous open beams stay in use rather than switching to a
+        // half landed set.
         let writing = files::FileStatus::Writing(PathBuf::from("/x/ob/Run_30339"));
-        assert_eq!(ready(&[(30338, a), (30339, writing)]), None);
+        assert_eq!(
+            ready(&[(30338, a.clone()), (30339, writing)], &[(30338, 0.7), (30339, 3.0)]),
+            None
+        );
+        // The newest candidate's wavelength is not known yet (its NeXus
+        // not read): wait rather than guess.
+        assert_eq!(ready(&[(30338, a), (30339, b)], &[(30338, 0.7)]), None);
     }
 
     #[test]

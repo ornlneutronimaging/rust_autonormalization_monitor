@@ -160,6 +160,21 @@ pub fn daslog(path: &Path, name: &str) -> Option<Vec<(DateTime<FixedOffset>, f64
     )
 }
 
+/// DASlogs PV recording a run's starting wavelength (Å): the detector
+/// window's minimum, set by the chopper timing for that run — two runs
+/// acquired under a different setting (a different scan step, e.g. a new
+/// temperature) do not share a common TOF binning, so an open beam must
+/// match the sample it divides on this value.
+const STARTING_WAVELENGTH_LOG: &str = "BL10:Exp:Chop:LambdaMinActual";
+
+/// A run's starting wavelength (Å), from its `BL10:Exp:Chop:LambdaMinActual`
+/// DASlogs entry — the last recorded value (a log can carry the previous
+/// run's value at its very start, as [`nexus_image_path`] does). `None`
+/// when the file or the log is missing/unreadable.
+pub fn nexus_starting_wavelength(path: &Path) -> Option<f64> {
+    daslog(path, STARTING_WAVELENGTH_LOG)?.into_iter().next_back().map(|(_, v)| v)
+}
+
 /// What the auto-normalization launcher needs out of a normalization
 /// session configuration file (schema of the marimo notebook, version 1).
 #[derive(Clone, Debug)]
@@ -421,6 +436,24 @@ mod tests {
         assert!(v.is_finite());
         // Missing log → None, no panic.
         assert!(daslog(path, "BL10:SE:ND2:NoSuchLog").is_none());
+    }
+
+    #[test]
+    fn reads_the_starting_wavelength_of_real_runs() {
+        // Two open-beam runs acquired back to back under different
+        // chopper settings (0.700 and 3.000 AngsMin, per their own
+        // folder names), immediately followed by a sample run at the
+        // latter: exactly the mismatch the live open-beams switch must
+        // catch.
+        let ob_a = Path::new("/SNS/VENUS/IPTS-38902/nexus/VENUS_30338.nxs.h5");
+        let ob_b = Path::new("/SNS/VENUS/IPTS-38902/nexus/VENUS_30339.nxs.h5");
+        let sample = Path::new("/SNS/VENUS/IPTS-38902/nexus/VENUS_30340.nxs.h5");
+        if !ob_a.is_file() || !ob_b.is_file() || !sample.is_file() {
+            return;
+        }
+        assert_eq!(nexus_starting_wavelength(ob_a), Some(0.7));
+        assert_eq!(nexus_starting_wavelength(ob_b), Some(3.0));
+        assert_eq!(nexus_starting_wavelength(sample), Some(3.0));
     }
 
     #[test]
