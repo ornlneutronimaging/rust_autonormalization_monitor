@@ -287,9 +287,166 @@ pub fn write_config_with_obs(
     result
 }
 
+/// The notebook's default parameters, as a configuration file.
+///
+/// Write at `dst` a normalization configuration (the notebook's schema,
+/// version 1) holding every default of the "Normalization TOF at VENUS"
+/// notebook — what a user gets by opening it and saving without touching
+/// a setting: Bragg mode, proton-charge normalization, no background
+/// matching, no inpainting, no manual TOF binning (no TOF range), 25 m
+/// source-detector distance, 700 ns spectra bins, no crop, no mask, the
+/// TIFF stack + integrated TIFF + `x_axis.txt` exports — with no sample
+/// (each run's own corrected folder is the sample) and no open beam (the
+/// table's "⇄ replace by…" names them). `ipts` (e.g. `IPTS-36967`),
+/// `detector` (e.g. `tpx1`) and `output_folder` are the root attributes
+/// the notebook, the workflow runner and this app read. The file is
+/// written to a temporary sibling and renamed into place, so a reader
+/// never sees a half-written file; `dst` is overwritten if it exists.
+pub fn write_default_config(
+    dst: &Path,
+    ipts: &str,
+    detector: &str,
+    output_folder: &Path,
+) -> Result<(), String> {
+    use hdf5_metno::types::VarLenUnicode;
+    let parent = dst
+        .parent()
+        .ok_or_else(|| format!("{} has no parent folder", dst.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let tmp = dst.with_extension("h5.tmp");
+    let unicode = |name: &str, value: &str| {
+        value
+            .parse::<VarLenUnicode>()
+            .map_err(|e| format!("{name} is not valid UTF-8: {e}"))
+    };
+    let string_attr = |loc: &h5::Location, name: &str, value: &str| -> Result<(), String> {
+        let value = unicode(name, value)?;
+        loc.new_attr::<VarLenUnicode>()
+            .create(name)
+            .and_then(|a| a.write_scalar(&value))
+            .map_err(|e| format!("cannot write attribute {name}: {e}"))
+    };
+    let bool_attr = |loc: &h5::Location, name: &str, value: bool| -> Result<(), String> {
+        loc.new_attr::<bool>()
+            .create(name)
+            .and_then(|a| a.write_scalar(&value))
+            .map_err(|e| format!("cannot write attribute {name}: {e}"))
+    };
+    let f64_attr = |loc: &h5::Location, name: &str, value: f64| -> Result<(), String> {
+        loc.new_attr::<f64>()
+            .create(name)
+            .and_then(|a| a.write_scalar(&value))
+            .map_err(|e| format!("cannot write attribute {name}: {e}"))
+    };
+    let result = (|| -> Result<(), String> {
+        let file = h5::File::create(&tmp)
+            .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        let group = |name: &str| {
+            file.create_group(name)
+                .map_err(|e| format!("cannot create the {name} group: {e}"))
+        };
+        // Root: what the notebook writes, plus where this file comes from.
+        file.new_attr::<i64>()
+            .create("schema_version")
+            .and_then(|a| a.write_scalar(&1))
+            .map_err(|e| format!("cannot write attribute schema_version: {e}"))?;
+        string_attr(
+            &file,
+            "created",
+            &chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        )?;
+        string_attr(&file, "notebook", "normalization_tof_at_venus_marimo")?;
+        string_attr(
+            &file,
+            "generated_by",
+            "autonormalization_monitor — the notebook's default parameters",
+        )?;
+        string_attr(&file, "ipts", ipts)?;
+        string_attr(&file, "detector", detector)?;
+        string_attr(&file, "output_folder", &output_folder.display().to_string())?;
+
+        // Sample: none — each run's corrected folder is the sample.
+        let sample = group("sample")?;
+        string_attr(&sample, "run_spec", "")?;
+        bool_attr(&sample, "combine_runs", false)?;
+        sample
+            .new_dataset::<VarLenUnicode>()
+            .shape(0)
+            .create("folders")
+            .map_err(|e| format!("cannot write sample/folders: {e}"))?;
+
+        // Open beams: none — named per run in the table.
+        let ob = group("ob")?;
+        string_attr(&ob, "run_spec", "")?;
+        ob.new_dataset::<VarLenUnicode>()
+            .shape(0)
+            .create("folders")
+            .map_err(|e| format!("cannot write ob/folders: {e}"))?;
+
+        let spectra = group("spectra")?;
+        f64_attr(&spectra, "tof_bin_size_ns", 700.0)?;
+
+        let norm = group("normalization")?;
+        string_attr(&norm, "mode", "Bragg mode")?;
+        bool_attr(&norm, "proton_charge", true)?;
+        bool_attr(&norm, "match_background", false)?;
+        bool_attr(&norm, "inpaint", false)?;
+        string_attr(&norm, "tof_binning_mode", "None")?;
+        f64_attr(&norm, "distance_source_detector_m", 25.0)?;
+        norm.new_dataset::<f64>()
+            .shape((0, 2))
+            .create("tof_ranges_us")
+            .map_err(|e| format!("cannot write normalization/tof_ranges_us: {e}"))?;
+        norm.new_dataset::<i64>()
+            .shape(0)
+            .create("tof_ranges_enabled")
+            .map_err(|e| format!("cannot write normalization/tof_ranges_enabled: {e}"))?;
+        // No crop_region, no roi_mask, no background_mask: the notebook
+        // writes them only when selected.
+
+        let export = group("export")?;
+        bool_attr(&export, "scitiff", false)?;
+        bool_attr(&export, "stack", true)?;
+        bool_attr(&export, "integrated", true)?;
+        bool_attr(&export, "integrated_tiff", true)?;
+        bool_attr(&export, "integrated_scitiff", false)?;
+        bool_attr(&export, "ascii", true)?;
+        drop(file);
+        std::fs::rename(&tmp, dst)
+            .map_err(|e| format!("cannot move {} to {}: {e}", tmp.display(), dst.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_a_default_config_this_app_reads_back() {
+        // Under $ANM_TEST_OUTPUT when set (the file is kept there for the
+        // python-side checks), else the temp dir.
+        let dir = std::env::var("ANM_TEST_OUTPUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("anm_default_config_test");
+        let output = dir.join("processed_data/autoreduction");
+        let path = output.join("default_normalization_config.h5");
+        write_default_config(&path, "IPTS-36967", "tpx1", &output).expect("written");
+        let info = read_config_info(&path).expect("readable");
+        assert!(info.ob_folders.is_empty());
+        assert_eq!(info.crop_region, None);
+        assert_eq!(info.output_folder.as_deref(), Some(output.as_path()));
+        assert_eq!(info.detector.as_deref(), Some("tpx1"));
+        assert!(!path.with_extension("h5.tmp").exists());
+        // Overwriting an existing file works too (a fresh copy per IPTS).
+        write_default_config(&path, "IPTS-36967", "tpx3", &output).expect("rewritten");
+        assert_eq!(read_config_info(&path).unwrap().detector.as_deref(), Some("tpx3"));
+    }
 
     // These read real shared files; they pass trivially where the VENUS
     // filesystem is not mounted.

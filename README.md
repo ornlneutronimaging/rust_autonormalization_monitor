@@ -4,7 +4,12 @@ Desktop GUI (Rust / egui) to drive the VENUS auto normalization: pick an
 experiment and a normalization configuration, then either normalize every
 upcoming run automatically or check a specific list of runs.
 
-Single view, top to bottom:
+Single view, top to bottom. Right under the title, a status strip holds
+the **Auto normalization ON/OFF** button (with the shared
+`autoreduction.cfg` it lives in and, while ON, what is registered):
+turning it ON registers the selected IPTS + configuration file in that
+file and sets its `activate` flag, so every upcoming run gets normalized;
+turning it OFF only clears the flag. It needs sections 1 and 2 filled.
 
 1. **Experiment (IPTS)** — dropdown of the accessible `/SNS/VENUS/IPTS-*`
    folders (with a type-to-filter box) plus a manual entry field. Everything
@@ -18,15 +23,30 @@ Single view, top to bottom:
    from anywhere (the native file dialog opens in `<IPTS>/shared`), and a
    **👁 Preview** button that opens the selected file in the
    rust_nexus_viewer. A button launches the marimo
-   **Normalization TOF at VENUS** notebook to create/edit a configuration: the notebook is
+   **Normalization TOF at VENUS** notebook: **🚀 Create new configuration**
+   while no file is selected (the notebook opens blank), **✏ Edit and/or
+   replace current configuration** otherwise (the notebook opens with the
+   selected file already loaded — its "Load a Session Configuration" step
+   done, through `$NORMALIZATION_TOF_CONFIG` — to change a setting and
+   save it again without normalizing anything here). The notebook is
    provisioned into `<IPTS>/shared/notebooks/imaging_marimo_<user>/` and
-   started from there, so it opens directly on the selected IPTS.
-3. **What to normalize** —
-   - the **Auto normalization ON/OFF** button: turning it ON registers the
-     selected IPTS + configuration file in the shared `autoreduction.cfg`
-     and sets its `activate` flag, so every upcoming run gets normalized;
-     turning it OFF only clears the flag;
-   - or a **list of runs** (e.g. `23615-23620, 23642`).
+   started from there, so it opens directly on the selected IPTS. Next to
+   it, the **Use default configuration** box skips the file altogether:
+   the normalization runs with the notebook's default parameters (Bragg
+   mode, proton-charge normalization, no background matching, no
+   inpainting, no manual TOF binning, 25 m flight path, 700 ns bins, no
+   crop, no mask; TIFF stack + integrated TIFF + `x_axis.txt`) and its
+   results go to `<IPTS>/shared/processed_data/autoreduction/`. A
+   configuration file holding those defaults
+   (`default_normalization_config.h5`) is written there — a fresh copy
+   whenever the box is checked or the IPTS changes, with the IPTS'
+   detector — and selected, so auto normalization registers a real file;
+   the drop-down and Browse… are disabled meanwhile. The file names no
+   open beam: pick them in the table (⇄ replace by…), which writes the
+   `_ob_<run>` copy next to it as usual. Unchecking goes back to the
+   newest file of the IPTS.
+3. **Normalize a list of runs** — a **list of runs** (e.g.
+   `23615-23620, 23642`) to check and normalize by hand.
 4. **Rolling combine & compare (NeuNorm)** — **opt-in**: the section
      heading is a checkbox (saved as the `rolling_combine` flag of the
      shared `autoreduction.cfg`) that makes the windows part of the auto
@@ -172,12 +192,12 @@ Single view, top to bottom:
    (`<base>/Run_<run>/normalization`; hover for the full path) — from
    the job log for a result found on disk, the configuration's output
    folder, dimmed, for a run still to come.
-   **✎ next to the Output cell** opens a window to type or browse another
+   **✏ next to the Output cell** opens a window to type or browse another
    output folder for that run only: **Apply** keeps it (the automatic
    normalization and the ▶ normalize button use it; a result already
    there is looked up in the new folder), **Apply & normalize now / re-run
    now** runs it at once. The Open beam / Output cells of a run with its
-   own open beams / output folder read in blue and the ⇄ / ✎ buttons are
+   own open beams / output folder read in blue and the ⇄ / ✏ buttons are
    highlighted; these per-run choices are kept for the session.
    **↻ re-run** on every normalized row runs the normalization again with
    the row's current settings (in case a setting, an open beam or the
