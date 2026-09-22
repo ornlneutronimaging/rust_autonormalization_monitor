@@ -1080,6 +1080,16 @@ impl MonitorApp {
         // The row's own settings (✏) replace the configuration's open
         // beams / output folder for this run.
         let info = self.effective_info(run, info);
+        // Live open beams: an open beam from another chopper wavelength
+        // setting would divide with the wrong TOF binning — the run is
+        // rejected outright (crossed out, like a manual ✖; ↩ restores it,
+        // and it is checked again at the next start) rather than
+        // normalized wrong. Every start goes through here: the automatic
+        // pass, ▶ normalize, ↻ re-run and the queue alike.
+        if self.wavelength_mismatch(run, &info.ob_folders).is_some() {
+            self.rejected.insert(run);
+            return;
+        }
         let state = match norm::prepare_run_job(run, &corrected, ipts_path, config, &info) {
             Ok(spec) => {
                 self.job_output.remove(&spec.target);
@@ -2101,6 +2111,36 @@ impl MonitorApp {
             }?;
             files::starting_wavelength_in_name(&path.file_name()?.to_string_lossy())
         })
+    }
+
+    /// Among `obs` (the open-beam folders a run is about to divide by),
+    /// the first one acquired at a starting wavelength other than
+    /// `sample`'s (the run's own): its folder, for the message/hover.
+    /// `None` when every open beam matches — or when a wavelength is not
+    /// known (the run's, or an open beam whose folder name carries no
+    /// `AngsMin` token): missing information is not a mismatch, the run
+    /// is normalized as before.
+    fn mismatched_open_beam(sample: Option<f64>, obs: &[PathBuf]) -> Option<PathBuf> {
+        let sample = sample?;
+        obs.iter()
+            .find(|folder| {
+                folder
+                    .file_name()
+                    .and_then(|n| files::starting_wavelength_in_name(&n.to_string_lossy()))
+                    .is_some_and(|w| !Self::wavelengths_match(w, sample))
+            })
+            .cloned()
+    }
+
+    /// Live open beams (opt-in): would normalizing `run` divide it by an
+    /// open beam from another chopper wavelength setting? The folder of
+    /// the offending open beam when so; `None` otherwise, and always when
+    /// the opt-in is off.
+    fn wavelength_mismatch(&self, run: u64, obs: &[PathBuf]) -> Option<PathBuf> {
+        if !self.live_open_beams_enabled() {
+            return None;
+        }
+        Self::mismatched_open_beam(self.starting_wavelength(run), obs)
     }
 
     /// Did the user opt the rolling combine & compare windows into the
@@ -3624,9 +3664,26 @@ impl MonitorApp {
                                 }
                                 let label = ui.label(run_text);
                                 if rejected {
-                                    label.on_hover_text(
-                                        "Rejected — excluded from the windows",
-                                    );
+                                    // The same open beams the start checked
+                                    // (the row's ✏ ones, else its configuration's).
+                                    let obs = self
+                                        .run_overrides
+                                        .get(&run.run)
+                                        .and_then(|o| o.obs.clone())
+                                        .unwrap_or_else(|| self.config_obs_for_run(run.run));
+                                    match self.wavelength_mismatch(run.run, &obs) {
+                                        Some(ob) => label.on_hover_text(format!(
+                                            "Rejected automatically (live open beams): its \
+                                             open beam {} was acquired at another starting \
+                                             wavelength than this run — ↩ restores it once the \
+                                             right open beam is in use\n{}",
+                                            Self::ob_runs_text(std::slice::from_ref(&ob)),
+                                            ob.display()
+                                        )),
+                                        None => label.on_hover_text(
+                                            "Rejected — excluded from the windows",
+                                        ),
+                                    };
                                 } else if alignment {
                                     label.on_hover_text(
                                         "Alignment run — no normalization needed",
@@ -4853,6 +4910,25 @@ mod tests {
         // The newest candidate's wavelength is not known yet (its NeXus
         // not read): wait rather than guess.
         assert_eq!(ready(&[(30338, a), (30339, b)], &[(30338, 0.7)]), None);
+    }
+
+    #[test]
+    fn mismatched_open_beam_is_the_one_at_another_wavelength() {
+        let mismatched = MonitorApp::mismatched_open_beam;
+        let ob_07 = PathBuf::from("/x/ob/20260921_Run_30338_ob__2_900C_0_700AngsMin_ob_0");
+        let ob_30 = PathBuf::from("/x/ob/20260921_Run_30339_ob__2_900C_3_000AngsMin_ob_0");
+        // Sample 30340 at 3.0 A: 30339 matches, 30338 does not — the run
+        // is rejected rather than divided by it.
+        assert_eq!(mismatched(Some(3.0), &[ob_30.clone()]), None);
+        assert_eq!(mismatched(Some(3.0), &[ob_30.clone(), ob_07.clone()]), Some(ob_07.clone()));
+        // The sample's wavelength is not known (no AngsMin token in its
+        // folder name, or no folder yet): not a mismatch.
+        assert_eq!(mismatched(None, &[ob_07.clone()]), None);
+        // An open beam whose folder name carries no token is not a
+        // mismatch either.
+        let unnamed = PathBuf::from("/x/ob/20260430_OB_RT_1_393C");
+        assert_eq!(mismatched(Some(3.0), &[unnamed]), None);
+        assert_eq!(mismatched(Some(3.0), &[]), None);
     }
 
     #[test]
