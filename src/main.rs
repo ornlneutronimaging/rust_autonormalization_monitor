@@ -27,7 +27,9 @@
 //!    normalized; once its corrected data is there, a banner offers to
 //!    make it (them, when several landed) the open beam(s) of the runs to
 //!    come — a copy of the configuration with the new open beams is
-//!    written next to it and selected.
+//!    written next to it and selected. A rejected open-beam run (✖) is
+//!    never offered; with live open beams on, rejecting one in use drops
+//!    it from the configuration's open beams at once.
 
 mod config;
 mod files;
@@ -2092,6 +2094,38 @@ impl MonitorApp {
         }
     }
 
+    /// Live open beams (opt-in): a rejected open-beam run is not an open
+    /// beam any more — when `run` is one the configuration currently
+    /// divides by, the configuration switches at once to the others it
+    /// names (through [`Self::use_as_open_beams`], so the next sample runs
+    /// no longer divide by it; results already there are never redone).
+    /// Rejected before it was picked up, a run simply never becomes a
+    /// candidate ([`Self::new_open_beams`]). True when the switch was
+    /// made (or attempted — the error, if any, shows in the banner);
+    /// false when there was nothing to switch (opt-in off, run not in
+    /// use, or the only open beam in use: it stays, with a note, until
+    /// another one lands or the user replaces it).
+    fn drop_rejected_open_beam(&mut self, run: u64) -> bool {
+        if !self.live_open_beams_enabled() || !self.ob_in_use(run) {
+            return false;
+        }
+        let remaining: Vec<PathBuf> = self
+            .config_obs
+            .iter()
+            .filter(|folder| Self::ob_run_numbers(std::slice::from_ref(folder)) != [run])
+            .cloned()
+            .collect();
+        if remaining.is_empty() {
+            self.ob_error = Some(format!(
+                "rejected open beam {run} is the only one the configuration divides by — \
+                 it stays until another open-beam run lands, or ⇄ replace by… another"
+            ));
+            return false;
+        }
+        self.use_as_open_beams(remaining);
+        true
+    }
+
     /// Make `folders` (complete corrected open-beam folders) the open
     /// beams of every normalization to come: a copy of the selected
     /// configuration with those folders as its open beams is written next
@@ -3963,7 +3997,9 @@ impl MonitorApp {
                                 // alignment run, never in the windows. An
                                 // open-beam run is never in the windows
                                 // either, but rejecting it keeps it out
-                                // of the "new open beams" banner.
+                                // of the "new open beams" banner (and,
+                                // live open beams, out of the
+                                // configuration when in use).
                                 if alignment {
                                     ui.label(egui::RichText::new("—").color(dim)).on_hover_text(
                                         "Alignment run — never part of the windows",
@@ -3978,7 +4014,9 @@ impl MonitorApp {
                                         (
                                             "✖ reject",
                                             "Never offer this open-beam run as a \
-                                             replacement open beam",
+                                             replacement open beam — live open beams: \
+                                             when the configuration divides by it, it \
+                                             is dropped from the open beams at once",
                                         )
                                     };
                                     if ui.button(text).on_hover_text(hover).clicked() {
@@ -4005,11 +4043,17 @@ impl MonitorApp {
                 });
         });
         if let Some(run) = toggle_run {
-            if !self.rejected.remove(&run) {
+            let now_rejected = !self.rejected.remove(&run);
+            if now_rejected {
                 self.rejected.insert(run);
             }
-            // Windows (and the table span) follow the new selection.
-            self.check_runs();
+            // A rejected open beam the live configuration divides by
+            // leaves it now (that switch refreshes the table itself);
+            // otherwise the windows (and the table span) follow the new
+            // selection.
+            if !(now_rejected && self.drop_rejected_open_beam(run)) {
+                self.check_runs();
+            }
         }
         if let Some(folder) = preview_folder {
             self.viewer_error = None;
