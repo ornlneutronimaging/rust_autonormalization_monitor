@@ -225,6 +225,26 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    just its number. A result already there — from a previous session, or
    in the legacy `Run_<run>/normalization` layout of the workflow runner
    and of this app before 2026-09-24 — is shown as done and never redone.
+   **⧉ Combine consecutive runs** (a third opt-in box in the heading,
+   shared `combine_consecutive` flag, off by default): every new sample
+   run is normalized **together** with the consecutive runs before it
+   acquired with the same settings — run 1234 on its own, then 1234+1235
+   when 1235 lands, then 1234+1235+1236, … until a run with other
+   settings starts a new series. Same settings means the same acquisition
+   name (title, sample-environment setpoint and chopper setting, as the
+   DAQ bakes them into the folder name: `reptRib_PFV468_2_900C_3_000AngsMin`),
+   the same starting wavelength, and the same acquisition time **or** the
+   same proton charge (2 % tolerance — a run is acquired for a set time or
+   a set charge, and the other one follows the beam). Open-beam, alignment
+   and rejected runs in between neither join nor break a series; a run
+   whose NeXus or folder is not readable yet breaks it. The combined
+   result gets its own folder, the first run's folder name with
+   `Run_<first>_to_<last>` (`20260921_Run_30340_to_30342_reptRib_…_0/
+   normalization`), shown on the row of the last run as **✔ N runs
+   combined** (hover: the runs); every earlier result — the single runs,
+   the shorter series — is kept. NeuNorm holds every stack of the series
+   in memory: long series need the memory of as many single runs. Toggling
+   the box looks the results up again under the naming it implies.
    **`autoreduction.log`**, at the top of the output folder, summarizes
    every normalization as it happens (one file for all runs, appended
    live; the rolling windows keep theirs in

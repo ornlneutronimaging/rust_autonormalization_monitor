@@ -330,6 +330,10 @@ struct MonitorApp {
     /// input, never normalized. Such runs stay listed but are neither
     /// waited for nor put in the windows.
     image_path_cache: HashMap<u64, String>,
+    /// NeXus `(duration s, proton charge pC)` of each run already read
+    /// (they never change once written): what decides, with the folder
+    /// name, whether consecutive runs were acquired with the same settings.
+    acq_cache: HashMap<u64, (f64, f64)>,
     /// The open-beam folders of the selected configuration file (read
     /// when the selection changes): what every upcoming normalization
     /// divides by, shown in the "Open beam" column of the table.
@@ -458,6 +462,7 @@ impl MonitorApp {
                 .collect(),
             time_cache: HashMap::new(),
             image_path_cache: HashMap::new(),
+            acq_cache: HashMap::new(),
             config_obs: Vec::new(),
             run_meta: HashMap::new(),
             run_overrides: HashMap::new(),
@@ -524,6 +529,7 @@ impl MonitorApp {
         self.selected_config = None;
         self.time_cache.clear();
         self.image_path_cache.clear();
+        self.acq_cache.clear();
         self.pv_cache.clear();
         self.rejected.clear();
         self.last_live_anchor = None;
@@ -943,16 +949,13 @@ impl MonitorApp {
             {
                 let registered = cfg.get("user_autoreduction_config_file").map(Path::new);
                 if cfg.activate && registered != Some(selected.as_path()) {
-                    let (rolling, live, live_ob) =
-                        (cfg.rolling_combine, cfg.live_reduction, cfg.live_open_beams);
+                    let opt_ins = Self::opt_ins_of(cfg);
                     match config::write_full(
                         &self.cfg_path,
                         &ipts,
                         &selected.display().to_string(),
                         true,
-                        rolling,
-                        live,
-                        live_ob,
+                        opt_ins,
                     ) {
                         Ok(()) => {
                             self.write_error = None;
@@ -1036,14 +1039,10 @@ impl MonitorApp {
                 self.config_infos.insert(config.clone(), info.clone());
             }
             // The row's own settings (✏) decide where its result lives;
-            // the row folder is named after the run's corrected folder.
-            let corrected = self.corrected_folder(run);
-            let output = norm::run_output_dir(
-                &ipts_path,
-                run,
-                corrected.as_deref(),
-                &self.effective_info(run, &info),
-            );
+            // the row folder is named after the run's corrected folder
+            // (or after its series, combined series on).
+            let (group, output) =
+                self.group_output_for(&ipts_path, run, &self.effective_info(run, &info));
             if norm::output_is_done(&output) {
                 let finished = std::fs::metadata(&output)
                     .and_then(|m| m.modified())
@@ -1069,7 +1068,7 @@ impl MonitorApp {
                     norm::JobState::Done {
                         output,
                         finished,
-                        runs: vec![run],
+                        runs: group,
                     },
                 );
                 continue;
@@ -1142,8 +1141,34 @@ impl MonitorApp {
             },
             None => Err(format!("run {run} is not listed in the table")),
         };
-        let corrected = match corrected {
-            Ok(folder) => folder,
+        // Combined series: the run is normalized together with the
+        // consecutive runs before it acquired with the same settings —
+        // every one of them needs its corrected data too.
+        let members = corrected.and_then(|folder| {
+            let group = self.combine_group(run);
+            group
+                .iter()
+                .map(|&member| {
+                    if member == run {
+                        return Ok((member, folder.clone()));
+                    }
+                    match self.corrected_folder(member).filter(|_| {
+                        self.run_files.iter().any(|rf| {
+                            rf.run == member && matches!(rf.corrected, files::FileStatus::Present(_))
+                        })
+                    }) {
+                        Some(f) => Ok((member, f)),
+                        None => Err(format!(
+                            "run {member} (to be combined with run {run}: same settings) has \
+                             no complete corrected data yet — retried automatically once it \
+                             is there"
+                        )),
+                    }
+                })
+                .collect::<Result<Vec<(u64, PathBuf)>, String>>()
+        });
+        let members = match members {
+            Ok(members) => members,
             Err(message) => {
                 // Only a run someone asked for explicitly gets the message
                 // (the automatic pass simply retries next refresh).
@@ -1180,7 +1205,7 @@ impl MonitorApp {
             );
             return;
         }
-        let state = match norm::prepare_run_job(run, &corrected, ipts_path, config, &info) {
+        let state = match norm::prepare_group_job(&members, ipts_path, config, &info) {
             Ok(spec) => {
                 self.job_output.remove(&spec.target);
                 self.run_meta.insert(
@@ -1192,9 +1217,10 @@ impl MonitorApp {
                         output: Some(spec.output().to_path_buf()),
                     },
                 );
+                let runs = spec.runs.clone();
                 norm::launch(spec, self.norm_tx.clone());
                 norm::JobState::Running {
-                    runs: vec![run],
+                    runs,
                     stage: "starting…".to_owned(),
                     fraction: None,
                     stages: Vec::new(),
@@ -1331,13 +1357,7 @@ impl MonitorApp {
         let ipts_path = self.ipts_path()?;
         let config = self.config_for_run(run)?;
         let info = h5::read_config_info(&config).ok()?;
-        let corrected = self.corrected_folder(run);
-        Some(norm::run_output_dir(
-            &ipts_path,
-            run,
-            corrected.as_deref(),
-            &self.effective_info(run, &info),
-        ))
+        Some(self.group_output_for(&ipts_path, run, &self.effective_info(run, &info)).1)
     }
 
     /// A run's corrected (input) folder as the table knows it — complete
@@ -2015,6 +2035,24 @@ impl MonitorApp {
     }
 
     /// `29905, 29906, 29907` — the open beams as a short run list.
+    /// `1234, 1235, 1236` — or `1234 to 1240` past five runs.
+    fn runs_text(runs: &[u64]) -> String {
+        match runs {
+            [first, .., last] if runs.len() > 5 => format!("{first} to {last}"),
+            _ => runs.iter().map(u64::to_string).collect::<Vec<_>>().join(", "),
+        }
+    }
+
+    /// Label of a running per-run job: the run alone, or the series it
+    /// combines.
+    fn job_label(run: u64, runs: &[u64]) -> String {
+        if runs.len() > 1 {
+            format!("combining runs {}", Self::runs_text(runs))
+        } else {
+            format!("normalizing run {run}")
+        }
+    }
+
     fn ob_runs_text(folders: &[PathBuf]) -> String {
         let runs = Self::ob_run_numbers(folders);
         if runs.is_empty() {
@@ -2235,12 +2273,85 @@ impl MonitorApp {
     /// nothing is stored when the file is missing or still being written,
     /// so the next refresh retries.
     fn classify_run(&mut self, ipts_path: &Path, run: u64) {
+        let nexus = files::nexus_path(ipts_path, run);
+        if !self.acq_cache.contains_key(&run)
+            && let Some(acq) = h5::nexus_acquisition(&nexus)
+        {
+            self.acq_cache.insert(run, acq);
+        }
         if self.image_path_cache.contains_key(&run) {
             return;
         }
-        if let Some(path) = h5::nexus_image_path(&files::nexus_path(ipts_path, run)) {
+        if let Some(path) = h5::nexus_image_path(&nexus) {
             self.image_path_cache.insert(run, path);
         }
+    }
+
+    /// A run's acquisition settings for the combined series: the
+    /// acquisition name and starting wavelength of its raw / corrected
+    /// folder, the duration and proton charge of its NeXus. `None` until
+    /// both a folder and the NeXus are there.
+    fn run_settings(&self, run: u64) -> Option<norm::RunSettings> {
+        let rf = self.run_files.iter().find(|rf| rf.run == run)?;
+        let name = [&rf.corrected, &rf.raw].into_iter().find_map(|status| {
+            let path = match status {
+                files::FileStatus::Present(p) | files::FileStatus::Writing(p) => Some(p),
+                files::FileStatus::Missing(_) => None,
+            }?;
+            files::acquisition_name(&path.file_name()?.to_string_lossy())
+        })?;
+        let (duration_s, proton_charge) = *self.acq_cache.get(&run)?;
+        Some(norm::RunSettings {
+            name,
+            wavelength: self.starting_wavelength(run),
+            duration_s,
+            proton_charge,
+        })
+    }
+
+    /// The series a run closes when the combined series are on: the
+    /// consecutive sample runs of the table before it acquired with the
+    /// same settings (each compared with the next; open-beam, alignment
+    /// and rejected runs in between are neither part of it nor break it;
+    /// a run whose settings are not readable yet breaks it), the run
+    /// itself last. Just the run when the series are off.
+    fn combine_group(&self, run: u64) -> Vec<u64> {
+        let mut group = vec![run];
+        if !self.combine_enabled() {
+            return group;
+        }
+        let Some(mut current) = self.run_settings(run) else {
+            return group;
+        };
+        let mut earlier: Vec<u64> = self
+            .run_files
+            .iter()
+            .map(|rf| rf.run)
+            .filter(|r| *r < run && !self.rejected.contains(r) && !self.skips_normalization(*r))
+            .collect();
+        earlier.sort_unstable_by(|a, b| b.cmp(a));
+        for previous in earlier {
+            let Some(settings) = self.run_settings(previous) else {
+                break;
+            };
+            if !norm::same_settings(&settings, &current) {
+                break;
+            }
+            group.push(previous);
+            current = settings;
+        }
+        group.reverse();
+        group
+    }
+
+    /// Where the normalization a run closes goes with the settings
+    /// `info`: its series' folder when the combined series are on and the
+    /// run continues one, else its own.
+    fn group_output_for(&self, ipts_path: &Path, run: u64, info: &h5::ConfigInfo) -> (Vec<u64>, PathBuf) {
+        let group = self.combine_group(run);
+        let first = self.corrected_folder(group[0]);
+        let output = norm::group_output_dir(ipts_path, &group, first.as_deref(), info);
+        (group, output)
     }
 
     /// A run's starting wavelength (Å), from its raw or corrected folder
@@ -2312,44 +2423,83 @@ impl MonitorApp {
         self.cfg.as_ref().map(|c| c.live_open_beams).unwrap_or(false)
     }
 
+    /// Did the user opt the combined series in — every new sample run
+    /// normalized together with the consecutive runs before it acquired
+    /// with the same settings (shared `combine_consecutive` flag, false
+    /// when the key is absent)?
+    fn combine_enabled(&self) -> bool {
+        self.cfg.as_ref().map(|c| c.combine_consecutive).unwrap_or(false)
+    }
+
+    /// This tool's opt-in flags of a shared configuration, as one value.
+    fn opt_ins_of(cfg: &config::AutoNormConfig) -> config::OptIns {
+        config::OptIns {
+            rolling_combine: cfg.rolling_combine,
+            live_reduction: cfg.live_reduction,
+            live_open_beams: cfg.live_open_beams,
+            combine_consecutive: cfg.combine_consecutive,
+        }
+    }
+
+    /// The current opt-in flags (all false without a shared configuration).
+    fn opt_ins(&self) -> config::OptIns {
+        self.cfg.as_ref().map(Self::opt_ins_of).unwrap_or_default()
+    }
+
     /// Opt the rolling windows in/out of the auto normalization: written to
     /// the shared config so it survives restarts and is visible to every
     /// user (the line is added when the notebook-written file lacks it).
     fn set_rolling_enabled(&mut self, enabled: bool) {
-        let (live, live_ob) = (self.live_enabled(), self.live_open_beams_enabled());
-        self.set_opt_in(enabled, live, live_ob, |path| {
-            config::set_rolling_combine(path, enabled)
-        });
+        let opt_ins = config::OptIns {
+            rolling_combine: enabled,
+            ..self.opt_ins()
+        };
+        self.set_opt_in(opt_ins, |path| config::set_rolling_combine(path, enabled));
     }
 
     /// Opt the live reduction in/out of the auto normalization (same
     /// shared-config mechanics as the rolling windows).
     fn set_live_enabled(&mut self, enabled: bool) {
-        let (rolling, live_ob) = (self.rolling_enabled(), self.live_open_beams_enabled());
-        self.set_opt_in(rolling, enabled, live_ob, |path| {
-            config::set_live_reduction(path, enabled)
-        });
+        let opt_ins = config::OptIns {
+            live_reduction: enabled,
+            ..self.opt_ins()
+        };
+        self.set_opt_in(opt_ins, |path| config::set_live_reduction(path, enabled));
     }
 
     /// Opt the live open beams in/out (same shared-config mechanics as the
-    /// other two flags).
+    /// other flags).
     fn set_live_open_beams_enabled(&mut self, enabled: bool) {
-        let (rolling, live) = (self.rolling_enabled(), self.live_enabled());
-        self.set_opt_in(rolling, live, enabled, |path| {
-            config::set_live_open_beams(path, enabled)
-        });
+        let opt_ins = config::OptIns {
+            live_open_beams: enabled,
+            ..self.opt_ins()
+        };
+        self.set_opt_in(opt_ins, |path| config::set_live_open_beams(path, enabled));
+    }
+
+    /// Opt the combined series in/out (same shared-config mechanics as the
+    /// other flags). The results found on disk are looked up again under
+    /// the naming the flag implies (a series' result is named after its
+    /// runs, a run's own after that run) — jobs in progress go on.
+    fn set_combine_enabled(&mut self, enabled: bool) {
+        let opt_ins = config::OptIns {
+            combine_consecutive: enabled,
+            ..self.opt_ins()
+        };
+        self.set_opt_in(opt_ins, |path| config::set_combine_consecutive(path, enabled));
+        self.run_jobs
+            .retain(|_, state| matches!(state, norm::JobState::Running { .. }));
+        let running: Vec<u64> = self.run_jobs.keys().copied().collect();
+        self.run_meta.retain(|run, _| running.contains(run));
     }
 
     /// Write one opt-in flag: `set` toggles its line in the existing shared
     /// file; when there is no shared file yet (auto normalization never
     /// turned ON) the file is created, OFF, with the selected
-    /// IPTS/configuration if any and all three flags as they should now
-    /// read (`rolling`, `live`, `live_ob`).
+    /// configuration file in the shared config and the flags `opt_ins`.
     fn set_opt_in(
         &mut self,
-        rolling: bool,
-        live: bool,
-        live_ob: bool,
+        opt_ins: config::OptIns,
         set: impl FnOnce(&Path) -> Result<(), String>,
     ) {
         let result = if self.cfg_path.is_file() {
@@ -2364,9 +2514,7 @@ impl MonitorApp {
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
                 false,
-                rolling,
-                live,
-                live_ob,
+                opt_ins,
             )
         };
         match result {
@@ -2384,16 +2532,13 @@ impl MonitorApp {
             return;
         };
         // The opt-ins are the user's own choices: keep them as they are.
-        let (rolling, live, live_ob) =
-            (self.rolling_enabled(), self.live_enabled(), self.live_open_beams_enabled());
+        let opt_ins = self.opt_ins();
         match config::write_full(
             &self.cfg_path,
             &ipts,
             &config_file.display().to_string(),
             true,
-            rolling,
-            live,
-            live_ob,
+            opt_ins,
         ) {
             Ok(()) => self.write_error = None,
             Err(e) => self.write_error = Some(e),
@@ -3690,6 +3835,28 @@ impl MonitorApp {
             if ob_response.changed() {
                 self.set_live_open_beams_enabled(live_ob);
             }
+            ui.add_space(theme::SPACE_MD);
+            let mut combine = self.combine_enabled();
+            let combine_response = ui
+                .checkbox(&mut combine, "⧉ Combine consecutive runs")
+                .on_hover_text(
+                    "Opt-in, saved in the shared configuration, independent of the \
+                     other flags: when checked, every new sample run is normalized \
+                     TOGETHER with the consecutive runs before it acquired with the \
+                     same settings — run 1234 on its own, then 1234+1235 when 1235 \
+                     lands, then 1234+1235+1236, … until a run with other settings \
+                     starts a new series. Same settings = same acquisition name \
+                     (title, setpoint and chopper setting of the folder name), same \
+                     starting wavelength, and the same acquisition time or the same \
+                     proton charge (2 %). Open-beam, alignment and rejected runs in \
+                     between neither join nor break a series. The combined result \
+                     goes to its own folder, Run_<first>_to_<last> in the first \
+                     run's folder name; every earlier result is kept. Unchecked \
+                     (the default), every run is normalized on its own.",
+                );
+            if combine_response.changed() {
+                self.set_combine_enabled(combine);
+            }
             if folded {
                 return;
             }
@@ -4890,11 +5057,11 @@ impl MonitorApp {
                     }
                 }
             }
-            Some(norm::JobState::Running { stage, fraction, stages, .. }) => {
+            Some(norm::JobState::Running { runs, stage, fraction, stages }) => {
                 ui.horizontal(|ui| {
                     Self::progress_cell(
                         ui,
-                        &format!("normalizing run {}", run.run),
+                        &Self::job_label(run.run, runs),
                         stage,
                         *fraction,
                         stages,
@@ -4903,15 +5070,25 @@ impl MonitorApp {
                     Self::output_toggle(ui, target, output_toggle);
                 });
             }
-            Some(norm::JobState::Done { output, finished, .. }) => {
+            Some(norm::JobState::Done { output, finished, runs }) => {
                 ui.horizontal(|ui| {
+                    let combined = runs.len() > 1;
                     ui.label(
-                        egui::RichText::new("✔ normalization done")
-                            .color(theme::SUCCESS)
-                            .strong(),
+                        egui::RichText::new(if combined {
+                            format!("✔ {} runs combined", runs.len())
+                        } else {
+                            "✔ normalization done".to_owned()
+                        })
+                        .color(theme::SUCCESS)
+                        .strong(),
                     )
                     .on_hover_text(format!(
-                        "finished {}\n{}",
+                        "{}finished {}\n{}",
+                        if combined {
+                            format!("runs {} normalized together (combined series)\n", Self::runs_text(runs))
+                        } else {
+                            String::new()
+                        },
                         finished.format("%Y-%m-%d %H:%M:%S"),
                         output.display()
                     ));

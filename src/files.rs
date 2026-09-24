@@ -67,6 +67,31 @@ pub fn run_number_in_name(name: &str) -> Option<u64> {
 /// decimal point — not to be confused with an unrelated digit group
 /// earlier in the name, like a temperature such as `2_900C` here).
 /// `None` when the name carries no such token.
+/// The acquisition name of a run folder — what the DAQ was told to call
+/// the measurement — without the `<date>_Run_<run>_` prefix and the
+/// trailing `_<index>` (the run's rank among those of the same name):
+/// `20260921_Run_30340_reptRib_PFV468_2_900C_3_000AngsMin_0` →
+/// `reptRib_PFV468_2_900C_3_000AngsMin`. Consecutive runs of one series
+/// share it (title, sample environment setpoint, chopper setting); a
+/// different sample or setpoint changes it. `None` when the name does not
+/// follow the pattern.
+pub fn acquisition_name(name: &str) -> Option<String> {
+    let idx = name.find("_Run_")?;
+    let after = &name[idx + "_Run_".len()..];
+    let digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = after[digits..].strip_prefix('_')?;
+    let trimmed = match rest.rfind('_') {
+        Some(i) if !rest[i + 1..].is_empty() && rest[i + 1..].chars().all(|c| c.is_ascii_digit()) => {
+            &rest[..i]
+        }
+        _ => rest,
+    };
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 pub fn starting_wavelength_in_name(name: &str) -> Option<f64> {
     let idx = name.find("AngsMin")?;
     let prefix = &name[..idx];
@@ -310,6 +335,25 @@ fn dir_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquisition_name_drops_the_run_prefix_and_the_index() {
+        assert_eq!(
+            acquisition_name("20260921_Run_30340_reptRib_PFV468_2_900C_3_000AngsMin_0").as_deref(),
+            Some("reptRib_PFV468_2_900C_3_000AngsMin")
+        );
+        assert_eq!(
+            acquisition_name("20260613_Run_23642_LF99D_Rnd2_Coarsen_0_416C_0_000AngsMin_12").as_deref(),
+            Some("LF99D_Rnd2_Coarsen_0_416C_0_000AngsMin")
+        );
+        // Open beams have the `_ob_<i>` tail: the `_<i>` goes, `ob` stays.
+        assert_eq!(
+            acquisition_name("20260921_Run_30339_ob__2_900C_3_000AngsMin_ob_0").as_deref(),
+            Some("ob__2_900C_3_000AngsMin_ob")
+        );
+        assert_eq!(acquisition_name("Run_7"), None);
+        assert_eq!(acquisition_name("something_else"), None);
+    }
     use std::fs;
 
     #[test]

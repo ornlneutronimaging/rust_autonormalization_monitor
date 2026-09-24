@@ -65,6 +65,18 @@ pub fn nexus_times(path: &Path) -> Option<(DateTime<FixedOffset>, DateTime<Fixed
     ))
 }
 
+/// How long a run acquired and how much beam it saw: `/entry/duration`
+/// (s) and `/entry/proton_charge` (pC) of its NeXus file. `None` when the
+/// file is missing, still being written, or lacks either.
+pub fn nexus_acquisition(path: &Path) -> Option<(f64, f64)> {
+    let file = h5::File::open(path).ok()?;
+    let scalar = |name: &str| {
+        let ds = file.dataset(name).ok()?;
+        read_f64s(&ds)?.into_iter().next().filter(|x| x.is_finite())
+    };
+    Some((scalar("entry/duration")?, scalar("entry/proton_charge")?))
+}
+
 /// DASlogs entry recording where the DAQ wrote the run's images,
 /// relative to the IPTS folder (e.g. `images/tpx1/raw/radiography/<title>/
 /// <run folder>`, or `images/tpx1/alignment/…` for an alignment run).
@@ -572,6 +584,17 @@ mod tests {
         assert!(start <= end);
         // Missing file → None, no panic.
         assert!(nexus_times(Path::new("/nonexistent.nxs.h5")).is_none());
+    }
+
+    #[test]
+    fn reads_the_acquisition_of_a_real_nexus() {
+        let path = Path::new("/SNS/VENUS/IPTS-38902/nexus/VENUS_30340.nxs.h5");
+        if !path.is_file() {
+            return;
+        }
+        let (duration, charge) = nexus_acquisition(path).expect("duration and proton charge");
+        assert!((duration - 2082.63).abs() < 0.01, "{duration}");
+        assert!((charge - 2.90007e12).abs() < 1e8, "{charge}");
     }
 
     #[test]

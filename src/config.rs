@@ -10,6 +10,7 @@
 //! rolling_combine: false
 //! live_reduction: false
 //! live_open_beams: false
+//! combine_consecutive: false
 //! ```
 //!
 //! `rolling_combine` and `live_reduction` are the opt-in flags of this
@@ -20,7 +21,10 @@
 //! independent of either: only when true does the tool itself replace the
 //! configuration's open beams by the newest complete, consecutive
 //! open-beam run(s) landed after them, as soon as they land — no manual
-//! "⇄ replace by…" needed. The notebook does not know those keys (it
+//! "⇄ replace by…" needed. `combine_consecutive` is independent too: only
+//! when true are consecutive sample runs acquired with the same settings
+//! normalized together (each new run of a series combined with the runs
+//! of the series before it). The notebook does not know those keys (it
 //! rewrites the file without them), so a missing key means false — nothing
 //! fires from this tool unless the box is checked.
 //!
@@ -39,6 +43,8 @@ pub const ROLLING_COMBINE_KEY: &str = "rolling_combine";
 pub const LIVE_REDUCTION_KEY: &str = "live_reduction";
 /// Key of the live open-beams (automatic OB replacement) opt-in flag.
 pub const LIVE_OPEN_BEAMS_KEY: &str = "live_open_beams";
+/// Key of the combine-consecutive-runs opt-in flag.
+pub const COMBINE_CONSECUTIVE_KEY: &str = "combine_consecutive";
 
 /// Snapshot of the configuration file, keeping the raw key order for display.
 #[derive(Clone, Debug, Default)]
@@ -54,6 +60,9 @@ pub struct AutoNormConfig {
     /// Parsed value of the `live_open_beams` opt-in flag (false when the
     /// key is absent).
     pub live_open_beams: bool,
+    /// Parsed value of the `combine_consecutive` opt-in flag (false when
+    /// the key is absent).
+    pub combine_consecutive: bool,
     /// All `key: value` pairs in file order (values with quotes stripped),
     /// for read-only display in the UI.
     pub entries: Vec<(String, String)>,
@@ -95,6 +104,8 @@ pub fn read(path: &Path) -> Result<AutoNormConfig, String> {
                 cfg.live_reduction = parse_bool(value);
             } else if key == LIVE_OPEN_BEAMS_KEY {
                 cfg.live_open_beams = parse_bool(value);
+            } else if key == COMBINE_CONSECUTIVE_KEY {
+                cfg.combine_consecutive = parse_bool(value);
             }
             cfg.entries.push((
                 key.to_owned(),
@@ -199,19 +210,41 @@ pub fn set_live_open_beams(path: &Path, enabled: bool) -> Result<(), String> {
     )
 }
 
+/// Set the `combine_consecutive` opt-in flag, adding the line when the
+/// file (written by the notebook) does not carry it yet.
+pub fn set_combine_consecutive(path: &Path, enabled: bool) -> Result<(), String> {
+    set_or_append_value(
+        path,
+        COMBINE_CONSECUTIVE_KEY,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// This tool's opt-in flags, as one value to pass around.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OptIns {
+    pub rolling_combine: bool,
+    pub live_reduction: bool,
+    pub live_open_beams: bool,
+    pub combine_consecutive: bool,
+}
+
 /// (Re)write the whole configuration file with the 5-key schema the
 /// normalization notebook uses (`register_config_for_autoreduction`) plus
-/// this tool's `rolling_combine`, `live_reduction` and `live_open_beams`
-/// flags, creating the parent folder / file if needed.
+/// this tool's opt-in flags, creating the parent folder / file if needed.
 pub fn write_full(
     path: &Path,
     ipts: &str,
     config_file: &str,
     activate: bool,
-    rolling_combine: bool,
-    live_reduction: bool,
-    live_open_beams: bool,
+    opt_ins: OptIns,
 ) -> Result<(), String> {
+    let OptIns {
+        rolling_combine,
+        live_reduction,
+        live_open_beams,
+        combine_consecutive,
+    } = opt_ins;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -226,7 +259,8 @@ pub fn write_full(
          last_modified_by: {user}\n\
          {ROLLING_COMBINE_KEY}: {rolling_combine}\n\
          {LIVE_REDUCTION_KEY}: {live_reduction}\n\
-         {LIVE_OPEN_BEAMS_KEY}: {live_open_beams}\n"
+         {LIVE_OPEN_BEAMS_KEY}: {live_open_beams}\n\
+         {COMBINE_CONSECUTIVE_KEY}: {combine_consecutive}\n"
     );
     fs::write(path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
@@ -312,7 +346,17 @@ last_modified_by: j35
         let dir = std::env::temp_dir().join("anm_test_write_full/sub");
         let _ = fs::remove_dir_all(std::env::temp_dir().join("anm_test_write_full"));
         let path = dir.join("autoreduction.cfg");
-        write_full(&path, "IPTS-36967", "/tmp/config.h5", true, true, false, false).unwrap();
+        write_full(
+            &path,
+            "IPTS-36967",
+            "/tmp/config.h5",
+            true,
+            OptIns {
+                rolling_combine: true,
+                ..OptIns::default()
+            },
+        )
+        .unwrap();
         let cfg = read(&path).unwrap();
         assert!(cfg.activate);
         assert!(cfg.rolling_combine);
@@ -382,6 +426,36 @@ last_modified_by: j35
         assert!(!cfg.live_open_beams);
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content.matches("live_open_beams").count(), 1);
+    }
+
+    #[test]
+    fn combine_consecutive_is_appended_then_toggled_in_place() {
+        let dir = std::env::temp_dir().join("anm_test_combine_consecutive");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_sample(&dir);
+        assert!(!read(&path).unwrap().combine_consecutive);
+        set_combine_consecutive(&path, true).unwrap();
+        let cfg = read(&path).unwrap();
+        assert!(cfg.combine_consecutive);
+        assert!(!cfg.live_open_beams);
+        assert_eq!(cfg.entries[5].0, "combine_consecutive");
+        set_combine_consecutive(&path, false).unwrap();
+        assert!(!read(&path).unwrap().combine_consecutive);
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("combine_consecutive").count(), 1);
+        // write_full carries the flag too.
+        write_full(
+            &path,
+            "IPTS-1",
+            "/tmp/c.h5",
+            false,
+            OptIns {
+                combine_consecutive: true,
+                ..OptIns::default()
+            },
+        )
+        .unwrap();
+        assert!(read(&path).unwrap().combine_consecutive);
     }
 
     #[test]

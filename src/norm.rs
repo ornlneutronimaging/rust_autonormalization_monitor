@@ -11,6 +11,15 @@
 //!   the configuration names no output folder). A result the workflow
 //!   runner or an older version of this tool left in the legacy layout
 //!   (`Run_<run>/normalization`) is found there and not redone.
+//! - **Combined series** (opt-in `combine_consecutive` flag): consecutive
+//!   sample runs acquired with the same settings — same acquisition name
+//!   (title, setpoint, chopper setting from the folder name), same
+//!   starting wavelength, and the same acquisition time or the same
+//!   proton charge (2 % tolerance, see [`same_settings`]) — are normalized
+//!   together: each new run of the series is combined with the runs of
+//!   the series before it (1234 alone; then 1234+1235; then
+//!   1234+1235+1236, …). Output: `<output base>/<first run's corrected
+//!   folder name with Run_<first>_to_<last>>/normalization`.
 //! - **Rolling windows**: the runs acquired within the last N minutes
 //!   (acquisition time from the NeXus `end_time`) normalized together, one
 //!   job per time window. Output:
@@ -210,6 +219,88 @@ pub fn run_row_name(run: u64, corrected: Option<&Path>) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| format!("Run_{run}"))
+}
+
+/// Acquisition settings of a sample run, for the combined series: what
+/// must match between consecutive runs for them to be normalized together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunSettings {
+    /// The acquisition name of its folder ([`crate::files::acquisition_name`]):
+    /// title, sample environment setpoint and chopper setting as the DAQ
+    /// wrote them.
+    pub name: String,
+    /// Starting wavelength (Å) from the folder name, when it carries one.
+    pub wavelength: Option<f64>,
+    /// `/entry/duration` of the NeXus (s).
+    pub duration_s: f64,
+    /// `/entry/proton_charge` of the NeXus (pC).
+    pub proton_charge: f64,
+}
+
+/// Relative tolerance on the acquisition time / proton charge of two runs
+/// of one series (the DAQ stops a run a little before or after the
+/// setpoint: 2082.63 s vs 2081.21 s, 2.90007e12 vs 2.90014e12 pC in
+/// practice).
+pub const SETTINGS_TOLERANCE: f64 = 0.02;
+
+/// Were two runs acquired with the same settings? Same acquisition name,
+/// same starting wavelength (when both are known), and the same
+/// acquisition time OR the same proton charge within
+/// [`SETTINGS_TOLERANCE`] — a run is acquired for a set time (then the
+/// charge follows the beam power) or for a set charge (then the time
+/// does), so one of the two matching is the setpoint unchanged; a run
+/// acquired twice as long matches on neither.
+pub fn same_settings(a: &RunSettings, b: &RunSettings) -> bool {
+    let close = |x: f64, y: f64| {
+        let scale = x.abs().max(y.abs());
+        scale == 0.0 || (x - y).abs() <= SETTINGS_TOLERANCE * scale
+    };
+    if a.name != b.name {
+        return false;
+    }
+    if let (Some(x), Some(y)) = (a.wavelength, b.wavelength)
+        && (x - y).abs() > 0.005
+    {
+        return false;
+    }
+    close(a.duration_s, b.duration_s) || close(a.proton_charge, b.proton_charge)
+}
+
+/// Row folder name of a combined series: the first run's corrected folder
+/// name with its `Run_<first>` token turned into `Run_<first>_to_<last>`
+/// (`20260921_Run_30340_to_30342_reptRib_…_0`); `Run_<first>_to_<last>_combined`
+/// when the name carries no such token. One run: [`run_row_name`].
+pub fn group_row_name(runs: &[u64], first_corrected: Option<&Path>) -> String {
+    let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
+        return "Run_?".to_owned();
+    };
+    if runs.len() == 1 {
+        return run_row_name(*first, first_corrected);
+    }
+    let token = format!("Run_{first}");
+    let name = run_row_name(*first, first_corrected);
+    if name != token && name.contains(&token) {
+        name.replacen(&token, &format!("Run_{first}_to_{last}"), 1)
+    } else {
+        format!("Run_{first}_to_{last}_combined")
+    }
+}
+
+/// Output folder of a combined series' normalization: `<output base>/
+/// <group row name>/normalization` (see [`group_row_name`]); one run is
+/// [`run_output_dir`], legacy fallback included.
+pub fn group_output_dir(
+    ipts_path: &Path,
+    runs: &[u64],
+    first_corrected: Option<&Path>,
+    config_info: &h5::ConfigInfo,
+) -> PathBuf {
+    match runs {
+        [run] => run_output_dir(ipts_path, *run, first_corrected, config_info),
+        _ => output_base(ipts_path, config_info)
+            .join(group_row_name(runs, first_corrected))
+            .join("normalization"),
+    }
 }
 
 /// Output folder of one run's own normalization: `<output base>/<corrected
@@ -498,35 +589,48 @@ pub fn prepare_job(
     })
 }
 
-/// Resolve one run's own normalization: the configuration's sample is
-/// replaced by that run's corrected folder, everything else (open beams,
-/// settings) comes from the configuration file. The result goes to
-/// `<output base>/<corrected folder name>/normalization`.
-pub fn prepare_run_job(
-    run: u64,
-    corrected_folder: &Path,
+/// Resolve the normalization of a series of runs combined (`(run,
+/// corrected folder)` pairs, ascending): NeuNorm adds their stacks up and
+/// divides by the open beams once. The job belongs to the last run of the
+/// series (its row shows it). One pair is a run on its own.
+pub fn prepare_group_job(
+    members: &[(u64, PathBuf)],
     ipts_path: &Path,
     config_path: &Path,
     config_info: &h5::ConfigInfo,
 ) -> Result<JobSpec, String> {
+    let (Some((first_run, first_corrected)), Some((last_run, _))) =
+        (members.first(), members.last())
+    else {
+        return Err("no run to normalize".to_owned());
+    };
+    let runs: Vec<u64> = members.iter().map(|(run, _)| *run).collect();
     let obs = resolve_obs(ipts_path, config_info)?;
-    let samples = vec![(
-        corrected_folder.to_path_buf(),
-        files::nexus_path(ipts_path, run),
-    )];
+    let samples: Vec<(PathBuf, PathBuf)> = members
+        .iter()
+        .map(|(run, folder)| (folder.clone(), files::nexus_path(ipts_path, *run)))
+        .collect();
     check_frame_counts(&samples, &obs)?;
-    let output = run_output_dir(ipts_path, run, Some(corrected_folder), config_info);
+    let output = group_output_dir(ipts_path, &runs, Some(first_corrected), config_info);
     let row_dir = output.parent().expect("run output has a parent").to_path_buf();
     let base = row_dir.parent().expect("row dir has a parent").to_path_buf();
+    let what = if runs.len() == 1 {
+        format!("Run {first_run}")
+    } else {
+        format!(
+            "Runs {} (combined)",
+            runs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+        )
+    };
     Ok(JobSpec {
-        target: JobTarget::Run(run),
-        runs: vec![run],
+        target: JobTarget::Run(*last_run),
+        runs,
         samples,
         obs,
         config: config_path.to_path_buf(),
         log: row_dir.join("logs").join("normalization.log"),
         summary: base.join(SUMMARY_LOG),
-        what: format!("Run {run}"),
+        what,
         parameters: config_info.parameters.clone(),
         crop: config_info
             .crop_region
@@ -1172,6 +1276,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    fn settings(name: &str, wavelength: Option<f64>, duration: f64, charge: f64) -> RunSettings {
+        RunSettings {
+            name: name.to_owned(),
+            wavelength,
+            duration_s: duration,
+            proton_charge: charge,
+        }
+    }
+
+    #[test]
+    fn same_settings_needs_name_wavelength_and_time_or_charge() {
+        let a = settings("reptRib_PFV468_2_900C_3_000AngsMin", Some(3.0), 2082.63, 2.90007e12);
+        // The real series: tiny drifts in both.
+        assert!(same_settings(&a, &settings(&a.name, Some(3.0), 2081.21, 2.90014e12)));
+        // Charge-controlled run under a weaker beam: longer, same charge.
+        assert!(same_settings(&a, &settings(&a.name, Some(3.0), 2600.0, 2.90014e12)));
+        // Time-controlled run under a weaker beam: same time, less charge.
+        assert!(same_settings(&a, &settings(&a.name, Some(3.0), 2082.0, 2.5e12)));
+        // Twice as long, twice the charge: another setpoint.
+        assert!(!same_settings(&a, &settings(&a.name, Some(3.0), 4165.0, 5.8e12)));
+        // Another sample / setpoint (name), another chopper setting.
+        assert!(!same_settings(&a, &settings("other_2_900C_3_000AngsMin", Some(3.0), 2082.63, 2.90007e12)));
+        assert!(!same_settings(&a, &settings(&a.name, Some(0.7), 2082.63, 2.90007e12)));
+        // Wavelength unknown on one side: the name decides.
+        assert!(same_settings(&a, &settings(&a.name, None, 2082.63, 2.90007e12)));
+    }
+
+    #[test]
+    fn group_rows_are_named_after_the_first_run() {
+        let first = Path::new("/c/20260921_Run_30340_reptRib_PFV468_2_900C_3_000AngsMin_0");
+        assert_eq!(
+            group_row_name(&[30340, 30341, 30342], Some(first)),
+            "20260921_Run_30340_to_30342_reptRib_PFV468_2_900C_3_000AngsMin_0"
+        );
+        assert_eq!(group_row_name(&[30340], Some(first)), "20260921_Run_30340_reptRib_PFV468_2_900C_3_000AngsMin_0");
+        assert_eq!(group_row_name(&[30340, 30341], None), "Run_30340_to_30341_combined");
+        assert_eq!(group_row_name(&[30340, 30341], Some(Path::new("/c/oddname"))), "Run_30340_to_30341_combined");
+        let info = config_info(Some("/out"));
+        assert_eq!(
+            group_output_dir(Path::new("/SNS/VENUS/IPTS-1"), &[30340, 30341], Some(first), &info),
+            PathBuf::from("/out/20260921_Run_30340_to_30341_reptRib_PFV468_2_900C_3_000AngsMin_0/normalization")
+        );
+        assert_eq!(
+            group_output_dir(Path::new("/SNS/VENUS/IPTS-1"), &[30340], Some(first), &info),
+            PathBuf::from("/out/20260921_Run_30340_reptRib_PFV468_2_900C_3_000AngsMin_0/normalization")
+        );
+    }
+
     #[test]
     fn durations_read_naturally() {
         assert_eq!(duration_text(41), "41 s");
@@ -1284,7 +1436,8 @@ mod tests {
             files::FileStatus::Present(folder) => folder,
             other => panic!("no corrected data for run {run}: {other:?}"),
         };
-        let spec = prepare_run_job(run, &corrected, ipts_path, config, &info).unwrap();
+        let spec =
+            prepare_group_job(&[(run, corrected.clone())], ipts_path, config, &info).unwrap();
         let row = corrected.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(spec.output, base.join(&row).join("normalization"));
         assert_eq!(spec.summary, base.join(SUMMARY_LOG));
@@ -1315,6 +1468,57 @@ mod tests {
         assert!(std::fs::read_to_string(&spec.log).unwrap().contains("skipped"));
         let summary = std::fs::read_to_string(&spec.summary).unwrap();
         assert!(summary.contains("Run 23642 — normalization SKIPPED"), "{summary}");
+        println!("--- {} ---\n{summary}", spec.summary.display());
+    }
+
+    /// Two consecutive runs normalized together, on real data:
+    /// `cargo test --release -- --ignored`.
+    #[test]
+    #[ignore]
+    fn normalizes_a_combined_series_end_to_end() {
+        let ipts_path = Path::new("/SNS/VENUS/IPTS-36967");
+        let config = Path::new(
+            "/SNS/VENUS/IPTS-36967/shared/autoreduce/configs/normalization_config_20260718_084258.h5",
+        );
+        if !config.is_file() {
+            return;
+        }
+        let base = std::env::var_os("ANM_TEST_OUTPUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("anm_test_e2e"))
+            .join("combined");
+        let _ = std::fs::remove_dir_all(&base);
+        let mut info = h5::read_config_info(config).unwrap();
+        info.output_folder = Some(base.clone());
+        let runs = [23641, 23642];
+        let members: Vec<(u64, PathBuf)> = files::check_runs(ipts_path, &runs)
+            .into_iter()
+            .map(|rf| match rf.corrected {
+                files::FileStatus::Present(folder) => (rf.run, folder),
+                other => panic!("no corrected data for run {}: {other:?}", rf.run),
+            })
+            .collect();
+        let spec = prepare_group_job(&members, ipts_path, config, &info).unwrap();
+        assert_eq!(spec.target, JobTarget::Run(23642));
+        assert_eq!(spec.runs, runs);
+        let first = members[0].1.file_name().unwrap().to_string_lossy().into_owned();
+        let row = first.replacen("Run_23641", "Run_23641_to_23642", 1);
+        assert_ne!(row, first);
+        assert_eq!(spec.output, base.join(&row).join("normalization"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let output = run_job(&spec, &tx).unwrap_or_else(|e| {
+            panic!(
+                "job failed: {e}\n--- log ---\n{}",
+                std::fs::read_to_string(&spec.log).unwrap_or_default()
+            )
+        });
+        assert!(output_is_done(&output));
+        let log = std::fs::read_to_string(&spec.log).unwrap();
+        assert_eq!(log.matches("\"--sample\"").count(), 2, "{log}");
+        let summary = std::fs::read_to_string(&spec.summary).unwrap();
+        assert!(summary.contains("Runs 23641, 23642 (combined) — normalization STARTED"), "{summary}");
+        assert!(summary.contains("sample 1      : "), "{summary}");
+        assert!(summary.contains("sample 2      : "), "{summary}");
         println!("--- {} ---\n{summary}", spec.summary.display());
     }
 
