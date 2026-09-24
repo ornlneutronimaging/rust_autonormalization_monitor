@@ -101,8 +101,9 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    span is rejected the windows are empty and the app simply waits for
    the next run.
    A footer under the table reminds where the normalized data lands (the
-   configuration's output folder — `Run_<run>/normalization` in there) with
-   a **📂 open folder** shortcut.
+   configuration's output folder — `<corrected folder name>/normalization`
+   in there) with a **📂 open folder** shortcut and a **📄
+   autoreduction.log** button opening the summary log (below).
    With auto normalization ON, every run that lands from then on is
    normalized **on its own** by this app: the row shows **⏳ waiting**
    until the run's corrected folder is complete (the Corrected column
@@ -125,7 +126,7 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    viewer is launched with `--detector <name>` (the configuration's
    `detector` attribute, e.g. `tpx1`, else the single detector folder of
    `shared/autoreduce/images`), so Timepix stacks open transposed the right
-   way even from a `Run_<run>/normalization` path that names no detector
+   way even from a `…/normalization` path that names no detector
    (**↻** retries a failed run). Before launching, the sample and every
    open-beam folder must hold the same number of images (NeuNorm divides
    the stacks frame by frame — the notebook's Data Quality Check refuses
@@ -148,7 +149,7 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    An **Open beam** column names, for every row, the open-beam run(s) the
    normalization divides by: what the result actually used for a
    normalized run (recorded when the job is launched here, read back from
-   the `--ob` arguments of `Run_<run>/logs/normalization.log` for a result
+   the `--ob` arguments of `<row>/logs/normalization.log` for a result
    found on disk — this tool and the workflow runner write the same log),
    the configuration's open beams, dimmed, for a run still to come (and
    for the "(next)" row). An open-beam row shows **✔ in use** when it is
@@ -189,7 +190,8 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    result found on disk) when it is not the one shown — ↻ re-run
    normalizes again with the file shown. The **Output** column names,
    for every row, the base folder the result sits in
-   (`<base>/Run_<run>/normalization`; hover for the full path) — from
+   (`<base>/<corrected folder name>/normalization`; hover for the full
+   path) — from
    the job log for a result found on disk, the configuration's output
    folder, dimmed, for a run still to come.
    **✏ next to the Output cell** opens a window to type or browse another
@@ -212,13 +214,28 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    The job runs exactly like the workflow runner's: a result already
    there is never redone, the inputs are pre-cropped on disk when the
    configuration has a crop region, and the script's output is streamed
-   into `Run_<run>/logs/normalization.log` (a failed row's **📄** button
+   into `<row>/logs/normalization.log` (a failed row's **📄** button
    opens it; the hover shows the last lines).
-   Output follows the workflow runner's layout under the configuration's
-   output folder: `<output folder>/Run_<run>/normalization` (under
+   Output goes under the configuration's output folder (under
    `<IPTS>/shared/autoreduce/normalized` when the configuration names no
-   output folder). A result already there — from the workflow runner or a
-   previous session — is shown as done and never redone. Every run that
+   output folder), in a row folder named after the run's corrected (input)
+   folder: `<output folder>/<corrected folder name>/normalization`, e.g.
+   `20260921_Run_30340_sample_3_000AngsMin_0/normalization` — so the
+   result carries the run's title, temperature and chopper setting, not
+   just its number. A result already there — from a previous session, or
+   in the legacy `Run_<run>/normalization` layout of the workflow runner
+   and of this app before 2026-09-24 — is shown as done and never redone.
+   **`autoreduction.log`**, at the top of the output folder, summarizes
+   every normalization as it happens (one file for all runs, appended
+   live; the rolling windows keep theirs in
+   `<IPTS>/shared/autoreduce/normalized/rolling`): when a job starts, a
+   block with the sample folder and NeXus, every open beam, the
+   configuration file and its settings (mode, inpaint, proton charge,
+   background match, TOF binning and ranges, distance, crop region, …),
+   the pre-crop when there is one, the output folder and the job log;
+   when it ends, one line — DONE with the result folder, FAILED with the
+   error, or SKIPPED when the result was already there — with the start
+   time and the duration. Every run that
    shows up as "(next)" — and any run still in flight when the app started
    watching (NeXus there, corrected data not yet) — is normalized
    automatically, no click needed. Runs that already had their corrected

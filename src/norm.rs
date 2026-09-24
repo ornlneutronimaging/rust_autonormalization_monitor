@@ -4,11 +4,13 @@
 //! - **Per-run**: a run normalized on its own, with the configuration
 //!   file's sample replaced by that run — automatically for every new run
 //!   when auto normalization is ON (as soon as its detector-corrected
-//!   folder shows up), on demand for older runs. Output follows the
-//!   workflow runner: `<config output folder>/Run_<run>/normalization`
-//!   (`<IPTS>/shared/autoreduce/normalized/Run_<run>/normalization` when
-//!   the configuration names no output folder), so a run already
-//!   normalized by either tool is found and not redone.
+//!   folder shows up), on demand for older runs. Output goes under the
+//!   configuration's output folder, in a folder named after the run's
+//!   corrected (input) folder: `<config output folder>/<corrected folder
+//!   name>/normalization` (`<IPTS>/shared/autoreduce/normalized/…` when
+//!   the configuration names no output folder). A result the workflow
+//!   runner or an older version of this tool left in the legacy layout
+//!   (`Run_<run>/normalization`) is found there and not redone.
 //! - **Rolling windows**: the runs acquired within the last N minutes
 //!   (acquisition time from the NeXus `end_time`) normalized together, one
 //!   job per time window. Output:
@@ -20,7 +22,11 @@
 //! the inputs are pre-cropped on disk when the configuration has a crop
 //! region, the script's output is streamed into `logs/<name>.log` next to
 //! the result, the job stages into a `.partial` folder and is promoted on
-//! success.
+//! success. Every job also appends a human-readable summary — sample,
+//! open beams, configuration and its settings, output folder, start and
+//! end times — to one `autoreduction.log` at the top of the output folder
+//! (see [`SUMMARY_LOG`]), written live: the start block when the job
+//! launches, the end line when it finishes.
 
 use crate::{files, h5};
 use chrono::{DateTime, FixedOffset};
@@ -180,17 +186,55 @@ pub fn output_dir(ipts_path: &Path, anchor_run: u64, minutes: u32) -> PathBuf {
     ))
 }
 
-/// Output folder of one run's own normalization — the workflow runner's
-/// layout under the configuration's output folder, so results are shared
-/// between the tools: `<output folder>/Run_<run>/normalization`. Without
-/// an output folder in the configuration, the same layout under
-/// `<IPTS>/shared/autoreduce/normalized`.
-pub fn run_output_dir(ipts_path: &Path, run: u64, config_info: &h5::ConfigInfo) -> PathBuf {
-    let base = config_info
+/// Name of the summary log every job appends to, at the top of the
+/// output folder (`<output folder>/autoreduction.log` for the per-run
+/// normalizations, `<IPTS>/shared/autoreduce/normalized/rolling/
+/// autoreduction.log` for the rolling windows).
+pub const SUMMARY_LOG: &str = "autoreduction.log";
+
+/// Base folder the per-run results go under: the configuration's output
+/// folder, else `<IPTS>/shared/autoreduce/normalized`.
+pub fn output_base(ipts_path: &Path, config_info: &h5::ConfigInfo) -> PathBuf {
+    config_info
         .output_folder
         .clone()
-        .unwrap_or_else(|| ipts_path.join("shared/autoreduce/normalized"));
-    base.join(format!("Run_{run}")).join("normalization")
+        .unwrap_or_else(|| ipts_path.join("shared/autoreduce/normalized"))
+}
+
+/// Name of a run's row folder under the output base: the name of its
+/// corrected (input) folder, e.g. `20260921_Run_30340_sample_3_000AngsMin_0`
+/// — `Run_<run>` when the corrected folder is not known (yet).
+pub fn run_row_name(run: u64, corrected: Option<&Path>) -> String {
+    corrected
+        .and_then(|f| f.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("Run_{run}"))
+}
+
+/// Output folder of one run's own normalization: `<output base>/<corrected
+/// folder name>/normalization` (see [`run_row_name`]). A complete result
+/// left in the legacy layout — `<output base>/Run_<run>/normalization`, the
+/// workflow runner's and this tool's before 2026-09-24 — is returned
+/// instead when nothing sits at the new place, so it is found and never
+/// redone.
+pub fn run_output_dir(
+    ipts_path: &Path,
+    run: u64,
+    corrected: Option<&Path>,
+    config_info: &h5::ConfigInfo,
+) -> PathBuf {
+    let base = output_base(ipts_path, config_info);
+    let row = run_row_name(run, corrected);
+    let output = base.join(&row).join("normalization");
+    let legacy_row = format!("Run_{run}");
+    if row != legacy_row && !output_is_done(&output) {
+        let legacy = base.join(legacy_row).join("normalization");
+        if output_is_done(&legacy) {
+            return legacy;
+        }
+    }
+    output
 }
 
 /// Is a normalization output folder complete (holds at least one TIFF)?
@@ -221,6 +265,13 @@ pub struct JobSpec {
     output: PathBuf,
     /// The job's log file (`<row>/logs/<name>.log`).
     pub log: PathBuf,
+    /// The summary log the job appends to (`<base>/autoreduction.log`).
+    pub summary: PathBuf,
+    /// What the job normalizes, for the summary log: `Run 30340` or
+    /// `Runs 30338, 30339, 30340 (last 5 min window)`.
+    what: String,
+    /// The configuration's settings, as text, for the summary log.
+    parameters: Vec<(String, String)>,
     /// Pre-crop region from the configuration, and where the cropped
     /// copies of the inputs go (`<base>/cropped_x0…_y1…/<folder name>`).
     crop: Option<((usize, usize, usize, usize), PathBuf)>,
@@ -424,6 +475,8 @@ pub fn prepare_job(
     let anchor_run = *window.runs.iter().max().expect("runs not empty");
     let output = output_dir(ipts_path, anchor_run, window.minutes);
     let anchor_dir = output.parent().expect("window output has a parent").to_path_buf();
+    let rolling = ipts_path.join("shared/autoreduce/normalized/rolling");
+    let runs_text: Vec<String> = window.runs.iter().map(|r| r.to_string()).collect();
     Ok(JobSpec {
         target: JobTarget::Window(window_index),
         runs: window.runs.clone(),
@@ -431,19 +484,24 @@ pub fn prepare_job(
         obs,
         config: config_path.to_path_buf(),
         log: anchor_dir.join("logs").join(format!("last_{}min.log", window.minutes)),
-        crop: config_info.crop_region.map(|region| {
-            (
-                region,
-                crop_parent(&ipts_path.join("shared/autoreduce/normalized/rolling"), region),
-            )
-        }),
+        summary: rolling.join(SUMMARY_LOG),
+        what: format!(
+            "Runs {} (last {} min window)",
+            runs_text.join(", "),
+            window.minutes
+        ),
+        parameters: config_info.parameters.clone(),
+        crop: config_info
+            .crop_region
+            .map(|region| (region, crop_parent(&rolling, region))),
         output,
     })
 }
 
 /// Resolve one run's own normalization: the configuration's sample is
 /// replaced by that run's corrected folder, everything else (open beams,
-/// settings) comes from the configuration file.
+/// settings) comes from the configuration file. The result goes to
+/// `<output base>/<corrected folder name>/normalization`.
 pub fn prepare_run_job(
     run: u64,
     corrected_folder: &Path,
@@ -457,7 +515,7 @@ pub fn prepare_run_job(
         files::nexus_path(ipts_path, run),
     )];
     check_frame_counts(&samples, &obs)?;
-    let output = run_output_dir(ipts_path, run, config_info);
+    let output = run_output_dir(ipts_path, run, Some(corrected_folder), config_info);
     let row_dir = output.parent().expect("run output has a parent").to_path_buf();
     let base = row_dir.parent().expect("row dir has a parent").to_path_buf();
     Ok(JobSpec {
@@ -467,6 +525,9 @@ pub fn prepare_run_job(
         obs,
         config: config_path.to_path_buf(),
         log: row_dir.join("logs").join("normalization.log"),
+        summary: base.join(SUMMARY_LOG),
+        what: format!("Run {run}"),
+        parameters: config_info.parameters.clone(),
         crop: config_info
             .crop_region
             .map(|region| (region, crop_parent(&base, region))),
@@ -541,7 +602,142 @@ impl Log {
     }
 }
 
+/// Local wall-clock time, as the summary log prints it.
+fn clock_text(t: DateTime<chrono::Local>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// A duration in seconds as `41 s`, `8 min 41 s`, `1 h 02 min 05 s`.
+pub fn duration_text(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    match (h, m) {
+        (0, 0) => format!("{s} s"),
+        (0, m) => format!("{m} min {s:02} s"),
+        (h, m) => format!("{h} h {m:02} min {s:02} s"),
+    }
+}
+
+/// The summary log (`autoreduction.log`) block a job appends when it
+/// starts: what it normalizes, every input, the configuration and its
+/// settings, where the result goes. One block, so parallel jobs never
+/// interleave their lines.
+fn summary_start_block(spec: &JobSpec, started: DateTime<chrono::Local>) -> String {
+    let mut text = String::new();
+    let line = |text: &mut String, label: &str, value: &str| {
+        text.push_str(&format!("  {label:<14}: {value}\n"));
+    };
+    text.push_str(&format!(
+        "{}\n[{}] {} — normalization STARTED\n",
+        "-".repeat(78),
+        clock_text(started),
+        spec.what
+    ));
+    for (i, (folder, nexus)) in spec.samples.iter().enumerate() {
+        let label = if spec.samples.len() == 1 {
+            "sample".to_owned()
+        } else {
+            format!("sample {}", i + 1)
+        };
+        line(&mut text, &label, &folder.display().to_string());
+        line(&mut text, "  nexus", &nexus.display().to_string());
+    }
+    for (i, (folder, nexus)) in spec.obs.iter().enumerate() {
+        let label = if spec.obs.len() == 1 {
+            "open beam".to_owned()
+        } else {
+            format!("open beam {}", i + 1)
+        };
+        line(&mut text, &label, &folder.display().to_string());
+        line(&mut text, "  nexus", &nexus.display().to_string());
+    }
+    line(&mut text, "configuration", &spec.config.display().to_string());
+    for (name, value) in &spec.parameters {
+        text.push_str(&format!("      {name} = {value}\n"));
+    }
+    if let Some(((x0, y0, x1, y1), parent)) = &spec.crop {
+        line(
+            &mut text,
+            "pre-crop",
+            &format!("(x0, y0, x1, y1) = ({x0}, {y0}, {x1}, {y1}) — cropped copies in {}", parent.display()),
+        );
+    }
+    line(&mut text, "output", &spec.output.display().to_string());
+    line(&mut text, "job log", &spec.log.display().to_string());
+    text
+}
+
+/// The summary log line a job appends when it ends.
+fn summary_end_line(
+    spec: &JobSpec,
+    started: DateTime<chrono::Local>,
+    ended: DateTime<chrono::Local>,
+    outcome: &str,
+) -> String {
+    format!(
+        "[{}] {} — normalization {outcome} (started {}, took {})\n",
+        clock_text(ended),
+        spec.what,
+        clock_text(started),
+        duration_text((ended - started).num_seconds())
+    )
+}
+
+/// Append one block to the summary log (created with its folder on first
+/// use). A summary that cannot be written never fails the job.
+fn append_summary(path: &Path, text: &str) {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+/// Outcome of [`run_job_inner`]: the result folder, and whether the job
+/// found it already there (skipped) rather than produced it.
+struct Outcome {
+    output: PathBuf,
+    skipped: bool,
+}
+
+/// Run one job and keep the summary log (`autoreduction.log`) up to date:
+/// the start block when the job launches, one end line when it finishes
+/// (DONE with the result folder, FAILED with the first line of the error,
+/// SKIPPED when the result was already there).
 fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
+    let started = chrono::Local::now();
+    let result = run_job_inner(spec, tx, started);
+    let ended = chrono::Local::now();
+    match &result {
+        Ok(Outcome { skipped: true, .. }) => {} // its own one-liner is written
+        Ok(Outcome { output, .. }) => append_summary(
+            &spec.summary,
+            &summary_end_line(spec, started, ended, &format!("DONE → {}", output.display())),
+        ),
+        Err(message) => append_summary(
+            &spec.summary,
+            &summary_end_line(
+                spec,
+                started,
+                ended,
+                &format!("FAILED: {}", message.lines().next().unwrap_or("").trim()),
+            ),
+        ),
+    }
+    result.map(|o| o.output)
+}
+
+fn run_job_inner(
+    spec: &JobSpec,
+    tx: &Sender<JobMessage>,
+    started: DateTime<chrono::Local>,
+) -> Result<Outcome, String> {
     let log = Log::open(&spec.log)?;
     let progress = |stage: String, fraction: Option<f32>| {
         let _ = tx.send(JobMessage::Progress {
@@ -561,8 +757,21 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
     // Never run twice: a complete result is reused as is.
     if output_is_done(&spec.output) {
         say("normalization output already there — skipped (never run twice)");
-        return Ok(spec.output.clone());
+        append_summary(
+            &spec.summary,
+            &format!(
+                "[{}] {} — normalization SKIPPED, result already there: {}\n",
+                clock_text(started),
+                spec.what,
+                spec.output.display()
+            ),
+        );
+        return Ok(Outcome {
+            output: spec.output.clone(),
+            skipped: true,
+        });
     }
+    append_summary(&spec.summary, &summary_start_block(spec, started));
 
     // Pre-crop every sample/OB folder when the configuration asks for it
     // (notebook convention), and normalize the cropped copies.
@@ -713,7 +922,10 @@ fn run_job(spec: &JobSpec, tx: &Sender<JobMessage>) -> Result<PathBuf, String> {
         message
     })?;
     say(&format!("normalized data written to {}", spec.output.display()));
-    Ok(spec.output.clone())
+    Ok(Outcome {
+        output: spec.output.clone(),
+        skipped: false,
+    })
 }
 
 /// Crop one input folder into `<crop_parent>/<folder name>/` (exclusive-stop
@@ -855,6 +1067,7 @@ fn write_tiff_f32(path: &Path, w: usize, h: usize, values: &[f32]) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn t(s: &str) -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339(s).unwrap()
@@ -893,30 +1106,128 @@ mod tests {
         assert_eq!(parse_progress("PROGRESS garbage"), None);
     }
 
+    fn config_info(output_folder: Option<&str>) -> h5::ConfigInfo {
+        h5::ConfigInfo {
+            ob_folders: vec![],
+            crop_region: None,
+            output_folder: output_folder.map(PathBuf::from),
+            detector: None,
+            parameters: vec![],
+        }
+    }
+
     #[test]
-    fn run_output_dir_follows_the_workflow_runner_layout() {
-        let with_folder = h5::ConfigInfo {
-            ob_folders: vec![],
-            crop_region: None,
-            output_folder: Some(PathBuf::from("/SNS/VENUS/IPTS-1/shared/jean")),
-            detector: None,
-        };
-        assert_eq!(
-            run_output_dir(Path::new("/SNS/VENUS/IPTS-1"), 23642, &with_folder),
-            PathBuf::from("/SNS/VENUS/IPTS-1/shared/jean/Run_23642/normalization")
+    fn run_output_dir_is_named_after_the_corrected_folder() {
+        let ipts = Path::new("/SNS/VENUS/IPTS-1");
+        let corrected = Path::new(
+            "/SNS/VENUS/IPTS-1/shared/autoreduce/images/tpx1/raw/x/20260921_Run_23642_x_3_000AngsMin_0",
         );
-        let without = h5::ConfigInfo {
-            ob_folders: vec![],
-            crop_region: None,
-            output_folder: None,
-            detector: None,
-        };
+        let with_folder = config_info(Some("/SNS/VENUS/IPTS-1/shared/jean"));
         assert_eq!(
-            run_output_dir(Path::new("/SNS/VENUS/IPTS-1"), 23642, &without),
+            run_output_dir(ipts, 23642, Some(corrected), &with_folder),
             PathBuf::from(
-                "/SNS/VENUS/IPTS-1/shared/autoreduce/normalized/Run_23642/normalization"
+                "/SNS/VENUS/IPTS-1/shared/jean/20260921_Run_23642_x_3_000AngsMin_0/normalization"
             )
         );
+        // No corrected folder known (yet): the run number stands in.
+        assert_eq!(
+            run_output_dir(ipts, 23642, None, &with_folder),
+            PathBuf::from("/SNS/VENUS/IPTS-1/shared/jean/Run_23642/normalization")
+        );
+        // No output folder in the configuration: the IPTS default.
+        assert_eq!(
+            run_output_dir(ipts, 23642, Some(corrected), &config_info(None)),
+            PathBuf::from(
+                "/SNS/VENUS/IPTS-1/shared/autoreduce/normalized/\
+                 20260921_Run_23642_x_3_000AngsMin_0/normalization"
+            )
+        );
+        assert_eq!(run_row_name(7, None), "Run_7");
+        assert_eq!(run_row_name(7, Some(Path::new("/a/b/20260101_Run_7_s_0"))), "20260101_Run_7_s_0");
+    }
+
+    #[test]
+    fn run_output_dir_finds_a_legacy_result() {
+        let base = std::env::temp_dir().join("anm_test_legacy_output");
+        let _ = std::fs::remove_dir_all(&base);
+        let info = config_info(base.to_str());
+        let ipts = Path::new("/SNS/VENUS/IPTS-1");
+        let corrected = Path::new("/x/20260101_Run_9_s_0");
+        let fresh = base.join("20260101_Run_9_s_0/normalization");
+        let legacy = base.join("Run_9/normalization");
+        // Nothing on disk: the new layout.
+        assert_eq!(run_output_dir(ipts, 9, Some(corrected), &info), fresh);
+        // A complete result in the legacy layout is found there.
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("img_0000.tiff"), b"").unwrap();
+        assert_eq!(run_output_dir(ipts, 9, Some(corrected), &info), legacy);
+        // An empty legacy folder does not count.
+        std::fs::remove_file(legacy.join("img_0000.tiff")).unwrap();
+        assert_eq!(run_output_dir(ipts, 9, Some(corrected), &info), fresh);
+        // A complete result at the new place wins over a legacy one.
+        std::fs::write(legacy.join("img_0000.tiff"), b"").unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join("img_0000.tiff"), b"").unwrap();
+        assert_eq!(run_output_dir(ipts, 9, Some(corrected), &info), fresh);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(duration_text(41), "41 s");
+        assert_eq!(duration_text(521), "8 min 41 s");
+        assert_eq!(duration_text(3725), "1 h 02 min 05 s");
+        assert_eq!(duration_text(-3), "0 s");
+    }
+
+    #[test]
+    fn summary_log_follows_a_job() {
+        let root = std::env::temp_dir().join("anm_test_summary_log");
+        let _ = std::fs::remove_dir_all(&root);
+        let spec = JobSpec {
+            target: JobTarget::Run(30340),
+            runs: vec![30340],
+            samples: vec![(
+                PathBuf::from("/c/20260921_Run_30340_s_0"),
+                PathBuf::from("/n/VENUS_30340.nxs.h5"),
+            )],
+            obs: vec![
+                (PathBuf::from("/c/ob/Run_30338_ob_0"), PathBuf::from("/n/VENUS_30338.nxs.h5")),
+                (PathBuf::from("/c/ob/Run_30339_ob_0"), PathBuf::from("/n/VENUS_30339.nxs.h5")),
+            ],
+            config: PathBuf::from("/cfg/normalization_config_x.h5"),
+            output: root.join("20260921_Run_30340_s_0/normalization"),
+            log: root.join("20260921_Run_30340_s_0/logs/normalization.log"),
+            summary: root.join(SUMMARY_LOG),
+            what: "Run 30340".to_owned(),
+            parameters: vec![
+                ("distance_source_detector_m".to_owned(), "25".to_owned()),
+                ("proton_charge".to_owned(), "true".to_owned()),
+            ],
+            crop: Some(((1, 2, 3, 4), root.join("cropped_x01_y02_x13_y14"))),
+        };
+        let started = chrono::Local.with_ymd_and_hms(2026, 9, 24, 10, 12, 3).unwrap();
+        let ended = started + chrono::Duration::seconds(521);
+        append_summary(&spec.summary, &summary_start_block(&spec, started));
+        append_summary(
+            &spec.summary,
+            &summary_end_line(&spec, started, ended, "DONE → /out"),
+        );
+        let text = std::fs::read_to_string(&spec.summary).unwrap();
+        let expect = |needle: &str| assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        expect("[2026-09-24 10:12:03] Run 30340 — normalization STARTED");
+        expect("sample        : /c/20260921_Run_30340_s_0");
+        expect("  nexus       : /n/VENUS_30340.nxs.h5");
+        expect("open beam 1   : /c/ob/Run_30338_ob_0");
+        expect("open beam 2   : /c/ob/Run_30339_ob_0");
+        expect("configuration : /cfg/normalization_config_x.h5");
+        expect("      distance_source_detector_m = 25");
+        expect("      proton_charge = true");
+        expect("pre-crop      : (x0, y0, x1, y1) = (1, 2, 3, 4)");
+        expect("output        : ");
+        expect("job log       : ");
+        expect("[2026-09-24 10:20:44] Run 30340 — normalization DONE → /out (started 2026-09-24 10:12:03, took 8 min 41 s)");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -974,8 +1285,10 @@ mod tests {
             other => panic!("no corrected data for run {run}: {other:?}"),
         };
         let spec = prepare_run_job(run, &corrected, ipts_path, config, &info).unwrap();
-        assert_eq!(spec.output, base.join("Run_23642/normalization"));
-        assert_eq!(spec.log, base.join("Run_23642/logs/normalization.log"));
+        let row = corrected.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(spec.output, base.join(&row).join("normalization"));
+        assert_eq!(spec.summary, base.join(SUMMARY_LOG));
+        assert_eq!(spec.log, base.join(&row).join("logs/normalization.log"));
         let (tx, rx) = std::sync::mpsc::channel();
         let output = run_job(&spec, &tx).unwrap_or_else(|e| {
             panic!(
@@ -990,9 +1303,19 @@ mod tests {
         let log = std::fs::read_to_string(&spec.log).unwrap();
         assert!(log.contains("running:"), "{log}");
         assert!(log.contains("normalized data written to"), "{log}");
+        // The summary log followed the job: a start block, an end line.
+        let summary = std::fs::read_to_string(&spec.summary).unwrap();
+        assert!(summary.contains("Run 23642 — normalization STARTED"), "{summary}");
+        assert!(summary.contains(&format!("sample        : {}", corrected.display())), "{summary}");
+        assert!(summary.contains("open beam"), "{summary}");
+        assert!(summary.contains("      proton_charge = "), "{summary}");
+        assert!(summary.contains("Run 23642 — normalization DONE → "), "{summary}");
         // Second call: reused, never run twice.
         assert_eq!(run_job(&spec, &tx).unwrap(), output);
         assert!(std::fs::read_to_string(&spec.log).unwrap().contains("skipped"));
+        let summary = std::fs::read_to_string(&spec.summary).unwrap();
+        assert!(summary.contains("Run 23642 — normalization SKIPPED"), "{summary}");
+        println!("--- {} ---\n{summary}", spec.summary.display());
     }
 
     #[test]

@@ -186,7 +186,7 @@ struct RunMeta {
     dropped_obs: Vec<PathBuf>,
     /// The configuration file (settings) it runs with.
     config: Option<PathBuf>,
-    /// Its result folder (`…/Run_<run>/normalization`).
+    /// Its result folder (`…/<corrected folder name>/normalization`).
     output: Option<PathBuf>,
 }
 
@@ -195,7 +195,8 @@ struct RunMeta {
 #[derive(Clone, Debug, Default)]
 struct RunOverride {
     obs: Option<Vec<PathBuf>>,
-    /// Output base folder: the result goes to `<here>/Run_<run>/normalization`.
+    /// Output base folder: the result goes to `<here>/<corrected folder
+    /// name>/normalization`.
     output: Option<PathBuf>,
     /// Configuration file (the Config drop-down): this run is normalized
     /// with it instead of the section 2 selection — its open beams,
@@ -372,14 +373,15 @@ struct MonitorApp {
     /// The configuration the Done-on-disk entries of `run_jobs` were
     /// looked up with — its output folder decides where results live.
     run_jobs_config: Option<PathBuf>,
-    /// Where the per-run normalized data lands (`<here>/Run_<run>/
-    /// normalization`): the selected configuration's output folder, or the
-    /// IPTS default. Shown in the footer.
+    /// Where the per-run normalized data lands (`<here>/<corrected folder
+    /// name>/normalization`, plus the `autoreduction.log` summary): the
+    /// selected configuration's output folder, or the IPTS default. Shown
+    /// in the footer.
     output_base: Option<PathBuf>,
     /// Detector name handed to the TIFF viewer (`--detector`, e.g. `tpx1`)
     /// so every stack opens in the right orientation — normalized folders
-    /// (`Run_<run>/normalization`) carry no detector in their path for the
-    /// viewer to guess from. From the configuration, else the IPTS layout.
+    /// (`<corrected folder name>/normalization`) carry no detector in
+    /// their path for the viewer to guess from. From the configuration, else the IPTS layout.
     detector: Option<String>,
     /// Live mode: every run the table has shown this session. Rows are
     /// never dropped when a new run lands (the windows slide, the table
@@ -1033,8 +1035,15 @@ impl MonitorApp {
             if Some(&config) != self.selected_config.as_ref() {
                 self.config_infos.insert(config.clone(), info.clone());
             }
-            // The row's own settings (✏) decide where its result lives.
-            let output = norm::run_output_dir(&ipts_path, run, &self.effective_info(run, &info));
+            // The row's own settings (✏) decide where its result lives;
+            // the row folder is named after the run's corrected folder.
+            let corrected = self.corrected_folder(run);
+            let output = norm::run_output_dir(
+                &ipts_path,
+                run,
+                corrected.as_deref(),
+                &self.effective_info(run, &info),
+            );
             if norm::output_is_done(&output) {
                 let finished = std::fs::metadata(&output)
                     .and_then(|m| m.modified())
@@ -1322,7 +1331,28 @@ impl MonitorApp {
         let ipts_path = self.ipts_path()?;
         let config = self.config_for_run(run)?;
         let info = h5::read_config_info(&config).ok()?;
-        Some(norm::run_output_dir(&ipts_path, run, &self.effective_info(run, &info)))
+        let corrected = self.corrected_folder(run);
+        Some(norm::run_output_dir(
+            &ipts_path,
+            run,
+            corrected.as_deref(),
+            &self.effective_info(run, &info),
+        ))
+    }
+
+    /// A run's corrected (input) folder as the table knows it — complete
+    /// or still being written — which names the run's row folder under
+    /// the output base. `None` before the autoreduction created it.
+    fn corrected_folder(&self, run: u64) -> Option<PathBuf> {
+        self.run_files
+            .iter()
+            .find(|rf| rf.run == run)
+            .and_then(|rf| match &rf.corrected {
+                files::FileStatus::Present(folder) | files::FileStatus::Writing(folder) => {
+                    Some(folder.clone())
+                }
+                files::FileStatus::Missing(_) => None,
+            })
     }
 
     /// "↻ re-run" on a normalized row (or "Apply & re-run" in the run
@@ -1803,7 +1833,7 @@ impl MonitorApp {
             if ui.button("📂 Browse…").clicked() {
                 let mut dialog = rfd::FileDialog::new().set_title(format!(
                     "Output folder for run {run} (the result goes to \
-                     Run_{run}/normalization inside it)"
+                     <corrected folder name>/normalization inside it)"
                 ));
                 let start = Path::new(editor.output_text.trim());
                 if start.is_dir() {
@@ -1826,7 +1856,9 @@ impl MonitorApp {
             }
         });
         ui.label(
-            egui::RichText::new(format!("The result goes to <folder>/Run_{run}/normalization"))
+            egui::RichText::new(
+                "The result goes to <folder>/<corrected folder name of the run>/normalization",
+            )
                 .color(dim)
                 .small(),
         );
@@ -3811,7 +3843,7 @@ impl MonitorApp {
                             );
                             ui.label(theme::section_heading("Output")).on_hover_text(
                                 "The output folder each result lands in \
-                                 (<folder>/Run_<run>/normalization): the result's own \
+                                 (<folder>/<corrected folder name>/normalization): the result's own \
                                  for a normalized run, the configuration's (dimmed) for \
                                  a run still to come. ✏ overrides it for one run",
                             );
@@ -4335,7 +4367,7 @@ impl MonitorApp {
                 ui.label(egui::RichText::new(Self::short_name(&folder)).color(theme::INFO))
                     .on_hover_text(format!(
                         "Output folder chosen for this run (✏) — the result goes to \
-                         Run_<run>/normalization in there\n{}",
+                         <corrected folder name>/normalization in there\n{}",
                         folder.display()
                     ));
             }
@@ -4343,7 +4375,7 @@ impl MonitorApp {
                 ui.label(egui::RichText::new(Self::short_name(base)).color(dim))
                     .on_hover_text(format!(
                         "The configuration's output folder — the result goes to \
-                         Run_<run>/normalization in there\n{}",
+                         <corrected folder name>/normalization in there\n{}",
                         base.display()
                     ));
             }
@@ -4447,7 +4479,8 @@ impl MonitorApp {
     }
 
     /// "Output" cell of one row: the base folder the run's result sits
-    /// in (`<here>/Run_<run>/normalization`), else where it will go.
+    /// in (`<here>/<corrected folder name>/normalization`), else where it
+    /// will go.
     fn output_cell(&self, ui: &mut egui::Ui, run: u64, kind: h5::RunKind) {
         let dim = theme::text_emphasis(ui.visuals());
         if kind != h5::RunKind::Sample {
@@ -4456,7 +4489,7 @@ impl MonitorApp {
         }
         match self.run_meta.get(&run).and_then(|m| m.output.as_ref()) {
             Some(output) => {
-                // `<base>/Run_<run>/normalization` → show `<base>`.
+                // `<base>/<row>/normalization` → show `<base>`.
                 let base = output
                     .parent()
                     .and_then(|row| row.parent())
@@ -4478,8 +4511,9 @@ impl MonitorApp {
     }
 
     /// Footer: where the normalized data lands, with a shortcut to the
-    /// folder. The per-run results go to `<output folder>/Run_<run>/
-    /// normalization`, the output folder coming from the configuration.
+    /// folder. The per-run results go to `<output folder>/<corrected
+    /// folder name>/normalization`, the output folder coming from the
+    /// configuration, which also holds the `autoreduction.log` summary.
     fn output_footer(&mut self, ui: &mut egui::Ui) {
         if self.ipts.is_none() {
             return;
@@ -4496,8 +4530,11 @@ impl MonitorApp {
                     )
                     .on_hover_text(
                         "The configuration file's output folder — each run goes to \
-                         Run_<run>/normalization in there (rolling windows: \
-                         <IPTS>/shared/autoreduce/normalized/rolling)",
+                         <corrected folder name>/normalization in there (rolling \
+                         windows: <IPTS>/shared/autoreduce/normalized/rolling), and \
+                         autoreduction.log at its top summarizes every normalization \
+                         as it runs: sample, open beams, configuration and settings, \
+                         output folder, start and end times",
                     );
                     let exists = base.is_dir();
                     let button = ui.add_enabled(exists, egui::Button::new("📂 open folder"));
@@ -4514,6 +4551,25 @@ impl MonitorApp {
                     };
                     if button.clicked() {
                         open = Some(base.clone());
+                    }
+                    let summary = base.join(norm::SUMMARY_LOG);
+                    let exists = summary.is_file();
+                    let button = ui.add_enabled(exists, egui::Button::new("📄 autoreduction.log"));
+                    let button = if exists {
+                        button.on_hover_text(format!(
+                            "Open the summary log: one block per normalization as it \
+                             runs — sample, open beams, configuration and settings, \
+                             output folder, start and end times\n{}",
+                            summary.display()
+                        ))
+                    } else {
+                        button.on_disabled_hover_text(
+                            "The summary log does not exist yet — written by the first \
+                             normalization",
+                        )
+                    };
+                    if button.clicked() {
+                        open = Some(summary);
                     }
                 }
                 None => {

@@ -177,6 +177,14 @@ pub struct ConfigInfo {
     /// The detector the data came from (root attribute `detector`, e.g.
     /// `tpx1`) — decides the display orientation in the TIFF viewer.
     pub detector: Option<String>,
+    /// The normalization settings, as `(name, value)` text pairs sorted by
+    /// name: every attribute of the `normalization` group (mode, inpaint,
+    /// proton_charge, match_background, tof_binning_mode,
+    /// distance_source_detector_m, crop_region, …) plus a summary of the
+    /// TOF ranges and of the background mask. Written to the
+    /// `autoreduction.log` summary of every normalization, so a result can
+    /// be traced back to what produced it.
+    pub parameters: Vec<(String, String)>,
 }
 
 /// Read the open-beam entries, crop flag and output folder of a
@@ -204,12 +212,114 @@ pub fn read_config_info(path: &Path) -> Result<ConfigInfo, String> {
     };
     let output_folder = root_string("output_folder").map(PathBuf::from);
     let detector = root_string("detector");
+    let parameters = file
+        .group("normalization")
+        .ok()
+        .map(|g| normalization_parameters(&g))
+        .unwrap_or_default();
     Ok(ConfigInfo {
         ob_folders,
         crop_region,
         output_folder,
         detector,
+        parameters,
     })
+}
+
+/// A number as the summary log prints it: integers without a decimal
+/// point, others rounded to 6 decimals (`340.16`, not `340.15999999999997`).
+fn number_text(x: f64) -> String {
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        format!("{}", x as i64)
+    } else {
+        format!("{}", (x * 1e6).round() / 1e6)
+    }
+}
+
+/// One attribute or dataset of a configuration file as text, whatever
+/// its HDF5 type: strings, numbers (`25`, `0.5`), booleans (`true` —
+/// h5py writes Python bools as a FALSE/TRUE enum), lists of numbers
+/// (`[0, 0, 512, 512]`). `None` for a type this tool does not read.
+fn value_text(c: &h5::Container) -> Option<String> {
+    use TypeDescriptor::*;
+    match c.dtype().and_then(|d| d.to_descriptor()).ok()? {
+        Boolean => c.read_raw::<bool>().ok().and_then(|v| v.first().map(|b| b.to_string())),
+        Float(_) | Integer(_) | Unsigned(_) => {
+            let values = read_f64s(c)?;
+            Some(match values.as_slice() {
+                [x] => number_text(*x),
+                many => format!(
+                    "[{}]",
+                    many.iter().map(|x| number_text(*x)).collect::<Vec<_>>().join(", ")
+                ),
+            })
+        }
+        _ => read_strings(c).map(|v| v.join(", ")),
+    }
+}
+
+/// The `(name, value)` text of every attribute of the `normalization`
+/// group, sorted by name, plus `tof_ranges_us` (how many ranges are
+/// enabled and which — listed when few, else their span — and the
+/// disabled ones) and `background_mask` (the count of selected pixels)
+/// when those datasets exist.
+fn normalization_parameters(group: &h5::Group) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = group
+        .attr_names()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|name| {
+            let attr = group.attr(&name).ok()?;
+            let value = value_text(&attr)?;
+            Some((name, value))
+        })
+        .collect();
+    out.sort();
+    let ranges = group.dataset("tof_ranges_us").ok().and_then(|d| read_f64s(&d));
+    if let Some(ranges) = ranges.filter(|v| v.len() % 2 == 0) {
+        let count = ranges.len() / 2;
+        let enabled = group
+            .dataset("tof_ranges_enabled")
+            .ok()
+            .and_then(|d| read_f64s(&d))
+            .filter(|v| v.len() == count)
+            .unwrap_or_else(|| vec![1.0; count]);
+        let range_text = |r: &[f64]| format!("[{}, {}]", number_text(r[0]), number_text(r[1]));
+        let pick = |want_enabled: bool| -> Vec<&[f64]> {
+            ranges
+                .chunks(2)
+                .zip(&enabled)
+                .filter(|(_, e)| (**e != 0.0) == want_enabled)
+                .map(|(r, _)| r)
+                .collect()
+        };
+        let (on, off) = (pick(true), pick(false));
+        let list = |ranges: &[&[f64]]| -> String {
+            if ranges.len() <= 8 {
+                ranges.iter().map(|r| range_text(r)).collect::<Vec<_>>().join(", ")
+            } else {
+                let lo = ranges.iter().map(|r| r[0]).fold(f64::INFINITY, f64::min);
+                let hi = ranges.iter().map(|r| r[1]).fold(f64::NEG_INFINITY, f64::max);
+                format!("spanning {} to {} µs", number_text(lo), number_text(hi))
+            }
+        };
+        let mut text = format!("{} of {count} enabled", on.len());
+        if !on.is_empty() {
+            text.push_str(&format!(": {}", list(&on)));
+        }
+        if !off.is_empty() {
+            text.push_str(&format!(" — disabled: {}", list(&off)));
+        }
+        out.push(("tof_ranges_us".to_owned(), text));
+    }
+    if let Some(mask) = group.dataset("background_mask").ok().and_then(|d| read_f64s(&d)) {
+        let selected = mask.iter().filter(|x| **x != 0.0).count();
+        out.push((
+            "background_mask".to_owned(),
+            format!("{selected} of {} px selected", mask.len()),
+        ));
+    }
+    out
 }
 
 /// Write a copy of the configuration `src` at `dst` with its open beams
@@ -598,5 +708,23 @@ mod tests {
             Some(PathBuf::from("/SNS/VENUS/IPTS-36967/shared/jean"))
         );
         assert_eq!(info.detector.as_deref(), Some("tpx1"));
+        // The settings, as text, for the autoreduction.log summary: bools
+        // (h5py enum), numbers, strings, and the TOF-range summary.
+        let get = |name: &str| {
+            info.parameters
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no parameter {name} in {:?}", info.parameters))
+        };
+        assert_eq!(get("match_background"), "false");
+        assert_eq!(get("proton_charge"), "true");
+        assert_eq!(get("distance_source_detector_m"), "25");
+        assert_eq!(get("tof_binning_mode"), "Manual");
+        assert!(get("tof_ranges_us").contains("of 80 enabled"), "{}", get("tof_ranges_us"));
+        let names: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+        let mut sorted = names[..names.len() - 1].to_vec();
+        sorted.sort_unstable();
+        assert_eq!(names[..names.len() - 1], sorted[..]);
     }
 }
