@@ -12,6 +12,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::logger;
+
 /// The notebook used to create/edit normalization configuration files.
 pub const NOTEBOOK_PATH: &str =
     "/SNS/VENUS/shared/software/git/marimo_notebooks/notebooks/normalization_tof_at_venus_marimo.py";
@@ -126,6 +128,7 @@ pub fn launch(ipts_path: &Path, config: Option<&Path>) -> Result<String, String>
     if let Some(config) = config {
         command.env(CONFIG_ENV, config);
     }
+    logger::log(format!("Launching marimo: {command:?}"));
     let mut child = command
         .spawn()
         .map_err(|e| format!("failed to launch {MARIMO_BIN}: {e}"))?;
@@ -142,6 +145,7 @@ pub fn launch(ipts_path: &Path, config: Option<&Path>) -> Result<String, String>
             let mut launched = false;
             for line in reader.lines().map_while(Result::ok) {
                 println!("{line}");
+                logger::log(format!("marimo: {line}"));
                 if !launched {
                     if let Some(start) = line.find("http://") {
                         let url: String = line[start..]
@@ -149,7 +153,10 @@ pub fn launch(ipts_path: &Path, config: Option<&Path>) -> Result<String, String>
                             .take_while(|c| !c.is_whitespace())
                             .collect();
                         println!("Opening {url} in firefox");
-                        let _ = Command::new("firefox").arg(&url).spawn();
+                        logger::log(format!("Opening {url} in firefox"));
+                        if let Err(e) = Command::new("firefox").arg(&url).spawn() {
+                            logger::error(format!("Cannot launch firefox for {url}: {e}"));
+                        }
                         launched = true;
                     }
                 }

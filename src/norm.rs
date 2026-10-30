@@ -6,11 +6,13 @@
 //!   when auto normalization is ON (as soon as its detector-corrected
 //!   folder shows up), on demand for older runs. Output goes under the
 //!   configuration's output folder, in a folder named after the run's
-//!   corrected (input) folder: `<config output folder>/<corrected folder
-//!   name>/normalization` (`<IPTS>/shared/autoreduce/normalized/…` when
-//!   the configuration names no output folder). A result the workflow
-//!   runner or an older version of this tool left in the legacy layout
-//!   (`Run_<run>/normalization`) is found there and not redone.
+//!   corrected (input) folder, the result folder itself carrying that
+//!   name again: `<config output folder>/<corrected folder name>/
+//!   normalized_<corrected folder name>` (`<IPTS>/shared/autoreduce/
+//!   normalized/…` when the configuration names no output folder). A
+//!   result the workflow runner or an older version of this tool left in
+//!   a legacy layout (`<corrected folder name>/normalization`,
+//!   `Run_<run>/normalization`) is found there and not redone.
 //! - **Combined series** (opt-in `combine_consecutive` flag): consecutive
 //!   sample runs acquired with the same settings — same acquisition name
 //!   (title, setpoint, chopper setting from the folder name), same
@@ -19,7 +21,7 @@
 //!   together: each new run of the series is combined with the runs of
 //!   the series before it (1234 alone; then 1234+1235; then
 //!   1234+1235+1236, …). Output: `<output base>/<first run's corrected
-//!   folder name with Run_<first>_to_<last>>/normalization`.
+//!   folder name with Run_<first>_to_<last>>/normalized_<that name>`.
 //! - **Rolling windows**: the runs acquired within the last N minutes
 //!   (acquisition time from the NeXus `end_time`) normalized together, one
 //!   job per time window. Output:
@@ -37,7 +39,7 @@
 //! (see [`SUMMARY_LOG`]), written live: the start block when the job
 //! launches, the end line when it finishes.
 
-use crate::{files, h5};
+use crate::{files, h5, logger};
 use chrono::{DateTime, FixedOffset};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -286,9 +288,23 @@ pub fn group_row_name(runs: &[u64], first_corrected: Option<&Path>) -> String {
     }
 }
 
+/// Name of the result folder inside a row folder: `normalized_<row folder
+/// name>` (`normalized_20260921_Run_30340_sample_3_000AngsMin_0`). The
+/// result folder carries the row's name so that many results opened
+/// together in the TIFF viewer do not all show up as "normalization".
+pub fn result_folder_name(row: &str) -> String {
+    format!("normalized_{row}")
+}
+
+/// The result folder name every result used before 2026-09-28 (this tool
+/// and the workflow runner alike).
+pub const LEGACY_RESULT_FOLDER: &str = "normalization";
+
 /// Output folder of a combined series' normalization: `<output base>/
-/// <group row name>/normalization` (see [`group_row_name`]); one run is
-/// [`run_output_dir`], legacy fallback included.
+/// <group row name>/normalized_<group row name>` (see [`group_row_name`],
+/// [`result_folder_name`]); a series already normalized into the legacy
+/// `<group row name>/normalization` is found there. One run is
+/// [`run_output_dir`], legacy fallbacks included.
 pub fn group_output_dir(
     ipts_path: &Path,
     runs: &[u64],
@@ -297,18 +313,21 @@ pub fn group_output_dir(
 ) -> PathBuf {
     match runs {
         [run] => run_output_dir(ipts_path, *run, first_corrected, config_info),
-        _ => output_base(ipts_path, config_info)
-            .join(group_row_name(runs, first_corrected))
-            .join("normalization"),
+        _ => {
+            let row_dir =
+                output_base(ipts_path, config_info).join(group_row_name(runs, first_corrected));
+            result_dir(&row_dir, &[])
+        }
     }
 }
 
 /// Output folder of one run's own normalization: `<output base>/<corrected
-/// folder name>/normalization` (see [`run_row_name`]). A complete result
-/// left in the legacy layout — `<output base>/Run_<run>/normalization`, the
-/// workflow runner's and this tool's before 2026-09-24 — is returned
-/// instead when nothing sits at the new place, so it is found and never
-/// redone.
+/// folder name>/normalized_<corrected folder name>` (see [`run_row_name`],
+/// [`result_folder_name`]). A complete result left in a legacy layout —
+/// `<corrected folder name>/normalization` (this tool between 2026-09-24
+/// and 2026-09-28), or `Run_<run>/normalization` (the workflow runner's
+/// and this tool's before 2026-09-24) — is returned instead when nothing
+/// sits at the new place, so it is found and never redone.
 pub fn run_output_dir(
     ipts_path: &Path,
     run: u64,
@@ -317,11 +336,26 @@ pub fn run_output_dir(
 ) -> PathBuf {
     let base = output_base(ipts_path, config_info);
     let row = run_row_name(run, corrected);
-    let output = base.join(&row).join("normalization");
     let legacy_row = format!("Run_{run}");
-    if row != legacy_row && !output_is_done(&output) {
-        let legacy = base.join(legacy_row).join("normalization");
-        if output_is_done(&legacy) {
+    let legacy_rows: &[PathBuf] = if row != legacy_row { &[base.join(legacy_row)] } else { &[] };
+    result_dir(&base.join(&row), legacy_rows)
+}
+
+/// `<row dir>/normalized_<row name>`, unless nothing complete sits there
+/// and a complete legacy result does: in `<row dir>/normalization`, or in
+/// the `normalization` folder of one of `legacy_row_dirs` (in order).
+fn result_dir(row_dir: &Path, legacy_row_dirs: &[PathBuf]) -> PathBuf {
+    let row = row_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let output = row_dir.join(result_folder_name(&row));
+    if !output_is_done(&output) {
+        let legacy = std::iter::once(row_dir)
+            .chain(legacy_row_dirs.iter().map(PathBuf::as_path))
+            .map(|dir| dir.join(LEGACY_RESULT_FOLDER))
+            .find(|dir| output_is_done(dir));
+        if let Some(legacy) = legacy {
             return legacy;
         }
     }
@@ -352,7 +386,7 @@ pub struct JobSpec {
     /// (corrected folder, NeXus file) per open-beam run.
     obs: Vec<(PathBuf, PathBuf)>,
     config: PathBuf,
-    /// Final result folder (`<row>/normalization`, or a window's folder).
+    /// Final result folder (`<row>/normalized_<row>`, or a window's folder).
     output: PathBuf,
     /// The job's log file (`<row>/logs/<name>.log`).
     pub log: PathBuf,
@@ -654,8 +688,51 @@ pub fn killed_by_system(message: &str) -> bool {
 /// arrive on `tx` as [`JobMessage`]s. The job stages into
 /// `<output>.partial` and promotes to `<output>` on success.
 pub fn launch(spec: JobSpec, tx: Sender<JobMessage>) {
+    logger::log(format!(
+        "Normalization started: {} — configuration {}, {} sample folder(s), open beams: {}, \
+         output {}, job log {}",
+        spec.what,
+        spec.config.display(),
+        spec.samples.len(),
+        if spec.obs.is_empty() {
+            "none".to_owned()
+        } else {
+            spec.obs
+                .iter()
+                .map(|(folder, _)| folder.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+        spec.output.display(),
+        spec.log.display()
+    ));
+    logger::log(format!(
+        "Normalization settings of {}: {}{}",
+        spec.what,
+        spec.parameters
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        match &spec.crop {
+            Some(((x0, y0, x1, y1), _)) => format!(", pre-crop (x0, y0, x1, y1)=({x0}, {y0}, {x1}, {y1})"),
+            None => String::new(),
+        }
+    ));
     std::thread::spawn(move || {
         let result = run_job(&spec, &tx);
+        match &result {
+            Ok(output) => logger::log(format!(
+                "Normalization finished: {} → {}",
+                spec.what,
+                output.display()
+            )),
+            Err(message) => logger::error(format!(
+                "Normalization failed: {} — {message}\njob log: {}",
+                spec.what,
+                spec.log.display()
+            )),
+        }
         let _ = tx.send(JobMessage::Finished {
             target: spec.target,
             runs: spec.runs.clone(),
@@ -685,12 +762,15 @@ impl Log {
 
     fn line(&self, msg: &str) {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
         {
-            let _ = writeln!(f, "[{}] {msg}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"));
+            Ok(mut f) => {
+                let _ = writeln!(f, "[{}] {msg}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"));
+            }
+            Err(e) => logger::warn(format!("Cannot write the job log {}: {e}", self.path.display())),
         }
     }
 
@@ -794,12 +874,13 @@ fn append_summary(path: &Path, text: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let written = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-    {
-        let _ = f.write_all(text.as_bytes());
+        .and_then(|mut f| f.write_all(text.as_bytes()));
+    if let Err(e) = written {
+        logger::warn(format!("Cannot append to the summary log {}: {e}", path.display()));
     }
 }
 
@@ -1230,20 +1311,21 @@ mod tests {
         assert_eq!(
             run_output_dir(ipts, 23642, Some(corrected), &with_folder),
             PathBuf::from(
-                "/SNS/VENUS/IPTS-1/shared/jean/20260921_Run_23642_x_3_000AngsMin_0/normalization"
+                "/SNS/VENUS/IPTS-1/shared/jean/20260921_Run_23642_x_3_000AngsMin_0/\
+                 normalized_20260921_Run_23642_x_3_000AngsMin_0"
             )
         );
         // No corrected folder known (yet): the run number stands in.
         assert_eq!(
             run_output_dir(ipts, 23642, None, &with_folder),
-            PathBuf::from("/SNS/VENUS/IPTS-1/shared/jean/Run_23642/normalization")
+            PathBuf::from("/SNS/VENUS/IPTS-1/shared/jean/Run_23642/normalized_Run_23642")
         );
         // No output folder in the configuration: the IPTS default.
         assert_eq!(
             run_output_dir(ipts, 23642, Some(corrected), &config_info(None)),
             PathBuf::from(
                 "/SNS/VENUS/IPTS-1/shared/autoreduce/normalized/\
-                 20260921_Run_23642_x_3_000AngsMin_0/normalization"
+                 20260921_Run_23642_x_3_000AngsMin_0/normalized_20260921_Run_23642_x_3_000AngsMin_0"
             )
         );
         assert_eq!(run_row_name(7, None), "Run_7");
@@ -1257,8 +1339,9 @@ mod tests {
         let info = config_info(base.to_str());
         let ipts = Path::new("/SNS/VENUS/IPTS-1");
         let corrected = Path::new("/x/20260101_Run_9_s_0");
-        let fresh = base.join("20260101_Run_9_s_0/normalization");
+        let fresh = base.join("20260101_Run_9_s_0/normalized_20260101_Run_9_s_0");
         let legacy = base.join("Run_9/normalization");
+        let row_legacy = base.join("20260101_Run_9_s_0/normalization");
         // Nothing on disk: the new layout.
         assert_eq!(run_output_dir(ipts, 9, Some(corrected), &info), fresh);
         // A complete result in the legacy layout is found there.
@@ -1268,8 +1351,13 @@ mod tests {
         // An empty legacy folder does not count.
         std::fs::remove_file(legacy.join("img_0000.tiff")).unwrap();
         assert_eq!(run_output_dir(ipts, 9, Some(corrected), &info), fresh);
-        // A complete result at the new place wins over a legacy one.
+        // A complete `<row>/normalization` (2026-09-24 … 2026-09-28) is
+        // found too, and wins over the `Run_<run>` one.
         std::fs::write(legacy.join("img_0000.tiff"), b"").unwrap();
+        std::fs::create_dir_all(&row_legacy).unwrap();
+        std::fs::write(row_legacy.join("img_0000.tiff"), b"").unwrap();
+        assert_eq!(run_output_dir(ipts, 9, Some(corrected), &info), row_legacy);
+        // A complete result at the new place wins over every legacy one.
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::write(fresh.join("img_0000.tiff"), b"").unwrap();
         assert_eq!(run_output_dir(ipts, 9, Some(corrected), &info), fresh);
@@ -1316,11 +1404,17 @@ mod tests {
         let info = config_info(Some("/out"));
         assert_eq!(
             group_output_dir(Path::new("/SNS/VENUS/IPTS-1"), &[30340, 30341], Some(first), &info),
-            PathBuf::from("/out/20260921_Run_30340_to_30341_reptRib_PFV468_2_900C_3_000AngsMin_0/normalization")
+            PathBuf::from(
+                "/out/20260921_Run_30340_to_30341_reptRib_PFV468_2_900C_3_000AngsMin_0/\
+                 normalized_20260921_Run_30340_to_30341_reptRib_PFV468_2_900C_3_000AngsMin_0"
+            )
         );
         assert_eq!(
             group_output_dir(Path::new("/SNS/VENUS/IPTS-1"), &[30340], Some(first), &info),
-            PathBuf::from("/out/20260921_Run_30340_reptRib_PFV468_2_900C_3_000AngsMin_0/normalization")
+            PathBuf::from(
+                "/out/20260921_Run_30340_reptRib_PFV468_2_900C_3_000AngsMin_0/\
+                 normalized_20260921_Run_30340_reptRib_PFV468_2_900C_3_000AngsMin_0"
+            )
         );
     }
 
@@ -1348,7 +1442,7 @@ mod tests {
                 (PathBuf::from("/c/ob/Run_30339_ob_0"), PathBuf::from("/n/VENUS_30339.nxs.h5")),
             ],
             config: PathBuf::from("/cfg/normalization_config_x.h5"),
-            output: root.join("20260921_Run_30340_s_0/normalization"),
+            output: root.join("20260921_Run_30340_s_0/normalized_20260921_Run_30340_s_0"),
             log: root.join("20260921_Run_30340_s_0/logs/normalization.log"),
             summary: root.join(SUMMARY_LOG),
             what: "Run 30340".to_owned(),
@@ -1439,7 +1533,7 @@ mod tests {
         let spec =
             prepare_group_job(&[(run, corrected.clone())], ipts_path, config, &info).unwrap();
         let row = corrected.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(spec.output, base.join(&row).join("normalization"));
+        assert_eq!(spec.output, base.join(&row).join(format!("normalized_{row}")));
         assert_eq!(spec.summary, base.join(SUMMARY_LOG));
         assert_eq!(spec.log, base.join(&row).join("logs/normalization.log"));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1504,7 +1598,7 @@ mod tests {
         let first = members[0].1.file_name().unwrap().to_string_lossy().into_owned();
         let row = first.replacen("Run_23641", "Run_23641_to_23642", 1);
         assert_ne!(row, first);
-        assert_eq!(spec.output, base.join(&row).join("normalization"));
+        assert_eq!(spec.output, base.join(&row).join(format!("normalized_{row}")));
         let (tx, _rx) = std::sync::mpsc::channel();
         let output = run_job(&spec, &tx).unwrap_or_else(|e| {
             panic!(

@@ -34,6 +34,7 @@
 mod config;
 mod files;
 mod h5;
+mod logger;
 mod norm;
 mod notebook;
 mod theme;
@@ -145,6 +146,16 @@ fn resolve_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(CONFIG_PATHS[0]))
 }
 
+/// Show an error in the UI (`slot`) and record it in the application log
+/// — once: the same message set again on the next refresh (a failure
+/// that persists) is not repeated.
+fn set_error(slot: &mut Option<String>, what: &str, message: String) {
+    if slot.as_deref() != Some(message.as_str()) {
+        logger::error(format!("{what}: {message}"));
+    }
+    *slot = Some(message);
+}
+
 /// A static logo image loaded into a texture, plus its aspect ratio for sizing.
 struct Logo {
     texture: egui::TextureHandle,
@@ -186,7 +197,7 @@ struct RunMeta {
     dropped_obs: Vec<PathBuf>,
     /// The configuration file (settings) it runs with.
     config: Option<PathBuf>,
-    /// Its result folder (`…/<corrected folder name>/normalization`).
+    /// Its result folder (`…/<corrected folder name>/normalized_<corrected folder name>`).
     output: Option<PathBuf>,
 }
 
@@ -196,7 +207,7 @@ struct RunMeta {
 struct RunOverride {
     obs: Option<Vec<PathBuf>>,
     /// Output base folder: the result goes to `<here>/<corrected folder
-    /// name>/normalization`.
+    /// name>/normalized_<corrected folder name>`.
     output: Option<PathBuf>,
     /// Configuration file (the Config drop-down): this run is normalized
     /// with it instead of the section 2 selection — its open beams,
@@ -378,13 +389,13 @@ struct MonitorApp {
     /// looked up with — its output folder decides where results live.
     run_jobs_config: Option<PathBuf>,
     /// Where the per-run normalized data lands (`<here>/<corrected folder
-    /// name>/normalization`, plus the `autoreduction.log` summary): the
+    /// name>/normalized_<corrected folder name>`, plus the `autoreduction.log` summary): the
     /// selected configuration's output folder, or the IPTS default. Shown
     /// in the footer.
     output_base: Option<PathBuf>,
     /// Detector name handed to the TIFF viewer (`--detector`, e.g. `tpx1`)
     /// so every stack opens in the right orientation — normalized folders
-    /// (`<corrected folder name>/normalization`) carry no detector in
+    /// (`<corrected folder name>/normalized_<corrected folder name>`) carry no detector in
     /// their path for the viewer to guess from. From the configuration, else the IPTS layout.
     detector: Option<String>,
     /// Live mode: every run the table has shown this session. Rows are
@@ -493,6 +504,26 @@ impl MonitorApp {
             refresh_secs: DEFAULT_REFRESH_SECS,
         };
         app.refresh();
+        match &app.cfg {
+            Ok(cfg) => logger::log(format!(
+                "Shared configuration {}: auto normalization {}, ipts {}, configuration file {}",
+                app.cfg_path.display(),
+                if cfg.activate { "ON" } else { "OFF" },
+                cfg.get("ipts").unwrap_or("?"),
+                cfg.get("user_autoreduction_config_file").unwrap_or("?")
+            )),
+            Err(e) => logger::warn(format!(
+                "Shared configuration {} not readable: {e}",
+                app.cfg_path.display()
+            )),
+        }
+        match &app.ipts_list {
+            Ok(list) => logger::log(format!(
+                "{} accessible IPTS folder(s) under {IPTS_ROOT}",
+                list.len()
+            )),
+            Err(e) => logger::error(format!("Cannot list IPTS: {e}")),
+        }
         // Convenience: pre-select the IPTS the shared configuration points
         // at. The configuration file defaults to the newest one of the
         // IPTS (select_ipts) — the file the notebook saved last is the one
@@ -506,6 +537,10 @@ impl MonitorApp {
                 app.select_ipts(ipts);
                 if app.selected_config.is_none() {
                     if let Some(file) = registered {
+                        logger::log(format!(
+                            "Configuration registered in autoreduction.cfg selected: {}",
+                            file.display()
+                        ));
                         app.selected_config = Some(file);
                         app.keep_selected_config();
                     }
@@ -521,6 +556,7 @@ impl MonitorApp {
 
     /// Make `ipts` the selected experiment and rescan what depends on it.
     fn select_ipts(&mut self, ipts: String) {
+        logger::log(format!("IPTS selected: {ipts}"));
         self.ipts = Some(ipts);
         self.manual_ipts_error = None;
         self.launch_status = None;
@@ -603,13 +639,22 @@ impl MonitorApp {
             .unwrap_or_else(|| "tpx1".to_owned());
         match h5::write_default_config(&path, &ipts, &detector, &output) {
             Ok(()) => {
+                logger::log(format!(
+                    "Default configuration written: {} (detector {detector}, output {})",
+                    path.display(),
+                    output.display()
+                ));
                 self.default_config_error = None;
                 self.selected_config = Some(path);
                 self.preview_error = None;
                 self.keep_selected_config();
             }
             Err(e) => {
-                self.default_config_error = Some(e);
+                set_error(
+                    &mut self.default_config_error,
+                    "Cannot write the default configuration",
+                    e,
+                );
                 self.use_default_config = false;
             }
         }
@@ -623,17 +668,27 @@ impl MonitorApp {
             .trim_start_matches("IPTS-")
             .trim_start_matches("ipts-");
         if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
-            self.manual_ipts_error =
-                Some(format!("'{typed}' is not an IPTS number (e.g. 36967)"));
+            set_error(
+                &mut self.manual_ipts_error,
+                "Manual IPTS entry",
+                format!("'{typed}' is not an IPTS number (e.g. 36967)"),
+            );
             return;
         }
         let name = format!("IPTS-{number}");
         let path = Path::new(IPTS_ROOT).join(&name);
         if !path.is_dir() {
-            self.manual_ipts_error = Some(format!("{} does not exist", path.display()));
+            set_error(
+                &mut self.manual_ipts_error,
+                "Manual IPTS entry",
+                format!("{} does not exist", path.display()),
+            );
         } else if !can_access(&path) {
-            self.manual_ipts_error =
-                Some(format!("no permission to access {}", path.display()));
+            set_error(
+                &mut self.manual_ipts_error,
+                "Manual IPTS entry",
+                format!("no permission to access {}", path.display()),
+            );
         } else {
             self.select_ipts(name);
         }
@@ -643,7 +698,9 @@ impl MonitorApp {
     /// and `shared/autoreduce/configs/*.h5`), newest first.
     fn rescan_configs(&mut self) {
         self.configs.clear();
-        self.configs_error = None;
+        // Kept aside so a scan failure repeated on every refresh is logged
+        // once (set_error).
+        let previous_error = self.configs_error.take();
         let Some(ipts_path) = self.ipts_path() else {
             return;
         };
@@ -675,10 +732,15 @@ impl MonitorApp {
             }
         }
         if !readable {
-            self.configs_error = Some(format!(
-                "cannot read {} (nor its configs/ subfolder)",
-                autoreduce.display()
-            ));
+            self.configs_error = previous_error;
+            set_error(
+                &mut self.configs_error,
+                "Configuration folder scan",
+                format!(
+                    "cannot read {} (nor its configs/ subfolder)",
+                    autoreduce.display()
+                ),
+            );
             return;
         }
         self.configs.sort_by(|a, b| b.mtime.cmp(&a.mtime));
@@ -709,7 +771,13 @@ impl MonitorApp {
                     mtime,
                 });
             }
-            _ => self.selected_config = None,
+            _ => {
+                logger::warn(format!(
+                    "Selected configuration no longer on disk, selection dropped: {}",
+                    selected.display()
+                ));
+                self.selected_config = None;
+            }
         }
     }
 
@@ -729,10 +797,14 @@ impl MonitorApp {
         } else {
             dialog = dialog.set_directory(&ipts_path);
         }
-        if let Some(path) = dialog.pick_file() {
-            self.selected_config = Some(path);
-            self.preview_error = None;
-            self.keep_selected_config();
+        match dialog.pick_file() {
+            Some(path) => {
+                logger::log(format!("Browse configuration: picked {}", path.display()));
+                self.selected_config = Some(path);
+                self.preview_error = None;
+                self.keep_selected_config();
+            }
+            None => logger::log("Browse configuration: dialog cancelled"),
         }
     }
 
@@ -894,6 +966,10 @@ impl MonitorApp {
         let info = match h5::read_config_info(&config) {
             Ok(info) => info,
             Err(e) => {
+                logger::error(format!(
+                    "Window normalizations not started: cannot read {}: {e}",
+                    config.display()
+                ));
                 for w in &mut self.windows {
                     w.state = norm::JobState::Failed { message: e.clone(), log: None };
                 }
@@ -915,7 +991,13 @@ impl MonitorApp {
                     self.job_output.remove(&spec.target);
                     norm::launch(spec, self.norm_tx.clone());
                 }
-                Err(message) => self.windows[i].state = norm::JobState::Failed { message, log: None },
+                Err(message) => {
+                    logger::error(format!(
+                        "Window last {} min: normalization not started: {message}",
+                        self.windows[i].minutes
+                    ));
+                    self.windows[i].state = norm::JobState::Failed { message, log: None };
+                }
             }
         }
     }
@@ -958,10 +1040,18 @@ impl MonitorApp {
                         opt_ins,
                     ) {
                         Ok(()) => {
+                            logger::log(format!(
+                                "autoreduction.cfg re-registered with {}",
+                                selected.display()
+                            ));
                             self.write_error = None;
                             self.cfg = config::read(&self.cfg_path);
                         }
-                        Err(e) => self.write_error = Some(e),
+                        Err(e) => set_error(
+                            &mut self.write_error,
+                            "Failed to update the configuration",
+                            e,
+                        ),
                     }
                 }
             }
@@ -982,6 +1072,22 @@ impl MonitorApp {
                 .and_then(|i| i.detector.clone())
                 .or_else(|| Self::detector_from_layout(&ipts_path));
             self.config_obs = info.map(|i| i.ob_folders).unwrap_or_default();
+            if let Some(config) = &self.selected_config {
+                logger::log(format!(
+                    "Configuration in use: {} — output folder {}, detector {}, open beams: {}",
+                    config.display(),
+                    self.output_base
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "?".to_owned()),
+                    self.detector.as_deref().unwrap_or("?"),
+                    if self.config_obs.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        Self::ob_folders_text(&self.config_obs).replace('\n', ", ")
+                    }
+                ));
+            }
         }
         // The per-run automatic pass needs auto normalization ON and the
         // live reduction opted in (shared `live_reduction` flag).
@@ -1030,6 +1136,10 @@ impl MonitorApp {
                 Ok(info) => info.clone(),
                 Err(e) => {
                     // Surface the problem on the run that needs it.
+                    logger::error(format!(
+                        "Run {run}: cannot read configuration {}: {e}",
+                        config.display()
+                    ));
                     self.run_jobs
                         .insert(run, norm::JobState::Failed { message: e.clone(), log: None });
                     continue;
@@ -1054,6 +1164,10 @@ impl MonitorApp {
                     .parent()
                     .map(|row| row.join("logs").join("normalization.log"));
                 let launch = log.and_then(|log| norm::launch_from_log(&log));
+                logger::log(format!(
+                    "Run {run}: result found on disk: {}",
+                    output.display()
+                ));
                 self.run_meta.insert(
                     run,
                     RunMeta {
@@ -1173,6 +1287,7 @@ impl MonitorApp {
                 // Only a run someone asked for explicitly gets the message
                 // (the automatic pass simply retries next refresh).
                 if self.run_jobs_from.is_none_or(|from| run <= from) {
+                    logger::error(format!("Run {run}: normalization not started: {message}"));
                     self.run_jobs
                         .insert(run, norm::JobState::Failed { message, log: None });
                 }
@@ -1192,17 +1307,14 @@ impl MonitorApp {
         info.ob_folders.retain(|f| !dropped.contains(f));
         if info.ob_folders.is_empty() && !dropped.is_empty() {
             self.run_meta.remove(&run);
-            self.run_jobs.insert(
-                run,
-                norm::JobState::Failed {
-                    message: format!(
-                        "no open beam at this run's starting wavelength: {} acquired at \
-                         another one (live open beams) — ⇄ replace by… one that matches",
-                        Self::ob_runs_text(&dropped)
-                    ),
-                    log: None,
-                },
+            let message = format!(
+                "no open beam at this run's starting wavelength: {} acquired at \
+                 another one (live open beams) — ⇄ replace by… one that matches",
+                Self::ob_runs_text(&dropped)
             );
+            logger::error(format!("Run {run}: normalization not started: {message}"));
+            self.run_jobs
+                .insert(run, norm::JobState::Failed { message, log: None });
             return;
         }
         let state = match norm::prepare_group_job(&members, ipts_path, config, &info) {
@@ -1227,6 +1339,7 @@ impl MonitorApp {
                 }
             }
             Err(message) => {
+                logger::error(format!("Run {run}: normalization not started: {message}"));
                 self.run_meta.remove(&run);
                 norm::JobState::Failed { message, log: None }
             }
@@ -1297,6 +1410,10 @@ impl MonitorApp {
     /// running on the run is left alone (the new file applies to its
     /// next run).
     fn set_run_config(&mut self, run: u64, config: Option<PathBuf>) {
+        logger::log(match &config {
+            Some(path) => format!("Run {run}: configuration set to {}", path.display()),
+            None => format!("Run {run}: configuration back to the section 2 selection"),
+        });
         let before = self.config_for_run(run);
         let config = config.filter(|c| Some(c) != self.selected_config.as_ref());
         if let Some(config) = &config {
@@ -1331,6 +1448,10 @@ impl MonitorApp {
         match h5::read_config_info(&config) {
             Ok(info) => self.start_run_job(run, &ipts_path, &config, &info),
             Err(message) => {
+                logger::error(format!(
+                    "Run {run}: cannot read configuration {}: {message}",
+                    config.display()
+                ));
                 self.run_jobs.insert(run, norm::JobState::Failed { message, log: None });
             }
         }
@@ -1378,7 +1499,7 @@ impl MonitorApp {
     /// "↻ re-run" on a normalized row (or "Apply & re-run" in the run
     /// editor): normalize the run again with the row's current settings.
     /// A result sitting where the new one will go is moved aside first as
-    /// `normalization.previous` (an older `.previous` is replaced) — the
+    /// `<result folder>.previous` (an older `.previous` is replaced) — the
     /// job never runs twice into the same folder. The job log keeps the
     /// history (append-only).
     fn rerun_run(&mut self, run: u64) {
@@ -1389,21 +1510,26 @@ impl MonitorApp {
             let output = output.clone();
             if self.planned_output(run).as_ref() == Some(&output) {
                 let previous = output.with_extension("previous");
-                let _ = std::fs::remove_dir_all(&previous);
+                if let Err(e) = std::fs::remove_dir_all(&previous)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    logger::warn(format!("Cannot remove {}: {e}", previous.display()));
+                }
                 if let Err(e) = std::fs::rename(&output, &previous) {
-                    self.run_jobs.insert(
-                        run,
-                        norm::JobState::Failed {
-                            message: format!(
-                                "cannot move the previous result aside ({} → {}): {e}",
-                                output.display(),
-                                previous.display()
-                            ),
-                            log: None,
-                        },
+                    let message = format!(
+                        "cannot move the previous result aside ({} → {}): {e}",
+                        output.display(),
+                        previous.display()
                     );
+                    logger::error(format!("Run {run}: {message}"));
+                    self.run_jobs
+                        .insert(run, norm::JobState::Failed { message, log: None });
                     return;
                 }
+                logger::log(format!(
+                    "Run {run}: previous result moved to {}",
+                    previous.display()
+                ));
             }
         }
         self.normalize_run_now(run);
@@ -1419,8 +1545,14 @@ impl MonitorApp {
             return;
         }
         if self.has_free_job_slot() {
+            logger::log(format!("Run {run}: normalization requested"));
             self.rerun_run(run);
         } else if !self.run_queue.contains(&run) {
+            logger::log(format!(
+                "Run {run}: normalization requested — queued ({} ahead, {} running)",
+                self.run_queue.len(),
+                self.running_run_jobs()
+            ));
             self.run_queue.push_back(run);
         }
     }
@@ -1523,6 +1655,18 @@ impl MonitorApp {
     /// on disk with the old settings is looked up again.
     fn apply_run_editor(&mut self, editor: RunEditor, run_now: bool, upcoming: bool) {
         let run = editor.run;
+        logger::log(match editor.mode {
+            EditorMode::OpenBeams => format!(
+                "Run {run}: open beams replaced by {} (run now: {run_now}, upcoming runs too: \
+                 {upcoming})\n{}",
+                Self::ob_runs_text(&editor.selected),
+                Self::ob_folders_text(&editor.selected)
+            ),
+            EditorMode::Output => format!(
+                "Run {run}: output folder set to '{}' (run now: {run_now})",
+                editor.output_text.trim()
+            ),
+        });
         let mut over = self.run_overrides.get(&run).cloned().unwrap_or_default();
         let mut selected = editor.selected;
         match editor.mode {
@@ -1643,7 +1787,7 @@ impl MonitorApp {
                             format!(
                                 "{what} and normalize run {run} again at once — the \
                                  result already in the target folder is kept as \
-                                 normalization.previous"
+                                 <result folder>.previous"
                             )
                         } else {
                             format!("{what} and normalize run {run} at once")
@@ -1853,7 +1997,7 @@ impl MonitorApp {
             if ui.button("📂 Browse…").clicked() {
                 let mut dialog = rfd::FileDialog::new().set_title(format!(
                     "Output folder for run {run} (the result goes to \
-                     <corrected folder name>/normalization inside it)"
+                     <corrected folder name>/normalized_<corrected folder name> inside it)"
                 ));
                 let start = Path::new(editor.output_text.trim());
                 if start.is_dir() {
@@ -1861,8 +2005,15 @@ impl MonitorApp {
                 } else if let Some(base) = output_base.filter(|b| b.is_dir()) {
                     dialog = dialog.set_directory(base);
                 }
-                if let Some(folder) = dialog.pick_folder() {
-                    editor.output_text = folder.display().to_string();
+                match dialog.pick_folder() {
+                    Some(folder) => {
+                        logger::log(format!(
+                            "Run {run}: output folder picked: {}",
+                            folder.display()
+                        ));
+                        editor.output_text = folder.display().to_string();
+                    }
+                    None => logger::log(format!("Run {run}: output folder dialog cancelled")),
                 }
             }
             if ui
@@ -1877,7 +2028,8 @@ impl MonitorApp {
         });
         ui.label(
             egui::RichText::new(
-                "The result goes to <folder>/<corrected folder name of the run>/normalization",
+                "The result goes to <folder>/<corrected folder name of the run>/\
+                 normalized_<corrected folder name of the run>",
             )
                 .color(dim)
                 .small(),
@@ -1887,7 +2039,7 @@ impl MonitorApp {
     /// Open a folder in the desktop file manager, or a file (e.g. a job
     /// log) in its default application — detached, via xdg-open.
     fn open_folder(&mut self, folder: &Path) {
-        self.viewer_error = if !folder.exists() {
+        let error = if !folder.exists() {
             Some(format!("not found: {}", folder.display()))
         } else {
             std::process::Command::new("xdg-open")
@@ -1897,6 +2049,11 @@ impl MonitorApp {
                 .err()
                 .map(|e| format!("cannot launch xdg-open: {e}"))
         };
+        match &error {
+            Some(e) => logger::error(format!("Cannot open: {e}")),
+            None => logger::log(format!("Opened with xdg-open: {}", folder.display())),
+        }
+        self.viewer_error = error;
     }
 
     /// The detector folder of the IPTS reduction layout
@@ -1926,7 +2083,7 @@ impl MonitorApp {
         let Some((first, rest)) = folders.split_first() else {
             return;
         };
-        self.viewer_error = if let Some(missing) = folders.iter().find(|f| !f.is_dir()) {
+        let error = if let Some(missing) = folders.iter().find(|f| !f.is_dir()) {
             Some(format!("folder not found: {}", missing.display()))
         } else {
             let mut cmd = std::process::Command::new(TIFF_VIEWER_CMD);
@@ -1937,11 +2094,16 @@ impl MonitorApp {
             if let Some(detector) = &self.detector {
                 cmd.arg("--detector").arg(detector);
             }
+            logger::log(format!("Launching the TIFF viewer: {cmd:?}"));
             cmd.spawn()
                 .map(|_| ())
                 .err()
                 .map(|e| format!("cannot launch {TIFF_VIEWER_CMD}: {e}"))
         };
+        if let Some(e) = &error {
+            logger::error(format!("Cannot open the viewer: {e}"));
+        }
+        self.viewer_error = error;
     }
 
     /// The state slot a job message refers to (a window's or a run's).
@@ -1954,7 +2116,15 @@ impl MonitorApp {
 
     fn refresh(&mut self) {
         self.cfg_path = resolve_config_path();
+        let was_active = self.is_active();
         self.cfg = config::read(&self.cfg_path);
+        if self.is_active() != was_active {
+            logger::log(format!(
+                "Shared configuration {} now says auto normalization {}",
+                self.cfg_path.display(),
+                if self.is_active() { "ON" } else { "OFF" }
+            ));
+        }
         if self.ipts.is_some() {
             self.rescan_configs();
         }
@@ -1978,6 +2148,7 @@ impl MonitorApp {
         // `runs` is kept sorted, so appending only-newer runs keeps it sorted.
         for run in files::list_nexus_runs(&ipts_path) {
             if run > newest_listed {
+                logger::log(format!("Run {run} joined the run list (hybrid mode)"));
                 self.runs.push(run);
                 if !self.run_list_text.trim().is_empty() {
                     self.run_list_text.push_str(&format!(", {run}"));
@@ -2186,10 +2357,14 @@ impl MonitorApp {
             .cloned()
             .collect();
         if remaining.is_empty() {
-            self.ob_error = Some(format!(
-                "rejected open beam {run} is the only one the configuration divides by — \
-                 it stays until another open-beam run lands, or ⇄ replace by… another"
-            ));
+            set_error(
+                &mut self.ob_error,
+                "Cannot switch the open beams",
+                format!(
+                    "rejected open beam {run} is the only one the configuration divides by — \
+                     it stays until another open-beam run lands, or ⇄ replace by… another"
+                ),
+            );
             return false;
         }
         self.use_as_open_beams(remaining);
@@ -2204,26 +2379,39 @@ impl MonitorApp {
     /// autoreduction.cfg on the next pass, so the autoreduction follows
     /// too. Results already there are never redone.
     fn use_as_open_beams(&mut self, folders: Vec<PathBuf>) {
+        const WHAT: &str = "Cannot switch the open beams";
         let Some(config) = self.selected_config.clone() else {
-            self.ob_error = Some("no configuration file selected (section 2)".to_owned());
+            set_error(
+                &mut self.ob_error,
+                WHAT,
+                "no configuration file selected (section 2)".to_owned(),
+            );
             return;
         };
         if folders.is_empty() {
-            self.ob_error = Some("no open-beam run to use".to_owned());
+            set_error(&mut self.ob_error, WHAT, "no open-beam run to use".to_owned());
             return;
         }
         for folder in &folders {
             if !files::folder_complete(folder, files::FolderKind::Corrected) {
-                self.ob_error = Some(format!(
-                    "the corrected open-beam folder is not complete: {}",
-                    folder.display()
-                ));
+                set_error(
+                    &mut self.ob_error,
+                    WHAT,
+                    format!(
+                        "the corrected open-beam folder is not complete: {}",
+                        folder.display()
+                    ),
+                );
                 return;
             }
         }
         let runs = Self::ob_run_numbers(&folders);
         if runs.is_empty() {
-            self.ob_error = Some("no run number in the open-beam folder names".to_owned());
+            set_error(
+                &mut self.ob_error,
+                WHAT,
+                "no run number in the open-beam folder names".to_owned(),
+            );
             return;
         }
         let run_spec = runs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
@@ -2239,6 +2427,12 @@ impl MonitorApp {
         let dst = config.with_file_name(format!("{base}_ob_{suffix}.h5"));
         match h5::write_config_with_obs(&config, &dst, &folders, &run_spec) {
             Ok(()) => {
+                logger::log(format!(
+                    "Open beams switched to run(s) {run_spec}: {} written from {} and selected\n{}",
+                    dst.display(),
+                    config.display(),
+                    Self::ob_folders_text(&folders)
+                ));
                 self.ob_error = None;
                 self.rescan_configs();
                 self.selected_config = Some(dst);
@@ -2248,7 +2442,7 @@ impl MonitorApp {
                 // registration when ON, table refreshed).
                 self.check_runs();
             }
-            Err(e) => self.ob_error = Some(e),
+            Err(e) => set_error(&mut self.ob_error, WHAT, e),
         }
     }
 
@@ -2450,6 +2644,7 @@ impl MonitorApp {
     /// the shared config so it survives restarts and is visible to every
     /// user (the line is added when the notebook-written file lacks it).
     fn set_rolling_enabled(&mut self, enabled: bool) {
+        logger::log(format!("Rolling combine & compare opt-in: {enabled}"));
         let opt_ins = config::OptIns {
             rolling_combine: enabled,
             ..self.opt_ins()
@@ -2460,6 +2655,7 @@ impl MonitorApp {
     /// Opt the live reduction in/out of the auto normalization (same
     /// shared-config mechanics as the rolling windows).
     fn set_live_enabled(&mut self, enabled: bool) {
+        logger::log(format!("Live reduction opt-in: {enabled}"));
         let opt_ins = config::OptIns {
             live_reduction: enabled,
             ..self.opt_ins()
@@ -2470,6 +2666,7 @@ impl MonitorApp {
     /// Opt the live open beams in/out (same shared-config mechanics as the
     /// other flags).
     fn set_live_open_beams_enabled(&mut self, enabled: bool) {
+        logger::log(format!("Live open beams opt-in: {enabled}"));
         let opt_ins = config::OptIns {
             live_open_beams: enabled,
             ..self.opt_ins()
@@ -2482,6 +2679,7 @@ impl MonitorApp {
     /// the naming the flag implies (a series' result is named after its
     /// runs, a run's own after that run) — jobs in progress go on.
     fn set_combine_enabled(&mut self, enabled: bool) {
+        logger::log(format!("Combine consecutive runs opt-in: {enabled}"));
         let opt_ins = config::OptIns {
             combine_consecutive: enabled,
             ..self.opt_ins()
@@ -2519,7 +2717,7 @@ impl MonitorApp {
         };
         match result {
             Ok(()) => self.write_error = None,
-            Err(e) => self.write_error = Some(e),
+            Err(e) => set_error(&mut self.write_error, "Failed to update the configuration", e),
         }
         self.refresh();
     }
@@ -2531,6 +2729,11 @@ impl MonitorApp {
         else {
             return;
         };
+        logger::log(format!(
+            "Auto normalization ON clicked: {ipts}, configuration {} → {}",
+            config_file.display(),
+            self.cfg_path.display()
+        ));
         // The opt-ins are the user's own choices: keep them as they are.
         let opt_ins = self.opt_ins();
         match config::write_full(
@@ -2541,7 +2744,7 @@ impl MonitorApp {
             opt_ins,
         ) {
             Ok(()) => self.write_error = None,
-            Err(e) => self.write_error = Some(e),
+            Err(e) => set_error(&mut self.write_error, "Failed to update the configuration", e),
         }
         self.refresh();
     }
@@ -2549,9 +2752,13 @@ impl MonitorApp {
     /// Turn auto-normalization OFF (only the flag is touched, the registered
     /// configuration file is kept).
     fn turn_off(&mut self) {
+        logger::log(format!(
+            "Auto normalization OFF clicked → {}",
+            self.cfg_path.display()
+        ));
         match config::set_activate(&self.cfg_path, false) {
             Ok(()) => self.write_error = None,
-            Err(e) => self.write_error = Some(e),
+            Err(e) => set_error(&mut self.write_error, "Failed to update the configuration", e),
         }
         self.refresh();
     }
@@ -2629,6 +2836,7 @@ impl MonitorApp {
             .on_hover_text("Re-read the configuration and re-check the files")
             .clicked()
         {
+            logger::log("Refresh now clicked");
             self.refresh();
         }
         ui.add_enabled(
@@ -2639,7 +2847,13 @@ impl MonitorApp {
                 .speed(1),
         )
         .on_hover_text("Refresh period in seconds");
-        ui.checkbox(&mut self.auto_refresh, "Auto-refresh");
+        if ui.checkbox(&mut self.auto_refresh, "Auto-refresh").changed() {
+            logger::log(format!(
+                "Auto-refresh {} (period {} s)",
+                if self.auto_refresh { "on" } else { "off" },
+                self.refresh_secs
+            ));
+        }
     }
 
     /// Section 1 — pick the experiment. Dropdown of accessible IPTS with a
@@ -2731,9 +2945,23 @@ impl MonitorApp {
         let Some(ipts_path) = self.ipts_path() else {
             return;
         };
+        logger::log(format!(
+            "Launching the normalization notebook in {} (configuration: {})",
+            ipts_path.display(),
+            config
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        ));
         self.launch_status = Some(match notebook::launch(&ipts_path, config.as_deref()) {
-            Ok(msg) => (msg, theme::SUCCESS),
-            Err(e) => (e, theme::DANGER),
+            Ok(msg) => {
+                logger::log(&msg);
+                (msg, theme::SUCCESS)
+            }
+            Err(e) => {
+                logger::error(format!("Notebook launch failed: {e}"));
+                (e, theme::DANGER)
+            }
         });
     }
 
@@ -2742,7 +2970,8 @@ impl MonitorApp {
         let Some(path) = self.selected_config.clone() else {
             return;
         };
-        self.preview_error = if !path.is_file() {
+        logger::log(format!("Preview configuration in the NeXus viewer: {}", path.display()));
+        let error = if !path.is_file() {
             Some(format!("configuration file not found: {}", path.display()))
         } else {
             std::process::Command::new(NEXUS_VIEWER_CMD)
@@ -2752,6 +2981,10 @@ impl MonitorApp {
                 .err()
                 .map(|e| format!("cannot launch {NEXUS_VIEWER_CMD}: {e}"))
         };
+        if let Some(e) = &error {
+            logger::error(format!("Cannot preview the configuration: {e}"));
+        }
+        self.preview_error = error;
     }
 
     /// Section 2 — pick the normalization configuration file, or launch the
@@ -2806,6 +3039,7 @@ impl MonitorApp {
                     .on_hover_text("Rescan shared/autoreduce (and its configs/ subfolder)")
                     .clicked()
                 {
+                    logger::log("Rescan configuration files clicked");
                     self.rescan_configs();
                 }
                 if ui
@@ -2919,6 +3153,7 @@ impl MonitorApp {
                          beams come from the table: ⇄ replace by…)."
                     ));
                 if response.changed() {
+                    logger::log(format!("Use default configuration: {}", self.use_default_config));
                     if self.use_default_config {
                         self.apply_default_config();
                     } else {
@@ -2941,6 +3176,7 @@ impl MonitorApp {
                 );
             }
             if let Some(path) = selected {
+                logger::log(format!("Configuration selected: {}", path.display()));
                 self.selected_config = Some(path);
                 self.preview_error = None;
             }
@@ -3048,18 +3284,28 @@ impl MonitorApp {
                 if ui.button("Show").clicked() || submitted {
                     match files::parse_run_list(&self.run_list_text) {
                         Ok(runs) => {
+                            logger::log(format!(
+                                "Run list: {} run(s) from '{}'",
+                                runs.len(),
+                                self.run_list_text.trim()
+                            ));
                             self.run_list_error = None;
                             self.runs = runs;
                             self.check_runs();
                         }
                         Err(e) => {
-                            self.run_list_error = Some(e);
+                            set_error(
+                                &mut self.run_list_error,
+                                &format!("Run list '{}'", self.run_list_text.trim()),
+                                e,
+                            );
                             self.runs.clear();
                             self.run_files.clear();
                         }
                     }
                 }
                 if !self.runs.is_empty() && ui.button("Clear").clicked() {
+                    logger::log("Run list cleared (back to live mode)");
                     self.runs.clear();
                     self.run_files.clear();
                     self.run_list_text.clear();
@@ -3341,6 +3587,7 @@ impl MonitorApp {
                     )
                 };
                 if launch.clicked() {
+                    logger::log("▶ Normalize windows now clicked");
                     self.launch_windows();
                 }
                 // Compare needs every window normalized: one TIFF viewer
@@ -3375,6 +3622,7 @@ impl MonitorApp {
                     ))
                 };
                 if compare.clicked() {
+                    logger::log(format!("Compare all {total} windows clicked"));
                     self.viewer_error = None;
                     self.open_in_viewer(&done);
                 }
@@ -3892,6 +4140,7 @@ impl MonitorApp {
                         .color(theme::INFO),
                 );
                 if ui.button("✖ clear queue").clicked() {
+                    logger::log(format!("Queue cleared ({} run(s))", self.run_queue.len()));
                     self.run_queue.clear();
                 }
             } else {
@@ -3915,6 +4164,12 @@ impl MonitorApp {
                     )
                 };
                 if button.clicked() {
+                    logger::log(format!(
+                        "▶ normalize all missing clicked: {} run(s) queued ({}), {} parallel jobs",
+                        missing.len(),
+                        Self::runs_text(&missing),
+                        self.parallel_jobs
+                    ));
                     self.run_queue.extend(missing);
                 }
             }
@@ -4010,7 +4265,8 @@ impl MonitorApp {
                             );
                             ui.label(theme::section_heading("Output")).on_hover_text(
                                 "The output folder each result lands in \
-                                 (<folder>/<corrected folder name>/normalization): the result's own \
+                                 (<folder>/<corrected folder name>/normalized_<corrected folder \
+                                 name>): the result's own \
                                  for a normalized run, the configuration's (dimmed) for \
                                  a run still to come. ✏ overrides it for one run",
                             );
@@ -4246,6 +4502,10 @@ impl MonitorApp {
             if now_rejected {
                 self.rejected.insert(run);
             }
+            logger::log(format!(
+                "Run {run} {}",
+                if now_rejected { "rejected" } else { "restored" }
+            ));
             // A rejected open beam the live configuration divides by
             // leaves it now (that switch refreshes the table itself);
             // otherwise the windows (and the table span) follow the new
@@ -4534,7 +4794,7 @@ impl MonitorApp {
                 ui.label(egui::RichText::new(Self::short_name(&folder)).color(theme::INFO))
                     .on_hover_text(format!(
                         "Output folder chosen for this run (✏) — the result goes to \
-                         <corrected folder name>/normalization in there\n{}",
+                         <corrected folder name>/normalized_<corrected folder name> in there\n{}",
                         folder.display()
                     ));
             }
@@ -4542,7 +4802,7 @@ impl MonitorApp {
                 ui.label(egui::RichText::new(Self::short_name(base)).color(dim))
                     .on_hover_text(format!(
                         "The configuration's output folder — the result goes to \
-                         <corrected folder name>/normalization in there\n{}",
+                         <corrected folder name>/normalized_<corrected folder name> in there\n{}",
                         base.display()
                     ));
             }
@@ -4646,7 +4906,7 @@ impl MonitorApp {
     }
 
     /// "Output" cell of one row: the base folder the run's result sits
-    /// in (`<here>/<corrected folder name>/normalization`), else where it
+    /// in (`<here>/<corrected folder name>/normalized_<corrected folder name>`), else where it
     /// will go.
     fn output_cell(&self, ui: &mut egui::Ui, run: u64, kind: h5::RunKind) {
         let dim = theme::text_emphasis(ui.visuals());
@@ -4656,7 +4916,7 @@ impl MonitorApp {
         }
         match self.run_meta.get(&run).and_then(|m| m.output.as_ref()) {
             Some(output) => {
-                // `<base>/<row>/normalization` → show `<base>`.
+                // `<base>/<row>/normalized_<row>` → show `<base>`.
                 let base = output
                     .parent()
                     .and_then(|row| row.parent())
@@ -4679,7 +4939,7 @@ impl MonitorApp {
 
     /// Footer: where the normalized data lands, with a shortcut to the
     /// folder. The per-run results go to `<output folder>/<corrected
-    /// folder name>/normalization`, the output folder coming from the
+    /// folder name>/normalized_<corrected folder name>`, the output folder coming from the
     /// configuration, which also holds the `autoreduction.log` summary.
     fn output_footer(&mut self, ui: &mut egui::Ui) {
         if self.ipts.is_none() {
@@ -4697,7 +4957,7 @@ impl MonitorApp {
                     )
                     .on_hover_text(
                         "The configuration file's output folder — each run goes to \
-                         <corrected folder name>/normalization in there (rolling \
+                         <corrected folder name>/normalized_<corrected folder name> in there (rolling \
                          windows: <IPTS>/shared/autoreduce/normalized/rolling), and \
                          autoreduction.log at its top summarizes every normalization \
                          as it runs: sample, open beams, configuration and settings, \
@@ -5117,7 +5377,7 @@ impl MonitorApp {
                         .on_hover_text(
                             "Re-run this normalization with the row's current settings \
                              (open beams: ⇄ replace by…; output folder: ✏). The \
-                             previous result is kept as normalization.previous",
+                             previous result is kept as <result folder>.previous",
                         )
                         .clicked()
                     {
@@ -5226,6 +5486,10 @@ impl eframe::App for MonitorApp {
                         };
                     }
                     if let Some(run) = retry.filter(|run| !self.run_queue.contains(run)) {
+                        logger::warn(format!(
+                            "Run {run}: normalization killed by the system — queued for one \
+                             automatic retry"
+                        ));
                         self.run_queue.push_back(run);
                     } else if let (norm::JobTarget::Run(run), true) = (&target, succeeded) {
                         // A success clears the one-retry mark: a later
@@ -5333,13 +5597,35 @@ impl eframe::App for MonitorApp {
 }
 
 fn main() -> eframe::Result<()> {
+    // Shared VENUS log (autonormalization_monitor_<user>.log), so what a
+    // user did and where it failed can be read back in the log browser.
+    if let Err(e) = logger::init() {
+        eprintln!("Warning: logging disabled — {e}");
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    logger::log(format!(
+        "Command line: autonormalization_monitor {}",
+        if argv.is_empty() { "(no arguments)".to_owned() } else { argv.join(" ") }
+    ));
+    if let Ok(cwd) = std::env::current_dir() {
+        logger::log(format!("Working directory: {}", cwd.display()));
+    }
+    // A crash (panic) is the error users report most often without being
+    // able to say what happened: record it before the default hook prints
+    // it to the terminal nobody is looking at.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logger::error(format!("PANIC: {info}"));
+        default_hook(info);
+    }));
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([880.0, 820.0])
             .with_title(APP_TITLE),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         APP_TITLE,
         native_options,
         Box::new(|cc| {
@@ -5351,7 +5637,12 @@ fn main() -> eframe::Result<()> {
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(MonitorApp::new()))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => logger::log("Application closed"),
+        Err(e) => logger::error(format!("Application failed: {e}")),
+    }
+    result
 }
 
 #[cfg(test)]

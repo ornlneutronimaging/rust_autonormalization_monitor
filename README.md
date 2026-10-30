@@ -101,8 +101,8 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    span is rejected the windows are empty and the app simply waits for
    the next run.
    A footer under the table reminds where the normalized data lands (the
-   configuration's output folder — `<corrected folder name>/normalization`
-   in there) with a **📂 open folder** shortcut and a **📄
+   configuration's output folder — `<corrected folder name>/normalized_<corrected
+   folder name>` in there) with a **📂 open folder** shortcut and a **📄
    autoreduction.log** button opening the summary log (below).
    With auto normalization ON, every run that lands from then on is
    normalized **on its own** by this app: the row shows **⏳ waiting**
@@ -126,7 +126,7 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    viewer is launched with `--detector <name>` (the configuration's
    `detector` attribute, e.g. `tpx1`, else the single detector folder of
    `shared/autoreduce/images`), so Timepix stacks open transposed the right
-   way even from a `…/normalization` path that names no detector
+   way even from a `…/normalized_<corrected folder name>` path that names no detector
    (**↻** retries a failed run). Before launching, the sample and every
    open-beam folder must hold the same number of images (NeuNorm divides
    the stacks frame by frame — the notebook's Data Quality Check refuses
@@ -190,7 +190,7 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    result found on disk) when it is not the one shown — ↻ re-run
    normalizes again with the file shown. The **Output** column names,
    for every row, the base folder the result sits in
-   (`<base>/<corrected folder name>/normalization`; hover for the full
+   (`<base>/<corrected folder name>/normalized_<corrected folder name>`; hover for the full
    path) — from
    the job log for a result found on disk, the configuration's output
    folder, dimmed, for a run still to come.
@@ -219,12 +219,17 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    Output goes under the configuration's output folder (under
    `<IPTS>/shared/autoreduce/normalized` when the configuration names no
    output folder), in a row folder named after the run's corrected (input)
-   folder: `<output folder>/<corrected folder name>/normalization`, e.g.
-   `20260921_Run_30340_sample_3_000AngsMin_0/normalization` — so the
-   result carries the run's title, temperature and chopper setting, not
-   just its number. A result already there — from a previous session, or
-   in the legacy `Run_<run>/normalization` layout of the workflow runner
-   and of this app before 2026-09-24 — is shown as done and never redone.
+   folder, the result folder inside it carrying that name again:
+   `<output folder>/<corrected folder name>/normalized_<corrected folder name>`,
+   e.g. `20260921_Run_30340_sample_3_000AngsMin_0/normalized_20260921_Run_30340_sample_3_000AngsMin_0`
+   — so the result carries the run's title, temperature and chopper
+   setting, not just its number, and many results opened together in the
+   TIFF viewer are told apart by name (they all showed up as
+   `normalization` before 2026-09-28). A result already there — from a
+   previous session, in the `<corrected folder name>/normalization` layout
+   of this app between 2026-09-24 and 2026-09-28, or in the legacy
+   `Run_<run>/normalization` layout of the workflow runner and of this app
+   before 2026-09-24 — is shown as done and never redone.
    **⧉ Combine consecutive runs** (a third opt-in box in the heading,
    shared `combine_consecutive` flag, off by default): every new sample
    run is normalized **together** with the consecutive runs before it
@@ -240,7 +245,7 @@ turning it OFF only clears the flag. It needs sections 1 and 2 filled.
    whose NeXus or folder is not readable yet breaks it. The combined
    result gets its own folder, the first run's folder name with
    `Run_<first>_to_<last>` (`20260921_Run_30340_to_30342_reptRib_…_0/
-   normalization`), shown on the row of the last run as **✔ N runs
+   normalized_20260921_Run_30340_to_30342_reptRib_…_0`), shown on the row of the last run as **✔ N runs
    combined** (hover: the runs); every earlier result — the single runs,
    the shorter series — is kept. NeuNorm holds every stack of the series
    in memory: long series need the memory of as many single runs. Toggling
@@ -310,6 +315,16 @@ From a graphical session (e.g. ThinLinc):
 
 The script rebuilds the release binary automatically when the sources have
 changed.
+
+## Log
+
+Every session appends to `/SNS/VENUS/shared/log/autonormalization_monitor_<user>.log`
+(same directory, naming and line format as the other VENUS tools, so the
+**log browser** shows it): the IPTS and configuration selections, every
+button and opt-in switch, each normalization launched (inputs, settings,
+output, job log) and how it ended, the notebook / viewer launches, and every
+error shown in the window. The per-job `logs/normalization.log` files next to
+the results are unchanged.
 
 ## Development
 
